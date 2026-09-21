@@ -85,7 +85,7 @@ let values: Vec<i32>=Vec::<i32>::new();
 let nested: Vec<Vec<i32>>=Vec::<Vec<i32>>::new();
 ```
 
-（CRLF→LF 归一化必须在 `Lexer::new` 之前：`TokenKind` 无载荷、靠 Span 切源码，lexer 与 parser 必须持有**同一份字符串**，否则 span 累积错位。见 [`../arch.md`](../arch.md) §5.2。）
+（CRLF→LF 归一化必须在 lexer 启动之前：`TokenKind` 无载荷、靠 Span 切源码，**切出来的 span 必须与 driver 归一化后的那份字节缓冲区对齐**，否则 span 累积错位。不是「lexer 与 parser 各持一份字符串」——全程只有一份缓冲区在接力。见 [`../arch.md`](../arch.md) §5.2。）
 
 ---
 
