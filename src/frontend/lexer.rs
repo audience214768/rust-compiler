@@ -2,7 +2,7 @@ use super::error::*;
 
 use super::token::*;
 use std::vec::Vec;
-pub struct Lexer<'a> {
+struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
 }
@@ -56,11 +56,8 @@ fn is_valid_int_literal(run: &[u8]) -> bool {
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str) -> Self {
-        Self {
-            src: input.as_bytes(),
-            pos: 0,
-        }
+    fn new(src: &'a [u8]) -> Self {
+        Self { src, pos: 0 }
     }
     fn peek(&self, n: usize) -> Option<u8> {
         self.src.get(self.pos + n).copied()
@@ -109,7 +106,7 @@ impl<'a> Lexer<'a> {
         }
         Ok(())
     }
-    pub fn next_token(&mut self) -> Result<Token, LexError> {
+    fn next_token(&mut self) -> Result<Token, LexError> {
         if let Err(start) = self.skip_whitespace_and_comments() {
             return Err(LexError {
                 kind: LexErrorKind::UnterminatedBlockComment,
@@ -346,6 +343,23 @@ impl<'a> Lexer<'a> {
     }
 }
 
+pub fn lex_all(src: &[u8]) -> Result<Vec<Token>, LexError> {
+    let mut lx = Lexer::new(src);
+    let mut out = Vec::new();
+    loop {
+        let t = lx.next_token()?;
+        debug_assert!(
+            t.kind == TokenKind::Eof || t.span.end > t.span.start,
+            "非 Eof token 必须推进，否则死循环：{t:?}"
+        );
+        let eof = t.kind == TokenKind::Eof;
+        out.push(t);
+        if eof {
+            return Ok(out);
+        }
+    }
+}
+
 pub fn normalize(src: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len());
     let mut it = src.iter().peekable();
@@ -363,23 +377,9 @@ mod tests {
     use super::*;
 
     /// 把整份源码喂给 lexer，收到 `Eof` 为止；`Err` 直接短路返回。
-    /// 顺带守一条不变式：**非 Eof 的 token 必须推进**（`span.end > span.start`）——
-    /// 这是唯一会"挂死"而不是报错的失效模式，`main.rs` 的循环与将来 parser 的 `bump`
-    /// 都靠它才不空转。
+    /// （终止条件与「非 Eof token 必须推进」的守卫都在 `lex_all` 里。）
     fn lex(src: &str) -> Result<Vec<Token>, LexError> {
-        let mut lx = Lexer::new(src);
-        let mut out = Vec::new();
-        loop {
-            let t = lx.next_token()?;
-            assert!(
-                t.kind == TokenKind::Eof || t.span.end > t.span.start,
-                "非 Eof token 必须推进，否则会死循环：{t:?}"
-            );
-            out.push(t);
-            if t.kind == TokenKind::Eof {
-                return Ok(out);
-            }
-        }
+        lex_all(src.as_bytes())
     }
 
     fn kinds(src: &str) -> Vec<TokenKind> {

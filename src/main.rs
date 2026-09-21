@@ -1,8 +1,7 @@
 mod frontend;
 
 use frontend::error::locate;
-use frontend::lexer::{normalize, Lexer};
-use frontend::token::TokenKind;
+use frontend::lexer::{lex_all, normalize};
 use std::env;
 use std::fs;
 use std::process;
@@ -34,28 +33,25 @@ fn main() {
         process::exit(1);
     }
 
-    let src = String::from_utf8(normalize(&raw)).expect("已校验为 ASCII");
+    let src = normalize(&raw);
 
-    let mut lexer = Lexer::new(&src);
-    loop {
-        let token = match lexer.next_token() {
-            Ok(t) => t,
-            Err(e) => {
-                let (line, col) = locate(src.as_bytes(), e.span.start as usize);
-                eprintln!("{path}:{line}:{col}: {}", e.kind);
-                process::exit(1);
-            }
-        };
-        let text = &src[token.span.start as usize ..token.span.end as usize];
+    let toks = match lex_all(&src) {
+        Ok(t) => t,
+        Err(e) => {
+            let (line, col) = locate(&src, e.span.start as usize);
+            eprintln!("{path}:{line}:{col}: {}", e.kind);
+            process::exit(1);
+        }
+    };
+
+    for token in &toks {
+        let text = &src[token.span.start as usize..token.span.end as usize];
         println!(
             "{:<14} {:>5}..{:<5} {:?}",
             format!("{:?}", token.kind),
             token.span.start,
             token.span.end,
-            text
+            String::from_utf8_lossy(text)
         );
-        if token.kind == TokenKind::Eof {
-            break;
-        }
     }
 }
