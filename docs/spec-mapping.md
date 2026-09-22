@@ -138,11 +138,81 @@ let nested: Vec<Vec<i32>>=Vec::<Vec<i32>>::new();
 | 规范产生式 | 实现 |
 |---|---|
 | `Function` + `FunctionReturnType` | 一个 `parse_function()`；`const?` / `pub` / `unsafe` / `extern` **都不存在** |
-| `FunctionParameters` + `SelfParam` + `ShorthandSelf` | `parse_function_params()`；先试 `self` 收尾（含 `&self` / `&'a mut self` / `mut self` / `self`） |
+| `FunctionParameters` | `parse_function_params() -> Result<(Option<Receiver>, Vec<Param>), _>`，见 §2.3.1 |
+| `SelfParam` + `ShorthandSelf` | `parse_self_param() -> Result<Receiver, _>`，见 §2.3.1 |
 | `FunctionParam` | `parse_param()` = `IdentifierBinding` + `:` + `Type`（`mut x: i32` 合法） |
 
 - `WhereClause` 在返回类型之后；**没有返回类型时紧跟在参数表之后**。
 - 省略返回类型 = `()`。参数与接收者后都允许尾逗号。
+- `GenericParams?`（`<'long: 'short, 'short>`，只可能含生命周期参数）与 `WhereClause?` 解析后**整体丢弃**，AST 里没有对应字段。语料里 fn 上的 `where` 只有一条（`semantic/lifetimes-and-use/acc-lifetimes-and-unused-valid-import-aliases-do-not-affect-rx-resolution.rx`，注意它末尾带尾逗号）。
+
+#### 2.3.1 参数表：怎么认出接收者、循环怎么写（2026-09-22 定，逐字对规范）
+
+规范原文（`items/functions.md:11-21`）：
+
+```
+FunctionParameters ->
+      SelfParam `,`?
+    | (SelfParam `,`)? FunctionParam (`,` FunctionParam)* `,`?
+SelfParam -> ShorthandSelf
+ShorthandSelf -> (`&` Lifetime?)? `mut`? `self`
+FunctionParam -> IdentifierBinding `:` Type
+```
+
+外加 `statements.md:12`：`IdentifierBinding -> 'mut'? IDENTIFIER`。
+
+**两条先看清的结论：**
+
+1. **Rx 没有 TypedSelf。** `SelfParam -> ShorthandSelf` 只有一支（全规范 grep `TypedSelf` 零命中）⇒ `self: Box<Self>` 是**语法错误**，不用为它写任何东西；`Receiver { by_ref, mutable }` 两个 bool 够用，不缺字段。
+2. **`mut` 是 `self` 与普通参数唯一重叠的前缀**——所以整个参数表只有**一个**位置需要看第二个 token：
+
+| 首 token | 是 SelfParam？ | 是 FunctionParam？ | 看第二个？ |
+|---|---|---|---|
+| `SelfValue` | ✔ | ✘（普通参数得是 `Ident`） | 不用 |
+| `And`（`&`） | ✔ | ✘（`IdentifierBinding` 不以 `&` 开头） | 不用 |
+| `Mut` | ✔ `mut self` | ✔ `mut x: i32` | **要**：`nth(1) == SelfValue`？ |
+| `Ident` | ✘ | ✔ | 不用 |
+| `RParen` | ✘ | ✘ | 不用（表空了） |
+
+⇒ 判定写成 `at_self_param(&self) -> bool`，**只看不动游标**（判定函数一律不许有副作用）：`SelfValue | And => true`、`Mut => nth(1) == SelfValue`、其余 `false`。
+
+**`&` 那一支不需要回溯。** `IdentifierBinding` 不以 `&` 开头，看到 `&` 就**必然**是 SelfParam——产生式已经把歧义消掉了，照抄即可。写成"先按 self 试、失败再按参数试"反而引入游标回退，破坏 `pos` 单调不减这条唯一契约。
+
+**参考实现里不抄的两处**：rust-analyzer 的 `opt_self_param` 用两段式 offset walk 是为了 TypedSelf，还带一个 `is_isolated_self` 守卫防 `self::foo` 被当成接收者。Rx 两样都没有：没有 TypedSelf，而 `self` 在我们的 lexer 里是**独立的 `TokenKind::SelfValue`**（不是 `Ident`）——"是不是 self"是比 kind 不是比字符串，那条守卫没有存在意义。⇒ 从参考实现只抄**骨架**，判定逻辑缩成上面那一行。
+
+**`parse_function_params` 的循环**照产生式直译：
+
+```rust
+self.expect(TokenKind::LParen)?;
+if self.at_self_param() {
+    recv = Some(self.parse_self_param()?);
+    if !self.at(TokenKind::RParen) { self.expect(TokenKind::Comma)?; }  // `fn f(self)` 无逗号也合法
+}
+while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+    //                          ^^^^ Eof 那半句是保命：`bump` 在 Eof 上不推进 `pos`，
+    //                               截断输入会让这个循环空转，而判分口径里超时 = 失败
+    params.push(self.parse_param()?);
+    if !self.eat(TokenKind::Comma) { break; }   // 尾逗号：吃不到逗号就必须已经到 `)`
+}
+self.expect(TokenKind::RParen)?;
+```
+
+`parse_self_param` 就是 `ShorthandSelf` 的逐字翻译：`eat(And)` →（若 `by_ref`）`eat(LifeTime)` 丢弃 → `eat(Mut)` → `expect(SelfValue)`。
+
+**语料覆盖（零特判）**：正例 `parser/accept/param_list-e6e46cd27a.rx` 一份文件同时覆盖空表 / 单参 / 尾逗号 / 双参（`fn a(){}`、`fn b(x: i32){}`、`fn c(x: i32, ){}`、`fn d(x: i32, y: ()){}`）。六条负例全部是"少一个具体符号 ⇒ `Expected(TokenKind)`"：
+
+| 用例 | 内容 | 挂在哪 |
+|---|---|---|
+| `reject/0015_curly_in_params` | `fn foo(}) {}` | `parse_param` 的 `expect(Ident)` 看到 `}` |
+| `reject/0021_incomplete_param` | `fn foo(x: i32, y) {` | `expect(Colon)` 看到 `)` |
+| `reject/empty_param_slot` | `fn f(y: i32, ,t: i32) {}` | 第二个 `parse_param` 的 `expect(Ident)` 看到 `,` |
+| `reject/omitted-arg-in-item-fn` | `fn foo(x) {` | `expect(Colon)` 看到 `)` |
+| `reject/missing_fn_param_type` | `fn f(x y: i32, z, t: i32) {}` | `expect(Colon)` 看到 `y` |
+| `reject/issue-58856-1` | `fn b(self>` | `at_self_param` 命中 ⇒ `expect(Comma)` 看到 `>` |
+
+⇒ **不要为负例写特判**，也**不要为接收者写"先试再回溯"**。
+
+**两件不在 parser 里做的事**：`self` 出现在**顶层 fn**（非 `impl` 内）语法上合法——`functions.md:24` 的 "Top-level functions accept only ordinary parameters" 是**语义**规则，对应负例是 `semantic/namespace-errors/rej-a-top-level-function-cannot-have-a-receiver.rx`，归 sema 管，parser 照收。参数 `mut` 撞同名 const（`functions.md:30`）是明文 UB，直接不管。
 
 ### 2.4 生命周期与泛型参数
 
@@ -150,7 +220,9 @@ let nested: Vec<Vec<i32>>=Vec::<Vec<i32>>::new();
 |---|---|
 | `GenericParams` / `GenericParam` / `LifetimeParam` | `parse_generic_params()`——**只可能含生命周期参数**，没有类型参数 |
 | `Lifetime` / `LifetimeBounds` / `TypeParamBounds` / `TypeParamBound` | `parse_lifetime()` / `parse_lifetime_bounds()` |
-| `WhereClause` + 3 个子产生式 | `parse_where_clause()`；两个分支按"`:` 前是生命周期还是类型"分派 |
+| `WhereClause` + 3 个子产生式 | `parse_where_clause()`；`parse_where_clause_item() -> Result<bool>`（有 item 就吃并返回 `true`，没有就一个 token 都不动返回 `false`），循环 `while ...? { if !eat(Comma) { break } }`；两个分支按"`:` 前是生命周期还是类型"分派，类型支靠 FIRST(`typeRef`) = `at_type_start()` 起头；**支持尾逗号** |
+
+`WhereClause` 的列表**没有自己的终结符**——`Parser.g4:104-106` 是 `WHERE (whereClauseItem (COMMA whereClauseItem)* COMMA?)?`，读完最后一个 item 就结束了。终止条件只能由 parser 自己判：FIRST（下一个 token 还能起 item 吗）或 FOLLOW（下一个 token 是不是外层的后继，三个宿主的后继都是 `{`）。**我们选 FIRST**，理由与统一约定见 [`arch.md`](arch.md) §1.5.6。语料里带真 `where` 子句的 `.rx` 只有 `semantic/lifetimes-and-use/acc-lifetimes-and-unused-valid-import-aliases-do-not-affect-rx-resolution.rx` 和它的 codegen 孪生文件；前者里那两处（struct 一处、fn 一处）都是 `'a: 'a,` / `'long: 'short,` 这种**带尾逗号**的形状，正好压在这条规则上。类型条目那一支**没有任何正例**，它存在的意义就是拒掉畸形输入。
 
 **关键点**：泛型**参数**只有生命周期，但泛型**实参**（`GenericArgs`，§2.8）含具体类型。这份语法必须能解析，然后**整体丢弃生命周期**（`grammar.md` 的 "Syntax that may be discarded after parsing"）。丢弃是编译器内部步骤，去掉生命周期注解后剩下的文本**不必**是合法 Rust。
 
@@ -236,16 +308,52 @@ if true {} else {} -1;                       // if 语句，然后 -1 表达式�
 (if true { 10 } else { 20 }) - 1;            // 一条表达式语句
 ```
 
-**实现的实质不是"改语法"，而是同一段表达式代码有两个入口，区别只有爬不爬升**：
+**实现的实质不是"改语法"，而是同一段表达式代码带不同的限制进来，区别只有爬不爬升**：
 
-| 上下文 | 入口 | 行为 |
+| 上下文 | 限制 | 行为 |
 |---|---|---|
-| 语句位置 | 块形式专用入口 | 原子 + 后缀，**不爬升** |
-| 值位置（初始化器、实参、条件…） | 普通入口 | 原子 + 后缀 + **爬升** |
+| 语句位置 | `STATEMENT`（`prefer_stmt: true`） | 原子 + 后缀；**后缀跑完后若仍是块形式才不爬升** |
+| 值位置（初始化器、实参、数组元素、字段值、块尾、括号内、中缀右侧…） | `VALUE` | 原子 + 后缀 + **爬升**（无条件） |
+| `if` / `while` 的条件 | `CONDITION`（`forbid_structs: true`） | 同值位置——**照常爬升**，只多一条"路径后不认结构体字面量"（§2.9 末段） |
 
-之所以"不爬升"恰好等于规范的规则，是因为规范留的两个例外正好由别的机制覆盖：`else` 归 `parse_if` 自己处理（不在爬升循环里）；字段/方法后缀由后缀循环处理。
+⚠ **"不爬升"不是无条件的——判据是后缀跑完之后 lhs 还是不是块形式。** 规范原文（`statements.md`）说的是「an expression with an **outer** block form terminates the statement immediately」，并且紧接着补了一句「postfix field accesses or method calls **may continue directly after a completed block expression**」，例子就是 `{ make() }.value;`。
 
-⇒ `parse_statement()` 是三分支：`;` → 空语句；`let` → let 语句；否则看首 token——是 `{` `if` `while` `loop` 之一就走**不爬升**入口（`;` 可选），其它走普通入口并**强制** `;`。**注意只有那 4 个 token 算块形式**：`(` `-` `!` `*` `&` 标识符 字面量都不算。
+判分语料里有三条铁证，其中最后一条是 W5 的真判分点：
+
+| 用例 | 内容 | 逼出的规则 |
+|---|---|---|
+| `parser/accept/expression_after_block-*.rx` | `{p}.x = 10;` | 后缀 `.x` 之后 lhs 不再是块形式 ⇒ **爬升恢复**，`= 10` 照吃 |
+| `parser/accept/binop_resets_statementness-*.rx` | `fn f() { v = {1}&2; }` | **中缀右侧按值位置解**（语句性在运算符右侧被重置） |
+| `semantic/blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx` | `if true {} else {}` 换行 `-1;` 与 `let y = if true {10} else {20} - 1;` 同处一份 | 前者**两条语句**、后者**一个表达式** ⇒ 「不爬升」和「总是爬升」两个偷懒版**会挂在同一个文件上** |
+
+⇒ `parse_statement()` 是三分支：`;` → 空语句；`let` → let 语句；否则看首 token——是 `{` `if` `while` `loop` 之一就走语句位置入口（`;` 可选），其它走普通入口并**强制** `;`。**注意只有那 4 个 token 算块形式**：`(` `-` `!` `*` `&` 标识符 字面量都不算。
+
+**后缀第一步还有一条**：语句位置且 lhs 是块形式时，**第一个后缀不许是 `(` / `[`**，只许 `.`；一旦吃下任何后缀，块形式身份就没了，后续一切恢复正常。这条是为了让 `while c {break}();` 读成 `while c {break}; ();` 而不是 `while c { break(); }`。
+
+#### 2.9.1 未写进规范的解析细则（2026-09-22 补，逐条转录自参考实现）
+
+规范只给产生式，没给"`break` 的操作数在条件里到底吃不吃 `{`"。（1）（2）两条是从 **rust-analyzer 的 parser**（本语料期望树的来源，commit `971903d9`）逐字读出来的，并用判分语料双向验证过；（3）是随之而来的实现形状：
+
+**（1）`break` 的操作数**：下一个 token 能起表达式，**且不是**（当前在 `forbid_structs` 上下文 且 下一个是 `{`）时，才吃操作数。
+
+```rust
+if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) { expr(p); }
+```
+
+两个方向都有正例逼着：
+
+| 用例 | 上下文 | 结果 |
+|---|---|---|
+| `parser/accept/break_ambiguity-1e03b43539.rx` = `if break {}` | 条件（`forbid_structs`） | `break` **不吃** `{}` ⇒ `if (break) {}` |
+| `parser/accept/break_ambiguity-3073889f26.rx` = `while break {}` | 条件 | 同上 |
+| `parser/accept/0035_weird_exprs-4a680eac1a.rx` = `loop { if break { } }` | 条件 | 同上 |
+| `codegen/expected-types/acc-no-inference-through-operators-or-borrows-is-required.rx` = `loop { break { 9 }; }` | **语句** | `break` **吃** `{9}`，循环值必须是 `9`（该文件是 codegen 正例，会真的跑） |
+
+⇒ 「`break` 永不把 `{` 当操作数」是**错的**，会挂掉上面第 4 条。判据里那个 `forbid_structs` 就是条件边界的同一个标志——**两个边界规则共用一只开关**，不是各自一套。
+
+**（2）`return` 与 `continue` 不对称**：`return` 的操作数解析**不继承当前限制**（直接按普通值位置解），所以 `return {}` 在条件里也会把 `{}` 吃掉；`continue` 根本没有操作数（`ContinueExpression -> 'continue'`，规范里就没有 `Expression?`）。
+
+**（3）限制怎么传**：参考实现是**按值传参**（`expr_bp(min_bp, r)`），不是可变字段 + 存/恢复。进 `(` `[`、调用实参、数组元素、字段值、块体、`break`/`return` 的操作数时**传 `VALUE` 常量**即可，不存在"忘了恢复"这条 bug。⇒ 我们的 `Parser` 因此**只有四个字段**（`arch.md` §1.2.1 原写的第 5 个 `no_struct_literal` 已删）。
 
 ### 2.10 表达式
 
@@ -277,7 +385,7 @@ if true {} else {} -1;                       // if 语句，然后 -1 表达式�
 
 **条件/循环体边界**（`if-expr.md`）：`if` / `while` 的条件里，`Name {` 处的 `{` 视为**体块**的开始。要把 struct 构造放进条件必须显式加括号：`if (S { flag: true }).flag { ... }`。但 `if { true } { ... }` 里前一个 `{` 是块值条件、后一个是体块，不适用本规则。
 
-实现：parser 加一个字段 `no_struct_literal: bool`，生效点**只有一处**——解析出一个路径之后，若当前是 `{` 且标志为假才转去解析结构体字面量。遇到 `(` `[` 调用实参 字段值 块体时**存旧值 → 置假 → 执行 → 恢复旧值**（**不能直接置假**：`if f(S{x:1}) && S { }` 里出括号后若不恢复，后面那个 `S {` 会把体块吃掉）。反过来，**前缀运算符的操作数要原样保留标志**——`if &S { x: 1 } { }` 里 `&` 后面那个 `{` 必须仍然是体块，所以 `Neg` / `Not` / `Deref` / `Ref` 求操作数时既不能置假也不能置真。最典型的翻车方式：忘了这个标志 → `if flag { }` 被读成"条件是结构体字面量 `flag {}`，然后缺体块"。
+实现：**没有字段**——`forbid_structs` 是按值传进 `parse_expr_bp(min_bp, r)` 的限制之一（§2.9.1 之（3））。生效点**只有一处**——解析出一个路径之后，若当前是 `{` 且 `!r.forbid_structs` 才转去解析结构体字面量。进入 `(` `[`、调用实参、数组元素、字段值、块体时**传 `Restrictions::VALUE`**（§2.9 那张表的第二行），于是 `if f(S{x:1}) && S { }` 里出括号后自动回到条件的 `CONDITION`，后面那个 `S {` 照旧是体块——**不需要"恢复"这个动作，也就没有"忘了恢复"**。反过来，**前缀运算符的操作数原样继承 `r`**——`if &S { x: 1 } { }` 里 `&` 后面那个 `{` 必须仍然是体块，所以 `Neg` / `Not` / `Deref` / `Ref` 求操作数时既不能换成 `VALUE` 也不能换成 `CONDITION`。最典型的翻车方式：这个限制传丢了 ⇒ `if flag { }` 被读成"条件是结构体字面量 `flag {}`，然后缺体块"。
 
 **cast 后的 `<`**（`operator-expr.md` §Cast parsing）：`as` 后面解析 `TypeNoBounds` 时，类型路径段之后的 `<` 进入 `GenericArgs` 而非比较；`<<` 的开头 `<` 同理。括号化的 cast 已经闭合类型语法，所以 `x as (usize) < y` 与 `x as (usize) << y` 按比较/移位解析。
 

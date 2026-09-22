@@ -1,22 +1,22 @@
 use std::vec::Vec;
 use super::token::Span;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct ExprId(pub usize);
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct BlockId(pub usize);
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct TypeId(pub usize);
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct PathId(pub usize);
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct ItemId(pub usize);
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct ConstValueId(pub usize);
 
 #[derive(Copy, Clone, Debug)]
@@ -30,22 +30,26 @@ pub enum PathIdentSegment {
     SelfType,
 }
 
+#[derive(Debug)]
 pub struct PathExprSegment {
     pub name: PathIdentSegment,
     pub args: Option<GenericArgs>,
     pub span: Span,
 }
 
+#[derive(Debug)]
 pub struct GenericArgs {
     pub types: Vec<TypeId>,
     pub span: Span,
 }
 
+#[derive(Debug)]
 pub struct ConstValue {
     pub kind: ConstValueKind,
     pub span: Span,
 }
 
+#[derive(Debug)]
 pub enum ConstValueKind {
     Int {
         digits: Span,
@@ -61,22 +65,26 @@ pub enum ConstValueKind {
     },
 }
 
+#[derive(Debug)]
 pub struct Param { //no lifetime, which is abandoned because grammar guarantee invalid lifetime is UB.
     pub binding: Name,
     pub mutable: bool,
     pub ty: TypeId,
 }
 
+#[derive(Debug)]
 pub struct Receiver {
     pub by_ref: bool,
     pub mutable: bool,
 }
 
+#[derive(Debug)]
 pub struct FieldDef {
     pub name: Name,
     pub ty: TypeId,
 }
 
+#[derive(Debug)]
 pub enum ItemKind {
     Fn {
         name: Name,
@@ -101,11 +109,13 @@ pub enum ItemKind {
     },
 }
 
+#[derive(Debug)]
 pub struct Item {
     pub kind: ItemKind,
     pub span: Span,
 }
 
+#[derive(Debug)]
 pub enum StmtKind {
     Empty,
     Let {
@@ -120,17 +130,20 @@ pub enum StmtKind {
     }
 }
 
+#[derive(Debug)]
 pub struct Stmt {
     pub kind: StmtKind,
     pub span: Span,
 }
 
 
+#[derive(Debug)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub span: Span,
 }
 
+#[derive(Debug)]
 pub enum Lit {
     Int {
         digits: Span,
@@ -139,6 +152,7 @@ pub enum Lit {
     Bool(bool),
 }
 
+#[derive(Debug)]
 pub enum BinOp {
     Add, Sub, Mul, Div, Rem,
     Eq, Ne, Lt, Le, Gt, Ge,
@@ -146,6 +160,7 @@ pub enum BinOp {
     BitAnd, BitOr, BitXor, Shl, Shr,
 }
 
+#[derive(Debug)]
 pub enum AssignOp {
     Assign,       // =
     AddAssign,    // +=
@@ -160,11 +175,13 @@ pub enum AssignOp {
     ShrAssign,    // >>=
 }
 
+#[derive(Debug)]
 pub struct FieldInit {
     pub name: Name,
     pub value: ExprId,
 }
 
+#[derive(Debug)]
 pub enum ExprKind {
     Lit(Lit),
     Path(PathId),
@@ -177,7 +194,7 @@ pub enum ExprKind {
     Neg(ExprId),
     Not(ExprId),
     Binary {
-        Op: BinOp,
+        op: BinOp,
         lhs: ExprId,
         rhs: ExprId,
     },
@@ -191,7 +208,10 @@ pub enum ExprKind {
         rhs: ExprId,
     },
 
-    Grouped(ExprId),
+    /// `UnitExpression -> ( )`。零载荷：`()` 里没有任何子表达式，
+    /// 所以不能拿 `Paren` 顶（那会硬造一个不存在的内层 `ExprId`）。
+    Unit,
+    Paren(ExprId),
     Array(Vec<ExprId>),
     ArrayRepeat {
         elem: ExprId,
@@ -231,15 +251,17 @@ pub enum ExprKind {
     If {
         cond: ExprId,
         then_block: BlockId,
-        else_block: Option<ExprId>, //in case of else if,expr include the block and the if
+        else_branch: Option<ExprId>, //in case of else if,expr include the block and the if
     }
 }
 
+#[derive(Debug)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
 }
 
+#[derive(Debug)]
 pub enum TypeKind {
     Paren(TypeId),
     Path(PathId),
@@ -254,16 +276,28 @@ pub enum TypeKind {
     },
 }
 
+#[derive(Debug)]
 pub struct Type {
-    kind: TypeKind,
-    span: Span,
+    pub kind: TypeKind,
+    pub span: Span,
 }
 
+#[derive(Debug)]
 pub struct Path {
     pub segments: Vec<PathExprSegment>,
     pub span: Span,
 }
 
+#[derive(Debug)]
+pub enum EntryRoot {
+    Expr(ExprId),
+    Type(TypeId),
+    /// `use` 声明没有对应的 `Item`（`parse_use` 返回 `Ok(None)`，见 `arch.md` §2.2）。
+    Item(Option<ItemId>),
+    Let(Stmt),
+}
+
+#[derive(Debug, Default)]
 pub struct Ast {
     pub items: Vec<Item>,
     pub root: Vec<ItemId>,
@@ -272,6 +306,7 @@ pub struct Ast {
     pub types: Vec<Type>,
     pub paths: Vec<Path>,
     pub consts: Vec<ConstValue>,
+    pub entry_root: Option<EntryRoot>,
 }
 #[cfg(test)]
 mod tests {

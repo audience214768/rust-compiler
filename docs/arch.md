@@ -215,22 +215,23 @@ struct Lexer<'a> {          // 类型与构造器都不对外，见 §1.1
 - **不变式**：`pos <= src.len()` **并不严格成立**。未终止块注释那一支会把 `pos` 推过文件末尾（实测走到 `len + 1`），所以**错误 span 必须 `min(src.len())` clamp**，否则渲染错误时切 `src[start..end]` 会 panic（单测 `unterminated_block_comment_span_is_clamped` 守着这条）。
 - **`Eof` 不推进 `pos`** ⇒ 流末尾之后再调 `next_token` 会**永远返回 `Eof`**。所以「什么时候停」不是 lexer 的事，是 `lex_all` 那个循环里一个显式的 `if eof`（§1.4）。
 
-**Parser —— 五个字段**（`src/frontend/parser.rs`，待写）：
+**Parser —— 四个字段**（`src/frontend/parser.rs`，已落地）：
 
 ```rust
 pub struct Parser<'a> {
-    src:  &'a [u8],           // 只给诊断取词用；判定一律不看它（§1.3.3）
-    toks: Vec<Token>,         // 全量 token + 尾部 Eof，必须自有、必须可变
-    pos:  usize,              // 游标 = 下一个待消费的 token 下标
-    no_struct_literal: bool,  // 条件边界标志（§1.5.3）
-    ast:  Ast,                // 边解析边填的 arena；结束时整体移出
+    src:  &'a [u8],    // 只给诊断取词用；判定一律不看它（§1.3.3）
+    toks: Vec<Token>,  // 全量 token + 尾部 Eof，必须自有、必须可变
+    pos:  usize,       // 游标 = 下一个待消费的 token 下标
+    ast:  Ast,         // 边解析边填的 arena；结束时整体移出
 }
 ```
 
-- **为什么 `src` 还要单独存一份**：`TokenKind` 无载荷（见 §1.2.2），要文本只能 `&src[span]` 现切。
+> **2026-09-22 改动：删掉了原设计的第 5 个字段 `no_struct_literal`。** 起因是逐字读了参考实现（rust-analyzer 的 parser，也就是本语料那份期望树的来源，commit `971903d9`）：它把两个上下文限制（`forbid_structs` / `prefer_stmt`）**按值传参**给 `expr_bp(min_bp, r)`，不做可变字段的存/恢复。这样做直接消掉了原设计里"进了括号忘了恢复标志"这一整类 bug——进 `(` `[`、实参、数组元素、字段值、块体时**传 `VALUE` 常量**就行，没有"恢复"这个动作可忘。代价是 `parse_expr_bp` 多一个参数。细节见 [`spec-mapping.md`](spec-mapping.md) §2.9.1 之（3）。
+
+- **为什么 `src` 还要单独存一份**：`TokenKind` 无载荷（见 §1.2.2），要文本只能 `&src[span]` 现切。⚠ 到 2026-09-22 为止 parser 里还没有任何一处真的读过它——若写完全部 `parse_*` 仍然如此，说明这个字段该删（编译器会一直报 `field is never read`，留意它）。
 - **为什么 `toks` 必须自有且可变**：切分要**原地改写** `toks[pos]`（§1.5.1），流式 token 源做不到。
 - **为什么 arena 装在一个 `ast: Ast` 字段里**而不是 6 个平铺字段：结束时一句 `Ok(self.ast)` 就移出（平铺要 6 次 `mem::take`），也让「AST 是独立于 parser 的值」在类型上看得见。`toks` 自有的理由见 §1.3.2。
-- **不变式**：`toks` 末尾恰好一个 `Eof` ⇒ 游标永不越界；`pos` **单调不减**（切分时不动它）⇒ 前端对 token 流是**单向扫描，永不回头**。
+- **不变式**：`toks` 末尾恰好一个 `Eof` ⇒ 游标永不越界；`pos` **单调不减**（切分时不动它）⇒ 前端对 token 流是**单向扫描，永不回头**。parser 侧对应的半条规则：`bump` **停在哨兵 `Eof` 上不再前进**（和 lexer 的「`Eof` 不推进 `pos`」是同一条规则的两半），代价是每个循环都得自己拿 `at(Eof)` / `expect` 收口。
 
 #### 1.2.2 部件之间传的值
 
@@ -317,7 +318,7 @@ pub struct Item { pub kind: ItemKind, pub span: Span }
 pub enum ItemKind {
     Fn {
         name: Name,
-        receiver: Option<Receiver>,   // 有 self 时，params 里不再重复它
+        recv: Option<Receiver>,       // 有 self 时，params 里不再重复它
         params: Vec<Param>,
         ret: Option<TypeId>,          // None ⇒ 返回 ()
         body: BlockId,
@@ -374,7 +375,7 @@ pub enum ExprKind {
     Unit,                                                      // ()
     Array(Vec<ExprId>),                                        // [a, b, c]
     ArrayRepeat { elem: ExprId, len: ConstValueId },           // [0; N]
-    Struct { path: PathId, fields: Vec<FieldInit>, base: Option<ExprId> },  // S{f} / S{f, ..b} / S
+    Struct { path: PathId, fields: Vec<FieldInit>, base: Option<ExprId> },  // S{x: 1} / S::<'a>{…} / S{}
     Block(BlockId),                                            // { ... }
     If   { cond: ExprId, then_block: BlockId, else_branch: Option<ExprId> },
     Loop(BlockId),
@@ -398,8 +399,10 @@ pub enum ExprKind {
 }
 
 pub enum Lit { Int { digits: Span, suffix: Option<Span> }, Bool(bool) }
-pub struct FieldInit { pub name: Name, pub value: ExprId }     // S { x } 简写 = value 指向同名 Path
+pub struct FieldInit { pub name: Name, pub value: ExprId }
 ```
+
+**`Struct` 的字面量语法只有一种形状**（`struct-expr.md`）：`StructExpression -> PathInExpression '{' StructExprFields? '}'`，`StructExprField -> IDENTIFIER ':' Expression`。⇒ **没有 `S { x }` 简写**（`x` 后必须有 `:`），**没有 `..base` 功能更新语法**，`S {}` 合法（零字段 struct）。于是 `base` 是个**死字段**：`parse_struct_expr` 永远写 `None`，sema 直接忽略它。留着的唯一理由是它已写进已定的节点定义；**删它要趁 sema 开工前一次做掉**（`parse` 阶段零成本——反正解析时只写 `None`），否则半路删会牵动 sema 的 match 臂。
 
 `else_branch` 存 `ExprId` 而不是 `BlockId`——理由见 §1.5.4。`Lit::Int` 的 `digits` 只是个 `Span`，**整数不在前端解析成数值**，范围检查推迟到语义阶段（下面那条）。
 
@@ -539,7 +542,9 @@ pub enum ConstValueKind {
 
 ##### 1.2.2.2 解析完就丢的两类（第三类其实是拒掉）
 
-**「不建节点」和「不解析」是两回事**。规范明确允许**解析完就丢**的只有**两类**（`grammar.md` 的 "Syntax that may be discarded after parsing"）：`use` 和生命周期。这两类语法必须完整走一遍，否则负例测试里的畸形写法会被接受；但走完之后不留任何节点。
+**「不建节点」和「不解析」是两回事**。规范明确允许**解析完就丢**的只有**两类**（`grammar.md` 的 "Syntax that may be discarded after parsing"）：`use` 和生命周期。这两类语法必须完整走一遍，否则负例测试里的畸形写法会被接受；但走完之后不留任何**可达**节点。
+
+⚠ **「可达」这个词是必要的**（2026-09-22 补）：`parse_type_root` 之类会顺手写 arena（`push_type`），所以丢掉返回值之后，arena 里会留下**从根不可达**的孤儿节点。`WhereClauseItem -> Type ':' TypeParamBounds?` 里那个 `Type` 就是第一处：它必须**真解析**（`Foo::Bar` 里的 `::` 会骗过「扫到 `:` 为止」的土办法），但结果不回填 AST ⇒ `ast.types` 里多一个孤儿。**这是设计允许的**——AST 由「从 `ast.root` / `entry_root` 可达」定义，arena 只是池子；不做回滚（要同时截 `types`/`paths`/`consts`，多一个不变量要守，只省几个字节）。⇒ 将来建 `Tables` 的 `types` 侧表时**按可达性填**，孤儿槽留空，**别写 `assert!(全填满)`**。真需要回滚的场合是前瞻试解析（try A，失败回退试 B），那天再建。
 
 | 丢什么 | 依据 | 落了什么 |
 |---|---|---|
@@ -640,15 +645,16 @@ pub enum SyntaxErrorKind {
     ExpectedType,          // 要一个类型
     ExpectedItem,          // 要一条 item（use / fn / struct / const / impl）
     ChainedComparison,     // a < b < c：规范要求加括号消歧
+    TypeArgsOnMethodSegment,  // x.foo::<i32>()：方法段上的类型实参（§5.2.1 决定 3、spec-mapping §2.10）
     ReservedKeyword,       // match / enum / trait / pub …（子集外，无载荷）
 }
 ```
 
-各变体的触发点：`Expected(Semi)` 由 `expect` 报（`let x = 1 }`）；`Expected(Eof)` 由 `parse_crate` 收尾报（`fn main() {} x`）；`ExpectedExpression` / `ExpectedType` / `ExpectedItem` 分别由 `parse_atom` / `parse_type` / `parse_item` 的分派失败报（`let x = ;` / `let x: = 1;` / 顶层裸 `42`）；`ChainedComparison` 由爬升循环报（§1.5.2）；`ReservedKeyword` 由原子或 item 分派看到 `Reserved` 时报（`match x {}`）。
+各变体的触发点：`Expected(Semi)` 由 `expect` 报（`let x = 1 }`）；`Expected(Eof)` 由五个入口共用的收尾 `finish` 报（`fn main() {} x`）；`ExpectedExpression` / `ExpectedType` / `ExpectedItem` 分别由 `parse_atom` / `parse_type` / `parse_item` 的分派失败报（`let x = ;` / `let x: = 1;` / 顶层裸 `42`）；`ChainedComparison` 由爬升循环报（§1.5.2）；`TypeArgsOnMethodSegment` 由后缀循环解析方法段时报（判据是段的 `args.is_some()`，不是 `types` 非空——`x.foo::<>()` 那种拿到的是 `Some(空)`）；`ReservedKeyword` 由原子或 item 分派看到 `Reserved` 时报（`match x {}`）。
 
 三条设计依据：
 
-1. **拆变体的标准是「消息形状不同」**，不是「语法位置不同」。`Expected(TokenKind)` 能点名具体要哪个 token，另外三个只能说出一**类**——形状不同，所以必须分开。反过来，93 条产生式里所有「缺个具体符号」的错都塌进 `Expected` 一个变体，不按产生式拆。
+1. **拆变体的标准是「消息形状不同」**，不是「语法位置不同」。`Expected(TokenKind)` 能点名具体要哪个 token，另外几个只能说出一**类**——形状不同，所以必须分开。反过来，93 条产生式里所有「缺个具体符号」的错都塌进 `Expected` 一个变体，不按产生式拆。
 2. **负例测试只判「拒没拒」**（`plan.md` §3.1 Q2 待课程确认），所以这份分类的用途是**给人看**，不是给测试分辨——够用就好，别按产生式铺开。
 3. **`ReservedKeyword` 无载荷，渲染时切 span 点名**——13 个 reserved 关键字在词法层塌成一个 `TokenKind::Reserved`，parser 分不出是哪个，只能靠 `&src[span]` 现切。这与 §1.3.3 那条「报错里点名 `box` 只能靠 span 现切」是同一个手法。
 
@@ -688,7 +694,7 @@ parse_function                 解析 fn main() { ... }
  └ parse_block                 解析 { ... }
     └ parse_statement          解析一条语句
        └ parse_if              发现是 if，解析整个 if 表达式
-          ├ parse_condition    解析条件
+          ├ 条件                 parse_expr_bp(0, CONDITION)，无独立函数（§1.5.3）
           ├ parse_block        解析 { ... }     ← 又回到 parse_block
           └ parse_block                          ← 语法的嵌套 = 调用栈的嵌套
 ```
@@ -738,13 +744,14 @@ parse_function                 解析 fn main() { ... }
 
 | 规则 | 问题 | 解法 |
 |---|---|---|
-| **语句边界** | `if c {} -1;` 该读成 `(if c {}) - 1`，还是「语句 `if c {}`，然后 `-1`」？ | 语句位置的块形式表达式**到块尾就结束** ⇒ 同一段表达式代码**两个入口**：值位置爬升、语句位置不爬升 |
+| **语句边界** | `if c {} -1;` 该读成 `(if c {}) - 1`，还是「语句 `if c {}`，然后 `-1`」？ | 同一段表达式代码**两个入口**：值位置无脑爬升；语句位置是「原子 + 后缀，**后缀跑完后若仍是块形式才不爬升**」。⚠ 判据是**后缀之后**的 lhs，不是原子——`{p}.x = 10;` 靠这条才活得下来 |
 | **块尾** | 块最后一个不带 `;` 的表达式是块的值——它算「语句」还是「值」？ | `parse_block_body` 只有一条规则：吃 `;` 成功 = 语句、继续循环；看到 `}` 收工。**谁是块尾留给语义阶段派生**（见下） |
-| **条件边界** | `if flag { }` 的 `{` 是体块，还是结构体字面量 `flag {}`？ | 用 `no_struct_literal` 标志：进条件置 `true`，进任何「里面是普通表达式」的位置置 `false` |
+| **条件边界** | `if flag { }` 的 `{` 是体块，还是结构体字面量 `flag {}`？ | 表达式解析的上下文限制 `forbid_structs`：`if` / `while` 的条件置它，其余位置不置。**按值传参，不做存/恢复** |
 
 三条规则里只有**语句边界**改变了代码结构（同一条产生式两个入口），另两条都是**在已有代码上加一个开关或减一个字段**：
 
-- **条件边界**的开关用闭包存/恢复（`with_no_struct_literal`），**最容易漏的进入点是「块体」**——`if loop { let p = Point { x: 1 }; break true; } {}` 里，解析条件期间标志一直是 `true`，内层 `loop` 的体块必须在 `false` 下解析。对称地，**前缀运算符的操作数要原样继承标志**（`if &S { x: 1 } { }` 里 `&` 后的 `{` 仍是体块）——`(` `[` 那类是「存旧值 → 置假 → 恢复」，`Neg` / `Not` / `Deref` / `Ref` 这类是「什么都不做」。不用 RAII guard 的理由是借用检查：guard 可变借走 `self.no_struct_literal` 时还要再借 `&mut self` 调 `parse_x()`。**如实说明**：在「首个错误立即返回」策略下，泄漏的标志位本就不可观测（错误一冒泡 `Parser` 就被丢弃），所以闭包买的不是当前正确性，而是 S6 若加错误恢复时不必回头改。
+- **条件边界**的两个限制（`forbid_structs` / `prefer_stmt`）**按值传参**给 `parse_expr_bp(min_bp, r)`，不做字段的存/恢复（2026-09-22 改，理由见 §1.2.1 那个改动说明）。于是"进一个普通表达式上下文"就等于"传 `VALUE` 常量"：`(` `[`、调用实参、数组元素、字段值、块体、`break`/`return` 的操作数全都是这一条，**没有"最容易漏的进入点"这回事了**。前缀运算符 `-` `!` `*` `&` `&mut` 的操作数**原样继承 `r`**（`if &S { x: 1 } { }` 里 `&` 后的 `{` 仍是体块）。中缀右侧是按 `Restrictions { prefer_stmt: false, ..r }` 解——**语句性在运算符右侧被重置，`forbid_structs` 照旧继承**（`v = {1}&2;` 靠这条）。
+- **两个边界规则共用同一只开关**：`break` 操作数的判据是「能起表达式 **且不是**（`forbid_structs` 且下一个是 `{`）」，用到的正是条件边界那个标志。⇒ `if break {}` 里 `{}` 留给 `if` 当体块，而语句位置的 `loop { break { 9 }; }` 里 `{9}` 是 `break` 的值。**`break` 是唯一有这个判据的**：`return` 的操作数不继承限制、`continue` 干脆没有操作数。逐字转录与用例见 [`spec-mapping.md`](spec-mapping.md) §2.9.1。
 - **块尾**是规范自相矛盾处（两方原文见 [`plan.md`](plan.md) §3.1 Q11）：`block-expr.md` 的产生式说块尾只许 `ExpressionWithoutBlock`，同一个文件的例子却拿 `{ base + 1 }` 当块尾并 yield `i32`。**parser 对此完全中立**——`Block` 只存 `stmts`（**没有 `tail` 字段**），「谁是块尾」是语义阶段的派生访问器（读法 B 只看最后一条是否 `semi: false`）⇒ **换边成本 = 改这一个访问器**。这也是 `StmtKind::Expr` 必须如实记录 `semi` 的原因：它是唯一能区分「块尾」与「语句」的信息。
 
 #### 1.5.4 一处数据结构的决定：`else` 存 `ExprId` 而不是 `BlockId`
@@ -790,7 +797,40 @@ parser/reject/path_item_without_excl-….rx   内容: foo\n   entry: crate
 
 ⇒ **五条里没有一条是新规则**，全是已经写进 [`spec-mapping.md`](spec-mapping.md) 的既有边界——测试点只是在**逼我们把它们真的实现出来**。
 
+**决策四：五个入口统一返回 `Result<Ast, FrontendError>`，碎片入口解析出的那个节点记在 `Ast::entry_root`。**
+
+```rust
+pub enum EntryRoot {
+    Expr(ExprId),
+    Type(TypeId),
+    Item(Option<ItemId>),   // use 声明没有对应的 Item（`parse_use` 返回 Ok(None)，§2.2）
+    Let(Stmt),              // Stmt 不住在 arena 里（§1.2.2.1），所以这一支是值不是 id
+}
+```
+
+四个碎片入口的产物不是一份 crate，光看 arena 认不出哪一个是根。记一笔之后：五个入口签名一致、`parse_let` 的结果也不会"解析完就丢掉"，AST 打印器不必为碎片入口各写一条路径。`parse_crate` 下它是 `None`（顶层项在 `root` 里）。
+
 **代价与风险**：`--entry=` 的拼写是自定的（[`plan.md`](plan.md) §3.1 Q14），若官方约定不同，改动量 = driver 里一个 `match` 加四个 wrapper 的函数名，**AST 与 `Parser` 一行不动**——这是把风险关在最小面上的做法。
+**入口从哪来**（2026-09-22 查证）：`metadata.entry` 是全语料唯一记着解析入口的地方。官方 `manifest.schema.json` 明说 metadata「Not used for grading」，但 parser stage 的入口提示只在这里，所以我们的 runner 照读（`scripts/parse_test.py`）。读到不认识的 `entry` 值**直接报错退出**，不要默认成 `crate`——那会让一半碎片静默走错入口。
+
+#### 1.5.6 列表的终止条件 = FIRST 集（2026-09-23 定）
+
+`WhereClause`（`Parser.g4:104-106`）和 `FunctionParameters`（`functions.md`）是同一类麻烦的产生式：**列表整体可选 + 元素可选 + 尾逗号可选，而且列表自己没有终结符**。`FunctionParameters -> SelfParam `,`? | (SelfParam `,`)? FunctionParam (`,` FunctionParam)* `,`?` 里没有括号——那个 `)` 是 `Function` 产生式的 token，不在列表手里；`WhereClause` 同理，`{` 是 struct/impl/fn 的。⇒ **读完最后一个元素之后，没有任何属于本列表的 token 能告诉你「到此为止」**，parser 必须自己判。
+
+**两条路，我们统一选 FIRST**：
+
+| | 判据 | 代价 |
+|---|---|---|
+| **FIRST**（选它） | 下一个 token 能否**起一个元素**？ | 需要把 FIRST 集写对（`at_type_start()` 那 7 个 token） |
+| FOLLOW | 下一个 token 是不是**外层的后继**？（rust-analyzer 的 `opt_where_clause` 用 `{` / `;` / `=` 收尾） | parser 得知道「我现在在谁肚子里」。Rx 里 `where` 的三个宿主（struct / impl / fn）后继恰好都是 `{`，所以照着抄也能跑；**但将来多一个后继不是 `{` 的宿主就得改**，FIRST 一个字不用动 |
+
+**白拿的安全性质**：`while <纯 token 集判定>` 在 `Eof` 上**必然为假** ⇒ 循环不可能空转。FOLLOW 那一版没这个性质，必须手写 `&& !at(Eof)` 保命——[`spec-mapping.md`](spec-mapping.md):190 记的那个坑（`bump` 在 `Eof` 上不推进 `pos`，截断输入让循环空转，而判分口径里**超时 = 失败**）在 FIRST 这一版是靠构造避开的，不是靠记得加检查。
+
+**为什么不让 `parse_type_root` 自己兼任这个判定**（本节最该记住的一条）：它内部全是 `expect`，而 `expect` 是 **fail-hard** 的——只有「对」和「炸」，**没有「没有」这个返回值**。可 `where {`、尾逗号之后需要的那个「没有」是**合法**的（`where` 整组是 `( ... )?`），不能是错误。于是「`match` 住 `Err`，把它当『这儿没类型』」这条路，要成立必须先记下 `pos`、失败后确认 **`pos` 没动**——因为 `parse_type_root` 会**吃过 token 才失败**：`where & : 'a` 是吃掉 `&`、去解析内层类型、看到 `:` 才炸的，不倒回去就谈不上「一个 token 都没消费」。**而那个 `pos == save` 守卫就是 FIRST 集本身**（「首 token 能不能起一个类型」≡「试过之后游标动没动」）。⇒ 事前问一次（`at_type_start()`）与事后补守卫是**同一个判断的两种问法**，选事前：事后那版依赖「`parse_type_root` 绝不在吃 token 之后失败」这个每加一支分支都得重新维持的隐形不变量，还会在「没元素」那一支里白造一个 `Err` 再扔掉。（不带 `pos` 守卫、直接把失败当「没有」并把游标倒回去，那是**回溯**，[`spec-mapping.md`](spec-mapping.md):179 已否。）
+
+**实现约定：判定与消费写在同一个函数里**，形状是「有就吃并返回 `true`，没有就**一个 token 都不动**返回 `false`」（`Result<bool>`），循环写成 `while 谓词 { if !eat(Comma) { break } }`。这样 FIRST 集**只有一份**、且和消费它的代码挨着。**拆成 `at_xxx()` + `parse_xxx()` 两个函数本身不违法**（[`spec-mapping.md`](spec-mapping.md):177 那条「判定函数不许有副作用」管的是别处）；违法的是**拆开之后循环仍然拿 FIRST 判终止**——那时集合才有两份，分别住在判定函数和循环条件里，加一支而忘了改另一处 ⇒ **合法程序被静默判成「没有元素」**。
+
+**落地与例外**：走这条的是 `at_type_start()` + `parse_where_clause_item() -> Result<bool>`（已落地，`parser.rs`）。**参数表是刻意不跟的例外**：它的循环用 **FOLLOW**（`!at(RParen)`，形状见 [`spec-mapping.md`](spec-mapping.md) §2.3.1），因为 `)` 就在眼前、跟着写最省事，代价是必须自己补上 `!at(Eof)`。那里不会有「集合两份」的问题——`parse_self()` 是**融合**的（返回 `Result<Option<Receiver>, _>`，有就吃、没有就 `None`），压根不参与判终止，拆不拆都合规。（§2.3.1 写的是拆分版计划名 `at_self_param()`；两种写法都对，差别只在「谁回答『表头有没有接收者』」，落地时以代码为准。）⇒ **规则是「FIRST 集不许写两份」，不是「一律不许用 FOLLOW」**；选 FOLLOW 时要明知故犯地补上 `Eof` 守卫。
 
 ### 1.6 两个走查例子
 
@@ -801,20 +841,24 @@ parser/reject/path_item_without_excl-….rx   内容: foo\n   entry: crate
 **② parser 走一遍，边走边建树**：
 
 ```
-parse_statement：cur = If，是块形式 → 走"不爬升"入口
- └ parse_if()
-    ├ bump() 吃掉 If；parse_condition() 置 no_struct_literal = true
-    │   └ parse_expr_bp(0)：原子 Ident(flag) → Path(flag) = e0
-    │       后缀：cur = LBrace 不是 . ( [ → 停
-    │       爬升：peek_infix(LBrace) 无 → 返回 e0   ← 条件到此为止，span 只覆盖 flag
-    │       恢复 no_struct_literal
-    ├ parse_block()  then：吃 LBrace，parse_block_body 见 IntLiteral(1) → e1
-    │       吃 ; ？ cur = RBrace → 否 ⇒ 收工，返回 [StmtKind::Expr{e1, semi:false}]  ← 块尾是**派生**的
-    │       吃 RBrace ⇒ b0 = Block{ stmts:[…e1…] }
-    ├ cur = Else → bump()；parse_block() 同流程 ⇒ b1，包成 ExprKind::Block(b1) ⇒ e3
-    └ 造 ExprKind::If{ cond:e0, then_block:b0, else_branch:Some(e3) } ⇒ e4
- └ parse_postfix(e4)：cur = RBrace → 无后缀 → e4
+parse_statement：首 token = If ∈ 块形式集 ⇒ 这条表达式语句按 Restrictions::STATEMENT 解
+ └ parse_expr_bp(0, STATEMENT)
+    ├ 原子分派：cur = If → parse_if()
+    │   ├ bump() 吃掉 If；parse_expr_bp(0, CONDITION) 解条件
+    │   │   └ 原子 Ident(flag) → Path(flag) = e0
+    │   │       后缀循环：cur = LBrace，不是 . ( [ → 一个都不吃
+    │   │       爬升循环：peek_infix(LBrace) 无 → 返回 e0   ← 条件到此为止，span 只覆盖 flag
+    │   ├ parse_block()  then：吃 LBrace，见 IntLiteral(1) → e1
+    │   │       吃 ; ？ cur = RBrace → 否 ⇒ 收工，返回 [StmtKind::Expr{e1, semi:false}]  ← 块尾是**派生**的
+    │   │       吃 RBrace ⇒ b0 = Block{ stmts:[…e1…] }
+    │   ├ cur = Else → bump()；调**同一个**"解析块形式原子"再来一次 ⇒ b1
+    │   │       包成 ExprKind::Block(b1) ⇒ e3        （`else if` 只是这里再走进 If 那一支）
+    │   └ 造 ExprKind::If{ cond:e0, then_block:b0, else_branch:Some(e3) } ⇒ e4
+    ├ 后缀循环：cur = RBrace → 一个都不吃，lhs 仍是块形式
+    └ r.prefer_stmt 且 lhs 仍是块形式 ⇒ 就地收工，**不进爬升循环**    ← 语句边界规则 ①
 ```
+
+条件那一支没有"存/恢复 `no_struct_literal`"这一步：限制是**按值传进 `parse_expr_bp` 的参数**（§1.5.3），`CONDITION` 传下去就完事，出来自然回到调用方的 `r`，**没有"忘了恢复"这条 bug 可犯**。
 
 **③ 得到的 arena**：
 
@@ -1024,6 +1068,24 @@ pass 的形态就是「遍历 IR → 改写 IR」，不需要跨 pass 的调度�
 - ⇒ 输入一律在 `&[u8]` 上扫描（规范保证 7-bit ASCII），`pos` 天然就是字节偏移，不需要 `Vec<char>`
 - ⇒ `Ast` 不带 `src`（返回类型上没有生命周期参数）⇒ **谁要文本，谁把 `(&Ast, &[u8])` 一起带上**
 
+**节点 Span 的约定（2026-09-22 定）**：一个节点的 `span` = **它在源码里占的完整字节范围**，没有例外。理由不是整齐，是 `Span` 唯一的用途就是报错时指出哪段代码有问题（`error.rs` 拿它算行列）。
+
+- ⇒ `ItemKind::Fn` 的 span 覆盖整个 `fn 名(参数) -> 返回类型 where … { 体 }`，**含 body**；`ItemKind::Struct` 的 span 从 `#[derive(...)]` 的 `#` 开始（属性是 item 的一部分，`traits-and-attributes.md:15`）。
+- **两条调用纪律**：`mark()` 在吃掉**第一个** token **之前**取；`span_from(m)` 在吃完**最后一个** token **之后**取。中间隔多少层递归都无所谓——`span_from` 只看 `mark` 和当时的 `pos`，不关心是谁吃的 token。这正是 `parse_fn` 敢让 body 下沉三四层（`parse_block → parse_statement → parse_expr_bp → parse_if`）再一个 `span_from(m)` 圈住整段的原因。
+- ⇒ 因此 `parse_item` 的 `mark()` 必须提到**属性之前**。属性在 struct 前面，而 §2.6 那条"属性只能出现在顶层具名 struct 之前"是**分派之后**才校验的；在 `parse_struct` 内部才 `mark()` 会丢掉 `#[derive(...)]`。
+- **单 token 的节点不要用 `mark`/`span_from`**，直接用 `expect`/`bump` 返回的 `Token`：`let tok = self.expect(TokenKind::Ident)?; Name { span: tok.span }`。`Token.span` 恰好是该 token 自己的字节范围（`lexer.rs` 的 `let start = self.pos;` 在跳过空白/注释之后、`end: self.pos` 在消费完之后），天然就对，且没有 off-by-one 的机会。
+
+**`mark` / `span_from` 到底算什么**（容易被误读，所以写死）：`pos` 指向**下一个还没消费的** token，所以"最后一个已消费的"是 `pos - 1`。
+
+```
+span_from(mark) = [toks[mark].span.start, toks[pos-1].span.end)    // pos > mark
+                = [toks[mark].span.start, toks[mark].span.start)   // 一个都没消费 ⇒ 零宽
+```
+
+⇒ 它**不是**「上一个 token 结束到这一个 token 开始」——那是 `[toks[pos-1].end, toks[pos].start)`，即两个 token 之间的**空白/注释**。用 §1.6.1 的数走一遍：`if flag { 1 } else { 2 }` 的 token span 依次是 `if`=0..2、`flag`=3..7、`{`=8..9、`1`=10..11、`}`=12..13、`else`=14..18、`{`=19..20、`2`=21..22、`}`=23..24 ⇒ then 块 `mark=2, pos=5` → `[8,13)` ✓；整个 if `mark=0, pos=9` → `[0,24)` ✓；空块 `{}` `mark=2, pos=3` → `[8,9)` ✓。
+
+`pos == mark`（一个 token 都没吃）时 `end = start`。**这把 `end` 钉死在 ≥ `start`**，所以不会出现 `end < start` 的 u32 回绕。
+
 #### 5.2.1 名字的表示（2026-09-21 定）
 
 **起因**：问「`Method.name: Span` 是否有『比较慢 / 查表要 interning / 不能表达泛型与 `Self`』三个缺点」。逐条复核的结果是**两条诊断错了、第三条要拆开，而真正的洞比这三条都严重**：
@@ -1070,6 +1132,6 @@ pass 的形态就是「遍历 IR → 改写 IR」，不需要跨 pass 的调度�
 
 ⇒ **三条设计结论**（都是"按已核实的契约"推出来的，不是猜的）：
 
-1. **"首个错误立即返回"是正确的架构，不要改成错误恢复。** 既然不要求措辞、不要求多处报错，恢复逻辑就是纯粹的成本。`Parser` 里那个 `no_struct_literal` 的存/恢复闭包（§1.5.3）留着是为将来留余地，**不是现在要用的**。
+1. **"首个错误立即返回"是正确的架构，不要改成错误恢复。** 既然不要求措辞、不要求多处报错，恢复逻辑就是纯粹的成本。同理，`Parser` 里**没有**任何"当前上下文标志"字段需要存/恢复——上下文限制是按值传进 `parse_expr_bp` 的参数（§1.5.3），少了整整一类"忘了恢复"的 bug。
 2. **"宽松"是最危险的失败模式。** 负例判分是二值的：一个**没被检查出来**的错误 = 一条挂掉的测试点。所以每条规则都要问"**不做会怎样**"——`spec-mapping.md` §4 那张"必须报错"清单是逐条对着测试点核过的。
 3. **UB 仍然从简。** `undefined-behavior.md` 的 Test guarantees 表明确把一批情况排除在测试之外（整数字面量越界、需要穿过运算符的期望类型传播、`==` 两侧源类型不同…）⇒ 这些**可以随便处理**，但**不能 panic**（panic 是 crash，算失败）。**"随便"不等于"崩"**。

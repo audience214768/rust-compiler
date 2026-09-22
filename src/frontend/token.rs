@@ -17,8 +17,8 @@ pub enum TokenKind {
     Let,
     Mod,
     Move,
-    SelfValue,
-    SelfType,
+    SelfValue, //self
+    SelfType, //Self
     Super,
     Unsafe,
     Use,

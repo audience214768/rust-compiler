@@ -57,10 +57,10 @@
 ### 1.3 W1–W4 · AST 阶段（ddl 10/11）
 
 - [x] **W1：前端方案决策**（2026-09-18，结论见 [`arch.md`](arch.md) §1.1；09-19 按新规范复核维持）
-- [ ] **测试运行器**（§2.0）——**越早越好，W1 就能跑**：仓库不自带运行器，没有它整个学期都在盲跑
-- [ ] **前端 S1–S6**（分解见 §2.2），目标 10/4 前跑通；`token.rs` / `lexer.rs` 的既有问题已清空（§2.3）
-- [ ] **五个解析入口 `--entry=`**（§2.0 / [`arch.md`](arch.md) §1.5.5）——stage 阶段测试点有 323/442 是**语法碎片**，只做 `parse_crate` 会直接挂掉约 295 个正例
-- [ ] AST 数据结构设计（形态见 [`arch.md`](arch.md) §1.2）
+- [x] **测试运行器**（§2.0）——**越早越好，W1 就能跑**：仓库不自带运行器，没有它整个学期都在盲跑。✅ 2026-09-22：官方 `test.py` 就位（§2.5）+ `scripts/parse_test.py` 自写运行器（`lex` 那份还没写，见 §2.4）
+- [ ] **前端 S1–S7**（分解见 §2.2），目标 10/4 前跑通；`token.rs` / `lexer.rs` 的既有问题已清空（§2.3）
+- [x] **五个解析入口 `--entry=`**（§2.0 / [`arch.md`](arch.md) §1.5.5）——stage 阶段测试点有 323/442 是**语法碎片**，只做 `parse_crate` 会直接挂掉约 295 个正例。✅ 2026-09-22：五个 `pub fn` wrapper + driver 开关已就位（**内部真实现待补**）
+- [x] AST 数据结构设计（形态见 [`arch.md`](arch.md) §1.2）——✅ 2026-09-22 落地
 - [ ] 符号表 / 作用域 / 类型检查（`names.md` 命名空间规则、`types.md` 推断与 coercion、方法查找）
 - [ ] 常见错误路径：非法输入需**非 0 退出且不 panic / 不超时 / 不被信号打死**（这正是负例的判定标准，措辞不限）
 - [ ] AST 打印/导出，作为验收与自查手段
@@ -154,8 +154,8 @@
 
 ### 2.1 当前进度与本周（W2）要做的三件事
 
-> **当前代码进度**（截至 2026-09-22）：只走到 ① 前端，且 ① 里只有 `token.rs` / `lexer.rs` / `error.rs` 完成；`ast.rs` 与 `parser.rs` 是空壳（`ast.rs` 已有节点草稿 + 3 条尺寸断言），② 语义 / ③ 中端 / ④ 后端 / ⑤ 优化 的目录尚未创建。
-> 已知遗留：`SyntaxErrorKind` / `FrontendError` 暂无构造点（parser 还没写），`never constructed` 与既有的 `Parser is never constructed` 同源，parser 落地即消。
+> **当前代码进度**（截至 2026-09-22）：只走到 ① 前端。① 里 `token.rs` / `lexer.rs` / `error.rs` / `ast.rs` **已完成**；`parser.rs` 的**骨架**已完成（`Parser` 四字段、游标原语、五个入口 wrapper、`Restrictions`、arena 写入辅助），五个 `parse_*_root` 还是**直接报错的占位**；driver 的 `--stage=` / `--entry=` 开关与自写运行器 `scripts/parse_test.py` 已就绪。② 语义 / ③ 中端 / ④ 后端 / ⑤ 优化 的目录尚未创建。
+> 已知遗留：`SyntaxErrorKind` / `FrontendError` 的构造点**只有 `expect` 与五个占位**（真实现还没写），`never constructed` 与既有的 `Parser is never constructed` 同源，parser 落地即消。
 > **主动推迟的一项**（2026-09-21）：名字暂不 interning，用 `Name { span }` + sema 的 `Names` 现切现比——理由与将来的替换成本见 [`arch.md`](arch.md) §5.2.1。**等 sema 把名字解析写出来后再评估一次**（那时才知道比较点长什么样）。
 
 **实测基线（2026-09-22，用现有 driver 逐个跑 manifest、只比退出码）**——这张表比任何估时都诚实：
@@ -163,7 +163,7 @@
 | stage | 实测 | 真过 / 假过 |
 |---|---|---|
 | `lexer` | **53 / 53** | ✅ **真过**——词法阶段已经符合已发布的测试点 |
-| `parser` | 370 / 442 | ⚠ 其中 **365 个是假过**（driver 只 lex 就 `exit 0`）；真正挂的是 **72 个负例**（67 个 `crate` 入口 + 5 个 `expression` 入口） |
+| `parser` | 370 / 442 | ⚠ 其中 **365 个是假过**（driver 只 lex 就 `exit 0`）；真正挂的是 **72 个负例**（67 个 `crate` 入口 + 5 个 `expression` 入口；另 5 个 `crate` 负例是**词法**错误，lexer 已经拦下了） |
 | `semantic` | 69 / 236 | ⚠ **69 个全是假过**，**167 个负例一个都没拦下来** |
 | `codegen` | 60 / 60 | ⚠ 全是假过，**115 组 io 一组都没跑过** |
 | `optimization` | 13 / 13 | ⚠ 全是假过，39 组 io 未跑 |
@@ -178,8 +178,8 @@ r = subprocess.run([BIN, p], capture_output=True)
 passed = (r.returncode == 0) == e['compilation_success']
 ```
 
-1. 🔧 **接官方运行器**（§2.5）**+ 给 `lex`/`parse` 补一个自写运行器**（§2.0 的缺口）——官方那套**跑不了 W4 的 495 个点**，所以"每一分钟都在盲跑"这句仍然成立，只是盲区缩小到了 W4 那两个 stage
-2. **开工 S2 + S3**（`ast.rs` 落地 → item 层）：**前端 ddl 是 10/4，今天已是 W2 周一**，§1.1 里"9/26 还没跑通 item/type 层就要下调验收目标"的预警**已经触发一半**——parser 现在还是 12 行的空壳
+1. ✅ **接官方运行器**（§2.5）**+ 给 `lex`/`parse` 补自写运行器**（§2.0 的缺口）——**已完成**：`scripts/parse_test.py` + driver 的 `--stage=` / `--entry=`，并用三个 shim 自检过（全 0 → 365/442；全拒 → 77/442；只 lex → **370/442**，与 §2.1 的基线逐格对上）
+2. **开工 S3 + S4**（类型层 → 表达式层；`ast.rs` 与 `Parser` 骨架已完成）：**前端 ddl 是 10/4，今天已是 W2 周一**，§1.1 里"9/26 还没跑通 item/type 层就要下调验收目标"的预警**已经触发一半**——`parse_*` 的真实现一行都还没写
 3. **发邮件问 §3.1 里还没答案的那几条**（Q1/Q2/Q3 已被测试点答掉大半；**真正要问的只剩 Q6、Q7–Q9、Q11–Q12、Q14–Q15**，Q10/Q13/Q16 已被规范原文或测试点答掉，Q10 只需在周报里提一句）
 
 > **REIMU 已到位（2026-09-22 更新）**：不必再去 `DarkSharpness/REIMU` 找预编译二进制了——模板把它作为**子模块 `vendor/REIMU`**（`wanoful/REIMU`，pin `66dcdbd`）固定住。本机已装 xmake 并编译通过（macOS 需要一个编译补丁，见 §2.5）。
@@ -191,27 +191,41 @@ passed = (r.returncode == 0) == e['compilation_success']
 | 步骤 | 内容 | 估时 | 对应测试点（`parser` stage，按 `entry` 分） |
 |---|---|---|---|
 | S1 | `token.rs` + `lexer.rs`：空白（**只有 4 种**）、嵌套注释、标识符/38+13 个关键字、整数字面量（radix + `_` + 后缀切分，**不设量级上限**）、lifetime token、44 个标点、ASCII 校验 + 报错通道 | ~~1–1.5 天~~ | ✅ **已完成：`lexer` 53/53** |
-| S2 | `ast.rs`（按 [`spec-mapping.md`](spec-mapping.md) §2 的映射列节点，每个带 Span；名字用 `Name` 不用裸 `Span`，见 §3.1 Q12） | 1 天 | 地基，无直接测试点 |
-| S3 | item 层：`use`（含 use tree/glob/alias）、`fn`（含接收者）、`struct`（含 derive 属性）、`const`、`impl`；以及 `Type` / `Path`（含 `GenericArgs` 与 turbofish）/ `WhereClause` / 生命周期参数 | 2–3 天 | `item` 28 正 + `typeRef` 101 正 |
-| S4 | statement / block（含**块尾规则**与**块形式表达式语句的边界规则**） | 1 天 | `letStatement` 13 正 |
-| S5 | **表达式优先级爬升** + 前缀/后缀/原子 + 三个边界规则（条件与循环体、cast 后的 `<`、struct 字面量） | 2–3 天 | `expression` **176 正**（+ 5 负） |
-| S6 | 错误信息与恢复、span 贯穿、AST 打印；`parse_const_value`（受限常量语法） | 1 天 | **72 个负例**（67 `crate` + 5 `expression`） |
+| S2 | `ast.rs`（按 [`spec-mapping.md`](spec-mapping.md) §2 的映射列节点，每个带 Span；名字用 `Name` 不用裸 `Span`，见 §3.1 Q12） | ~~1 天~~ | ✅ **已完成**（节点 + 6 个 `*Id` newtype + 6 个 arena + 3 条尺寸断言） |
+| S3 | **类型层**：`parse_type`（`(` / path / `&` / `[T; N]`）、`parse_type_path`、`parse_generic_args`、极简 `parse_const_value`、`&&` 切分 | 1 天 | `typeRef` **101 正 / 0 负** |
+| S4 | **表达式层**：原子 + 后缀循环 → 前缀 + 优先级爬升 → 块形式（`{` `if` `while` `loop` `break` `continue` `return`）+ 三条边界规则 | 4–5 天 | `expression` **176 正 / 5 负** |
+| S5 | **语句 / 块收口**：`parse_statement` 三分支、`parse_let`、`;` 可选性、空语句、块尾 | 0.5 天 | `letStatement` **13 正** |
+| S6 | **item 层**：`use`（use tree / glob / alias）、`fn`（含接收者）、`struct`（含 derive 属性）、`const`、`impl`；`parse_crate` 收口 | 1.5–2 天 | `item` **28 正** + `crate` **47 正** |
+| S7 | **负例加固**（**不做错误恢复**，只需每条都真的报到错） | 2–3 天 | **77 负**（72 `crate` + 5 `expression`） |
 
-合计 **8–10.5 个工作日**（旧规范估 4–6 天）。S6 完成打 tag `ast`。**全部跑通 = 365 正 + 77 负 = 442/442。**
+合计 **9–11.5 个工作日**（旧规范估 4–6 天）。S7 完成打 tag `ast`。**全部跑通 = 365 正 + 77 负 = 442/442。**
 
-⚠ **S6 那 72 个负例不是"拒掉 enum / match / for"那种粗活**——它们是 **rust-analyzer 的 parser 回归用例**（`0000_struct_field_missing_comma`、`0015_curly_in_params`、`arg_list_recovery`、`issue-101540`…共 69 个不同名），考的是**残缺/畸形输入的拒绝**：`require-parens-for-chained-comparison`（3 条）、missing comma、缺分号、空参数槽、坏 use 路径…**好消息是不用做错误恢复**——我们是"首个错误立即返回"，只要能拒就行，而这些用例本来就是"这里有个错"。
+> **2026-09-22 改了顺序（原来是 item 层在前）**：`plan.md` 原顺序是 S3(item) → S4(stmt) → S5(表达式)，**这会让 item 层的 28 个点大部分拿不到**——逐条核过，其中 **23 条需要完整的表达式 + 语句能力**：
+>
+> ```rust
+> fn ktulhu() { ;;;();;;;;;;;;() }                                    // 空语句 + 调用
+> fn t2() -> [u32; 1] { if true { [1,2,3]; } else { [2,3,4]; } [0] }  // 语句边界
+> fn abc() { Repr { raw: [0] }.raw[0] = 0; Repr{raw:[0]}(); }         // struct 字面量 + 索引 + 赋值
+> fn the(x: &Cell<bool>) { return while !x.get() { x.set(true); }; }  // return + while + 方法调用
+> ```
+>
+> 只有 5 条（`use std::mem::swap;` / `fn a() {}` / `struct S {}` / `const TEST: usize = 3;` / `impl () {}`）是光杆 item。
+> 反过来，**`typeRef` 的 101 条全是正例、零负例、且完全不依赖表达式**（唯一例外是 `[T; N]` 的 N，走极简 `parse_const_value`）⇒ **第一步就做类型层**，用最小的力气拿最大的一批绿点。**新顺序：自底向上** —— 类型 → 表达式 → 语句 → item/crate → 负例。
 
-**S2–S5 内部的落地顺序**（每步让一个规范里的具体例子从错变对，比按文件切更早暴露问题）：
+⚠ **S7 那 77 个负例不是"拒掉 enum / match / for"那种粗活**——它们是 **rust-analyzer 的 parser 回归用例**（`0000_struct_field_missing_comma`、`0015_curly_in_params`、`arg_list_recovery`、`issue-101540`…，77 条里 41 个不同的名字），考的是**残缺/畸形输入的拒绝**：`require-parens-for-chained-comparison`（3 条）、missing comma、缺分号、空参数槽、坏 use 路径…**好消息是不用做错误恢复**——我们是"首个错误立即返回"，只要能拒就行，而这些用例本来就是"这里有个错"。
+
+**S3–S5 内部的落地顺序**（每步让一个规范里的具体例子从错变对，比按文件切更早暴露问题）：
 
 | 步 | 做什么 | 最小验证用例 |
 |---|---|---|
-| 0 | `ast.rs`：列节点 + 6 个 `*Id` newtype + 6 个 arena（**parser 的地基**） | `cargo build` 通过 |
-| 1 | `parse_function` / `parse_block` / `parse_statement` / `parse_atom`，**不做运算符** | `fn main() { }` |
-| 2 | "全程爬升"的表达式版本 | `let value = if true { 10 } else { 20 } - 1;` |
-| 3 | 加语句边界分支 | `if true {} else {} -1;`（这步之前它是**错**的） |
-| 4 | 加块尾（记 `semi`，`tail()` 派生） | `{ a; b }` / `{ a }` / `{ if c {1} else {2} }`（最后一条取决于 Q11） |
-| 5 | 加 `no_struct_literal` | `if (S{flag:true}).flag {}` / `if check(S{flag:true}) {}` / `if { true } {}` |
-| 6 | 加标点切分 | `Vec<Vec<i32>>= x;` / `&&x` / `&&i32` |
+| 0 | ✅ `Parser` 骨架：游标原语（`bump`/`nth`/`eat`/`expect`/`mark`/`span_from`）+ 五个入口 wrapper + `Restrictions` + arena 写入辅助（**parser 的地基**） | `cargo build` 干净、`cargo test` 全绿 |
+| 1 | 类型层：`parse_type` 的四个分支 + `parse_const_value` | `&&i32` / `[u32; 1]` / `&'static ()`（→ `typeRef` 101） |
+| 2 | `parse_atom` + **后缀循环**，不做运算符 | `f(1).x[0]` / `S { x: 5 }` |
+| 3 | 加"全程爬升"的表达式版本 | `1 + 2 * 3` / `a - b - c` |
+| 4 | 加语句边界分支（`Restrictions::prefer_stmt`；**判据是后缀跑完之后**的 lhs） | `{p}.x = 10;` 与 `if true {} else {} -1;`（这步之前必错一个） |
+| 5 | 加块尾（记 `semi`，`tail()` 派生） | `{ a; b }` / `{ a }` / `{ if c {1} else {2} }`（最后一条取决于 Q11） |
+| 6 | 加条件边界（`Restrictions::CONDITION` 的 `forbid_structs`）与 `break` 的不吃 `{` 判据 | `if (S{flag:true}).flag {}` / `if check(S{flag:true}) {}` / `if break {}` / `loop { break { 9 }; }` |
+| 7 | 加标点切分 | `Vec<Vec<i32>>= x;` / `&&x` / `&&i32` |
 
 ### 2.3 词法部分核对结果：清单已清空（2026-09-19）
 
@@ -230,10 +244,10 @@ passed = (r.returncode == 0) == e['compilation_success']
 | # | 位置 | 待办 |
 |---|---|---|
 | 1 | ~~`.gitignore`~~ | ✅ **已由 §2.5 解决**：`tests/official/` 改走子模块（不再有嵌套仓库需要忽略），`tests/`、`scripts/` 也随模板建好了 |
-| 2 | `ast.rs` | 空壳。[`arch.md`](arch.md) §1.2.2 已给出六个 arena 的**逐变体定义**与推导，照它抄即可（落地顺序第 0 步）。注意 `Ast` 有 `items`（池子）和 `root`（顶层列表）两个字段，遍历程序入口读 `root`；`Stmt` **不在** arena 里（`Block.stmts: Vec<Stmt>`，§1.2.2.1） |
-| 3 | `parser.rs` | 空壳。按 [`arch.md`](arch.md) §1.2.1 的字段表起步；四个非纯递归的机制见 §1.5，**五个入口见 §1.5.5** |
-| 4 | `main.rs` | 现在**只 lex 然后 dump token**（没有 parser、没有 `.ll`/`.s` 输出、没有 `--stage=`/`--entry=`）。接口契约见 [`arch.md`](arch.md) §0.5；token dump 建议挪到 `--stage=tokens` 或 `--dump-tokens` 下，别挡着正常路径 |
-| 5 | `scripts/` | ✅ 官方 `test.py` 已就位（§2.5）。**仍需自写**：`lex`/`parse` 两个 stage 的运行器（§2.0 的缺口） |
+| 2 | `ast.rs` | ✅ **已完成**（节点 + 6 个 `*Id` newtype + 6 个 arena + 3 条尺寸断言）。**2026-09-22 与文档对齐了两处字段名**：`ExprKind::Grouped` → `Paren`、`If.else_block` → `else_branch`；文档那边的 `ItemKind::Fn.receiver` 改成 `recv`（与 `Field`/`Method`/`Index` 三个兄弟字段一致） |
+| 3 | `parser.rs` | **骨架已完成**：`Parser` 四字段（§1.2.1）、游标原语、arena 写入辅助、`Restrictions` 三个常量、五个入口 wrapper + 共用的 `finish`（吃满 `Eof`）。**待办：五个 `parse_*_root` 的真实现**，按 §2.2 的 S3→S7。坑清单见 [`spec-mapping.md`](spec-mapping.md) §2 与 `arch.md` §1.5 |
+| 4 | `main.rs` | ✅ **已完成**：`--stage=` / `--entry=` 就位（默认 `--stage=optimization --entry=crate`，用法错退 2、正常拒退 1、无 panic）；`--stage=lex` 保留 token dump，`parse` 不 dump。**待办：`semantic`/`codegen`/`optimization` 三个 stage 还是"未实现"占位** |
+| 5 | `scripts/` | ✅ 官方 `test.py` 已就位（§2.5）；`parse_test.py`（`lex`/`parse` 的自写运行器）**已完成并通过三个 shim 的自检**（§2.1 第 1 条）。**待办：`lex` stage 的运行器**（parser 那份稍改 `STAGES` 即可，优先级低——lexer 53/53 已定） |
 
 ### 2.5 模板脚手架接入（2026-09-22 新增）
 
@@ -333,13 +347,13 @@ xmake -y -P vendor/REIMU
 | ~~**测试点未发布**~~ | ✅ **已解决**（2026-09-22）：804 例已发布，判分口径明确。`.g4` 仍可能不发，但**不再是阻塞项** | — |
 | **267 个负例才是真分母** | `lexer` 23 + `parser` 77 + `semantic` **167**。正例靠"能解析"就能过，负例必须**真的检查**——而且**崩/超时/被信号打死统统算失败** | 全程 |
 | **167 个 semantic 负例集中在少数几条规则上** | `vec-index-mutability` 一个目录就 **22 条**（最大），`namespace-errors` 16、`invalid-impls-and-generics` 12、`copy-clone-and-equality` 12、`constant-errors` 10——**这几条规则写不完，W8 就打不满**。逐条对照 [`spec-mapping.md`](spec-mapping.md) §6 | W5–W8 |
-| **72 个 parser 负例是 rust-analyzer 回归用例** | 不是"拒掉 enum/match/for"这种粗活，而是**残缺/畸形输入的边角拒绝**（缺逗号、缺分号、空参数槽、坏 use 路径、`issue-NNNNN`…）。**不需要错误恢复**（首个错误即返回），但每条都得真的报到错 | S6（W3–W4） |
-| **五个解析入口的官方调用方式未知** | 碎片靠 `metadata.entry` 指定入口，但**官方运行器怎么把 entry 传给 driver 是猜的**（Q14）。猜错的代价：442 条里 323 条判不了 | 写运行器时（W2），随 Q14 确认 |
+| **77 个 parser 负例是 rust-analyzer 回归用例** | 不是"拒掉 enum/match/for"这种粗活，而是**残缺/畸形输入的边角拒绝**（缺逗号、缺分号、空参数槽、坏 use 路径、`issue-NNNNN`…）。**不需要错误恢复**（首个错误即返回），但每条都得真的报到错 | S7（W3–W4） |
+| **五个解析入口的官方调用方式未知** | 碎片靠 `metadata.entry` 指定入口，但**官方运行器怎么把 entry 传给 driver 是猜的**（Q14）。猜错的代价：442 条里 323 条判不了。**已把风险关到最小**：拼写自定但集中在 driver 一个 `match` 里，AST 与 `Parser` 一行不用改 | 随 Q14 确认 |
 | **`use rx::core::*;` 一行不落地** | 每份程序都有这行，但 `use` **解析后整体丢弃**（规范明文 + 测试点印证）⇒ 内建 `get_i32` 等**必须按名字直接认**，不能指望导入绑定。写名字解析时别顺手去实现导入 | W5–W8 |
 | **图着色寄存器分配 + 溢出处理** | 优化阶段最重的一块；先用线性扫描兜底正确性 | W13–W16 |
 | **支配树 / 支配边界** | mem2reg 算 phi 插入点的前置，也是循环优化的基础 | W5–W8 |
 | **单人开发，无并行冗余** | 每阶段结束打 tag，保证任何时刻都有一个可交付版本 | 全程 |
-| **W4 只剩 2.5 周，parser 还是空壳** | 前端比旧规范大 50%（8–10.5 个工作日），而 **10/4 是前端 ddl**。今天 9/22 仍未开工 S2/S3 ⇒ **9/26 这个复评点必须动真格**：要么下调 W4 的验收范围（如只保 `lexer` + `parser`，语义挪到 W5），要么加投入 | **9/26 复评** |
+| **W4 只剩 2.5 周，`parse_*` 真实现一行没写** | 前端比旧规范大 50%（9–11.5 个工作日），而 **10/4 是前端 ddl**。今天 9/22 骨架刚落地、S3 还没开工 ⇒ **9/26 这个复评点必须动真格**：要么下调 W4 的验收范围（如只保 `lexer` + `parser`，语义挪到 W5），要么加投入 | **9/26 复评** |
 
 ---
 
