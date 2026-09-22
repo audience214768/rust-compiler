@@ -1,7 +1,11 @@
 # 编译器项目计划
 
-> **依据**：课程安排在 [`tasks.md`](tasks.md)（只由你手动改）；语言定义在 [`../rx-compiler-specification`](../rx-compiler-specification)（**今年已发布**，在线版 <https://acmclasscourse-2025.github.io/rx-compiler-specification/>）。
-> **架构与运行流程**在 [`arch.md`](arch.md)；**规范里搜不到的施工图**（后缀切分算法、上下文切分、93 条产生式→函数映射、优先级 bp 表、UB 边界）在 [`docs/spec-mapping.md`](docs/spec-mapping.md)——规范原文本身请直接搜[在线版](https://acmclasscourse-2025.github.io/rx-compiler-specification/)，不再转抄。本文只留**任务安排**与**疑问难点**。
+> **依据**（三份，缺一不可）：
+> 1. **课程安排**在 [`tasks.md`](tasks.md)（只由你手动改）；
+> 2. **语言定义**在 [`../../rx-compiler-specification`](../../rx-compiler-specification)（**今年已发布**，在线版 <https://acmclasscourse-2025.github.io/rx-compiler-specification/>）；
+> 3. **判分 oracle** 在 [`rx-compiler-testcases/`](rx-compiler-testcases/)（**2026-09-22 已发布**，804 个用例 / 98 个 manifest / 五个 stage）——它才是"做成什么样算过"的最终口径，**与规范冲突时以它为准**（见下方「内建命名」）。
+>
+> **架构与运行流程**在 [`arch.md`](arch.md)；**规范里搜不到的施工图**（后缀切分算法、上下文切分、93 条产生式→函数映射、优先级 bp 表、UB 边界、**测试点→检查项对照**）在 [`spec-mapping.md`](spec-mapping.md)——规范原文本身请直接搜[在线版](https://acmclasscourse-2025.github.io/rx-compiler-specification/)，不再转抄。本文只留**任务安排**与**疑问难点**。
 > **产出物**：从源程序生成优化后的 RISC-V 汇编（RV32IM）。**LLVM IR 是强制的中间表示**，不是建议。
 > **注意**：`../Compiler-Design-Implementation` 的 `testcases/` 与 `tools/local_judge.py` 是**上一届 Mx\* 语言**的旧材料（测试点全是 `.mx`），对今年的 Rx **不可复用**，只能参考脚本形态。
 
@@ -13,6 +17,8 @@
 | 后端 | **自写**：从 LLVM IR 生成 RISC-V 汇编。Clang 只能用于验证，**不能替代后端** |
 | 目标平台 | little-endian **RV32IM / ILP32**，REIMU 模拟器，`--memory=256M --stack=1M` |
 | 实现语言 | **Rust**（edition 2024，本机 1.94.1） |
+| 判分 oracle | [`tests/official/`](tests/official/)（子模块）的 98 个 manifest，按 `stage` 分阶段判。**官方运行器随模板提供**（`scripts/test.py` + `config.mk`）——但它**跳过 `lex`/`parse`**，那两个 stage 的运行器仍要自写（§2.0） |
+| 内建 I/O | **`get_i32` / `print_i32` / `println_i32`**（snake_case）。✅ 规范书与测试点**完全一致**（规范 `27b1875`，2026-09-19 改名；全库 `grep` 驼峰名 = **0 处**） |
 | 必做优化 | 寄存器分配、内联、死代码消除、常量传播、尾递归优化、除法模数优化 ❓（`backend.md` 说 "No specific optimization is mandatory"，以哪个为准见 Q6） |
 | 协作约束 | `CLAUDE.md`：**不能整段使用 AI，可以用 AI 辅助设计 + debug**——边界见 §4.2 |
 
@@ -25,14 +31,16 @@
 
 ### 1.1 里程碑
 
-假设第 1 周为 9/14–9/20（今天 9/19 是第 1 周周六）。
+假设第 1 周为 9/14–9/20（今天 2026-09-22 是**第 2 周周一**）。
 
-| 周 | 截止（周日 23:59） | 交付 | 权重 |
-|---|---|---|---|
-| 4 | 2026-10-11 | AST 验收 | 15% |
-| 8 | 2026-11-08 | IR 验收 | 15% |
-| 12 | 2026-12-06 | CodeGen 验收 | 20% |
-| 16 | 2027-01-03 | Optimize 验收 | 通过测试 35% + 排名 15% |
+| 周 | 截止（周日 23:59） | 交付 | **要清的测试点**（判分 oracle） | 权重 |
+|---|---|---|---|---|
+| 4 | 2026-10-11 | AST 验收 | `lexer` 53 + `parser` 442 = **495** | 15% |
+| 8 | 2026-11-08 | IR 验收 | `semantic` **236**（69 正 / 167 负） | 15% |
+| 12 | 2026-12-06 | CodeGen 验收 | `codegen` **60** 个程序 × 115 组 io 全对 | 20% |
+| 16 | 2027-01-03 | Optimize 验收 | `optimization` **13** 个 workload × 39 组 io 全对 | 通过测试 35% + 排名 15% |
+
+**「要清的测试点」是验收判据，不是加分项**——manifest 的 `compilation_success` 就是通过/不通过的定义（§2.0），没有"差不多对"的中间态。
 
 配套：第 4/8/12/16 周各有一场考试；Code Review 至少 4 次（2–3 次常规 + 1–2 次抽查）。
 
@@ -44,35 +52,41 @@
 - 性能度量是 REIMU 的 **`Total cycles`**。基线、聚合方式与排名公式属 "assessment policy"，规范未给 ❓ 见 Q6。
 - 考试不直接给分，但通过 Code Review 影响成绩 → 每阶段考点跟着课程进度复习。
 - **自己写前端对 Code Review 与 W4 考试都是加分项**（考试就考词法/语法原理）。
-- **LLVM IR 强制带来的最大红利**：从 W5 起就能用 `clang` + `runtime.s` + REIMU 跑**端到端**测试（命令见 [`docs/spec-mapping.md`](docs/spec-mapping.md) §5），**不必等自写后端**。**要尽早把这个闭环搭起来**。
+- **LLVM IR 强制带来的最大红利**：从 W5 起就能用 `clang` + `runtime.s` + REIMU 跑**端到端**测试（命令见 [`spec-mapping.md`](spec-mapping.md) §5），**不必等自写后端**。**要尽早把这个闭环搭起来**。⚠ **必须用 `/opt/homebrew/opt/llvm/bin/clang`（23.1.1），不能用系统 `clang`**——Apple clang 不带 RISC-V 后端，实测报 `unable to create target: 'No available targets are compatible with triple "riscv32-unknown-none-elf"'`（2026-09-22 实测）。
 
 ### 1.3 W1–W4 · AST 阶段（ddl 10/11）
 
 - [x] **W1：前端方案决策**（2026-09-18，结论见 [`arch.md`](arch.md) §1.1；09-19 按新规范复核维持）
+- [ ] **测试运行器**（§2.0）——**越早越好，W1 就能跑**：仓库不自带运行器，没有它整个学期都在盲跑
 - [ ] **前端 S1–S6**（分解见 §2.2），目标 10/4 前跑通；`token.rs` / `lexer.rs` 的既有问题已清空（§2.3）
+- [ ] **五个解析入口 `--entry=`**（§2.0 / [`arch.md`](arch.md) §1.5.5）——stage 阶段测试点有 323/442 是**语法碎片**，只做 `parse_crate` 会直接挂掉约 295 个正例
 - [ ] AST 数据结构设计（形态见 [`arch.md`](arch.md) §1.2）
 - [ ] 符号表 / 作用域 / 类型检查（`names.md` 命名空间规则、`types.md` 推断与 coercion、方法查找）
-- [ ] 常见错误路径：非法输入需非 0 退出并给出可读信息
+- [ ] 常见错误路径：非法输入需**非 0 退出且不 panic / 不超时 / 不被信号打死**（这正是负例的判定标准，措辞不限）
 - [ ] AST 打印/导出，作为验收与自查手段
 - [ ] 验收材料 + Code Review 自查（§4.2）
+
+**W4 的通过线**：`lexer` 53/53 + `parser` 442/442。
 
 ### 1.4 W5–W8 · IR 阶段（ddl 11/8）
 
 - [ ] 在内存里建 LLVM 形状的 IR + `.ll` 文本打印器（形态见 [`arch.md`](arch.md) §2）
+- [ ] **语义分析收尾**（符号表 / 作用域 / 类型检查 / coercion / 方法查找 / 常量求值）：`semantic` 的 **167 个负例**全在这一关，逐条对照 [`spec-mapping.md`](spec-mapping.md) §6 的检查项
 - [ ] AST → IR lowering：局部变量、控制流、函数调用、数组、struct 布局、`Box`/`Vec` 内建、引用与解引用
 - [ ] **mem2reg**（alloca → SSA + phi）：低代码量、收益极高，且是后续优化的前置
 - [ ] **搭起 clang 验证闭环**：`.ll` → `clang -S` → 与 `runtime.s` 一起喂 REIMU
 - [ ] 验收材料
-- **可交付判据**：能在**没有自写后端**的情况下，用 clang 编译自己的 `.ll` 跑通一批测试。
+- **可交付判据**：① `semantic` **236/236**；② 能在**没有自写后端**的情况下，用 clang 编译自己的 `.ll` 跑通一批测试。
 
 ### 1.5 W9–W12 · CodeGen（ddl 12/6，正确性优先，不看性能）
 
 - [ ] 指令选择 + 栈式分配，先跑通全量正确性（形态见 [`arch.md`](arch.md) §3）
 - [ ] 调用约定、栈帧布局、callee-saved 寄存器、`ra`/`sp` 管理。**内部约定可自定义**，但**机器 `main`、C 运行时、REIMU libc 三处必须守 psABI**
-- [ ] 内建函数汇编：`getInt`/`printInt`/`printlnInt` 走 C 运行时；`__rx_alloc(size, align)` 用于 `Box`/`Vec`
+- [ ] 内建函数汇编：**`get_i32` / `print_i32` / `println_i32`** 走 C 运行时；`__rx_alloc(size, align)` 用于 `Box`/`Vec`
 - [ ] 数据布局按 `backend.md`：标量 4 字节 4 对齐，`bool` 1 字节，`()` 0 字节，`&[T; N]` 是**一个 word**
 - [ ] 全量回归脚本 + CI（每次 push 自动跑）
 - [ ] 验收
+- **可交付判据**：`codegen` **60/60**，且 **115 组 io 的输出逐字节相符**（不是"能跑"，是 stdout 完全一致）。
 
 ### 1.6 W13–W16 · Optimize（ddl 2027-01-03）
 
@@ -88,32 +102,116 @@
 - 每周记录周期数，做本地排名预估，避免最后一周才发现差距
 - 排名冲刺期保留可回退的 tag（优化引入 bug 时能退回上一版）
 
+**可交付判据**：`optimization` **13/13 × 39 组 io 全对**。⚠ 任何 manifest 里**都没有时间上限**，"跑得快"不给分——这个阶段考的是**优化不许改变行为**，13 个 workload 各自的 `.small` / `.large` / `.large-variant` 三组输入就是拿来逼出"优化后结果变了"的（`large-control-flow` 有 6251 行）。**六项必做优化的依据是 [`tasks.md`](tasks.md)，不是测试点**（测试点不含任何性能阈值，§3.1 Q6）。
+
 ---
 
 ## 2. 目前任务安排
 
-### 2.1 本周（W1）立刻要做的三件事
+### 2.0 测试点接入（2026-09-22 新增）
 
-1. **通读 `undefined-behavior.md` 全章**——它才是这门语言真正的范围界定（比各章散文更权威）
-2. **开工 S1（token + lexer）**：`token.rs` 与 `lexer.rs` 的既有问题已全部清空（§2.3），错误通道也已就位——直接写 S1 主体（字符分派 + 各类 token）
-3. **发邮件问清 §3.1 的疑问**（顺带完成本周答疑记录）——尤其 **Q1（g4/测试点）与 Q3（REIMU）**
+**仓库**：已作为**子模块**接入 [`tests/official/`](tests/official/)（2026-09-22），pin 在 `c1e8196`。原先克隆在项目根下的 `rx-compiler-testcases/` 已废弃——官方运行器的 `--tests-dir` 默认是 `tests/`，放根目录它**根本发现不了**。
 
-> REIMU 暂缓安装（2026-09-19 决定）：源码在 <https://github.com/DarkSharpness/REIMU>，v1.0.1 有预编译二进制，release 资源当时下载超时。**它不影响前端阶段**，等要用验证闭环（W5）之前再装即可。
+**官方运行器已随模板提供**（2026-09-22 接入，详见 §2.5）：`Makefile` + `config.mk` + `scripts/test.py`。**原先"仓库不自带运行器、要自己写"的结论作废。**
+
+| stage | 用例 | 正 / 负 | 这份测试点在问什么 |
+|---|---|---|---|
+| `lexer` | 53 | 30 / 23 | 能否分词；负例 = 词法错误 |
+| `parser` | 442 | 365 / 77 | 能否解析；负例 = 语法错误。**80% 是语法碎片，靠 `metadata.entry` 指定入口** |
+| `semantic` | 236 | 69 / **167** | 语义检查是否正确。**负例占七成，这是全项目最大的负例库** |
+| `codegen` | 60 | 60 / 0 | 全 accept + **115 组 io**：编译成汇编跑 REIMU，stdout 逐字节比对 |
+| `optimization` | 13 | 13 / 0 | 同上，**39 组 io**（每个 workload 三组：`.small` / `.large` / `.large-variant`） |
+
+**判定口径**（`manifest.schema.json` + `README-ZH.md`，这是判分的原文依据）：
+
+- `compilation_success: true` → 该阶段要接受；`false` → **正常拒绝即可**。
+- **崩（crash）、被信号打死（signal）、超时（timeout）一律算失败**——"拒了但顺带 panic"不给分。
+- **不要求 AST 序列化，也不要求诊断措辞**——只要能非 0 退出。⇒ 我们的"退出码只有 0 / 1"（[`arch.md`](arch.md) §0.5）**正好合用，不用改**。
+- `metadata` 字段 schema 明说 "Not used for grading"，但**我们非用不可**：`parser` 的 `metadata.entry` 是**唯一**说明这份碎片从哪个入口解析的信息。
+
+**官方运行器做什么**（`scripts/test.py`，402 行，已逐段读过）：
+
+1. `discover()` 从 `tests/` 递归找 `manifest.json` 并校验字段；**路径按 manifest 所在目录拼**（`source` 是相对路径）——这条我们原先猜对了。
+2. **按 `stage` 决定调哪条命令**，而不是传 `--stage=` 开关：`semantic` → `SEMANTIC`；`codegen` 与 `optimization` **共用同一条 `CODEGEN`**。
+3. 退出码判据：`compilation_success: true` 要求 **0**，`false` 要求 **1**；其它退出码 / 信号 / 超时一律失败（`run_case` 里写死的 `expected = 0 if case.success else 1`）。
+4. `codegen` / `optimization`：编译 → `RUN` 跑 REIMU → **stdout 逐字节比 `.out`**，stdin 喂 `.in`；不匹配时打印**带 diff 的失败详情**。
+5. 产物与 cycle 报告落在 `target/tests/`（已在 `.gitignore` 的 `/target` 覆盖内）；`optimization` 会额外产出 `optimization-cycles.json`，内容是每条 io 的 `Total cycles`。
+
+⚠ **关键缺口：`lex` 和 `parse` 被 `discover()` 主动跳过**（源码硬编码 `if entry.get("stage") in ("lex", "parse"): continue`，理由是"已提供 G4 文法"）。**而 W4 的 495 个测试点正好全在这两个 stage** ⇒ **官方运行器完全不覆盖 W4 验收**。那两个阶段仍得自写运行器（README 也说"可以扩展 Makefile"）——所以 §2.1 的第 1 项只是**缩小**，没有取消。
+
+**driver 要加的两个开关**（接口契约见 [`arch.md`](arch.md) §0.5）：
+
+| 开关 | 作用 | 为什么必须 |
+|---|---|---|
+| `--stage=<lex\|parse\|semantic\|codegen\|optimization>` | 只跑到该阶段 | 测试点按 stage 判，得能"跑一半" |
+| `--entry=<crate\|expression\|typeRef\|item\|letStatement>` | `parse` 阶段选解析入口 | 442 条里只有 119 条是整份 crate，**其余 323 条是碎片** |
+
+⚠ **不能用"挨个入口试一遍，有一个成功就算过"兜底**：`parser/reject/path_item_without_excl.rx` 的内容就是一个 `foo`，`entry=crate` 时该拒，而用 `expression` 入口试会**误收**。入口必须显式传。理由详见 [`arch.md`](arch.md) §1.5.5。
+
+**这两个开关是我们的自由，不是官方约定**（原 Q14 已答）：官方运行器**不传任何 `--stage=` / `--entry=`**——stage 靠"调 `SEMANTIC` 还是 `CODEGEN`"隐式表达，而 `parse` 它根本不跑。真正必须守的官方契约只有两条：**`SEMANTIC` 用退出码 0/1 表达接受/拒绝**，**`CODEGEN` 把 RV32IM 汇编写进 `{output}`**。
+
+> **顺带一个好消息**：`codegen/*.rx` 与 `semantic/*.rx` **逐字节相同**（60/60 已核对）。`codegen` = `semantic` 的正例 + `.in`/`.out` ⇒ **W8 把 semantic 打满，W12 就只剩"汇编生成得对"这一件事**，不用再对付新的语言特性。
+
+### 2.1 当前进度与本周（W2）要做的三件事
+
+> **当前代码进度**（截至 2026-09-22）：只走到 ① 前端，且 ① 里只有 `token.rs` / `lexer.rs` / `error.rs` 完成；`ast.rs` 与 `parser.rs` 是空壳（`ast.rs` 已有节点草稿 + 3 条尺寸断言），② 语义 / ③ 中端 / ④ 后端 / ⑤ 优化 的目录尚未创建。
+> 已知遗留：`SyntaxErrorKind` / `FrontendError` 暂无构造点（parser 还没写），`never constructed` 与既有的 `Parser is never constructed` 同源，parser 落地即消。
+> **主动推迟的一项**（2026-09-21）：名字暂不 interning，用 `Name { span }` + sema 的 `Names` 现切现比——理由与将来的替换成本见 [`arch.md`](arch.md) §5.2.1。**等 sema 把名字解析写出来后再评估一次**（那时才知道比较点长什么样）。
+
+**实测基线（2026-09-22，用现有 driver 逐个跑 manifest、只比退出码）**——这张表比任何估时都诚实：
+
+| stage | 实测 | 真过 / 假过 |
+|---|---|---|
+| `lexer` | **53 / 53** | ✅ **真过**——词法阶段已经符合已发布的测试点 |
+| `parser` | 370 / 442 | ⚠ 其中 **365 个是假过**（driver 只 lex 就 `exit 0`）；真正挂的是 **72 个负例**（67 个 `crate` 入口 + 5 个 `expression` 入口） |
+| `semantic` | 69 / 236 | ⚠ **69 个全是假过**，**167 个负例一个都没拦下来** |
+| `codegen` | 60 / 60 | ⚠ 全是假过，**115 组 io 一组都没跑过** |
+| `optimization` | 13 / 13 | ⚠ 全是假过，39 组 io 未跑 |
+
+⇒ **读法**：除了 `lexer`，现在所有通过率都是"退出码 0"的假象。**真实分母是 267 个负例**（23 + 77 + 167），这才是接下来三个月的硬骨头。
+
+复现方式（路径要按 manifest 所在目录拼，`source` 是相对路径）：
+
+```python
+p = os.path.join(stage, e['source'])   # ← 容易漏，漏了会全报「无法读取」
+r = subprocess.run([BIN, p], capture_output=True)
+passed = (r.returncode == 0) == e['compilation_success']
+```
+
+1. 🔧 **接官方运行器**（§2.5）**+ 给 `lex`/`parse` 补一个自写运行器**（§2.0 的缺口）——官方那套**跑不了 W4 的 495 个点**，所以"每一分钟都在盲跑"这句仍然成立，只是盲区缩小到了 W4 那两个 stage
+2. **开工 S2 + S3**（`ast.rs` 落地 → item 层）：**前端 ddl 是 10/4，今天已是 W2 周一**，§1.1 里"9/26 还没跑通 item/type 层就要下调验收目标"的预警**已经触发一半**——parser 现在还是 12 行的空壳
+3. **发邮件问 §3.1 里还没答案的那几条**（Q1/Q2/Q3 已被测试点答掉大半；**真正要问的只剩 Q6、Q7–Q9、Q11–Q12、Q14–Q15**，Q10/Q13/Q16 已被规范原文或测试点答掉，Q10 只需在周报里提一句）
+
+> **REIMU 已到位（2026-09-22 更新）**：不必再去 `DarkSharpness/REIMU` 找预编译二进制了——模板把它作为**子模块 `vendor/REIMU`**（`wanoful/REIMU`，pin `66dcdbd`）固定住。本机已装 xmake 并编译通过（macOS 需要一个编译补丁，见 §2.5）。
 
 ### 2.2 前端实施顺序
 
-实现细节查 [`docs/spec-mapping.md`](docs/spec-mapping.md)（后缀切分算法、上下文切分、93 条产生式→函数映射、优先级 bp 表、UB 边界）；规范原文搜[在线版](https://acmclasscourse-2025.github.io/rx-compiler-specification/)。这里是排期与验收口径。**每步的验证用例见 [`arch.md`](arch.md) §1.6 的落地顺序表。**
+实现细节查 [`spec-mapping.md`](spec-mapping.md)（后缀切分算法、上下文切分、93 条产生式→函数映射、优先级 bp 表、UB 边界）；规范原文搜[在线版](https://acmclasscourse-2025.github.io/rx-compiler-specification/)。这里是排期与验收口径。
 
-| 步骤 | 内容 | 估时 |
+| 步骤 | 内容 | 估时 | 对应测试点（`parser` stage，按 `entry` 分） |
+|---|---|---|---|
+| S1 | `token.rs` + `lexer.rs`：空白（**只有 4 种**）、嵌套注释、标识符/38+13 个关键字、整数字面量（radix + `_` + 后缀切分，**不设量级上限**）、lifetime token、44 个标点、ASCII 校验 + 报错通道 | ~~1–1.5 天~~ | ✅ **已完成：`lexer` 53/53** |
+| S2 | `ast.rs`（按 [`spec-mapping.md`](spec-mapping.md) §2 的映射列节点，每个带 Span；名字用 `Name` 不用裸 `Span`，见 §3.1 Q12） | 1 天 | 地基，无直接测试点 |
+| S3 | item 层：`use`（含 use tree/glob/alias）、`fn`（含接收者）、`struct`（含 derive 属性）、`const`、`impl`；以及 `Type` / `Path`（含 `GenericArgs` 与 turbofish）/ `WhereClause` / 生命周期参数 | 2–3 天 | `item` 28 正 + `typeRef` 101 正 |
+| S4 | statement / block（含**块尾规则**与**块形式表达式语句的边界规则**） | 1 天 | `letStatement` 13 正 |
+| S5 | **表达式优先级爬升** + 前缀/后缀/原子 + 三个边界规则（条件与循环体、cast 后的 `<`、struct 字面量） | 2–3 天 | `expression` **176 正**（+ 5 负） |
+| S6 | 错误信息与恢复、span 贯穿、AST 打印；`parse_const_value`（受限常量语法） | 1 天 | **72 个负例**（67 `crate` + 5 `expression`） |
+
+合计 **8–10.5 个工作日**（旧规范估 4–6 天）。S6 完成打 tag `ast`。**全部跑通 = 365 正 + 77 负 = 442/442。**
+
+⚠ **S6 那 72 个负例不是"拒掉 enum / match / for"那种粗活**——它们是 **rust-analyzer 的 parser 回归用例**（`0000_struct_field_missing_comma`、`0015_curly_in_params`、`arg_list_recovery`、`issue-101540`…共 69 个不同名），考的是**残缺/畸形输入的拒绝**：`require-parens-for-chained-comparison`（3 条）、missing comma、缺分号、空参数槽、坏 use 路径…**好消息是不用做错误恢复**——我们是"首个错误立即返回"，只要能拒就行，而这些用例本来就是"这里有个错"。
+
+**S2–S5 内部的落地顺序**（每步让一个规范里的具体例子从错变对，比按文件切更早暴露问题）：
+
+| 步 | 做什么 | 最小验证用例 |
 |---|---|---|
-| S1 | `token.rs` + `lexer.rs`：空白（**只有 4 种**）、嵌套注释、标识符/38+13 个关键字、整数字面量（radix + `_` + 后缀切分，**不设量级上限**）、lifetime token、44 个标点、ASCII 校验 + 报错通道 | 1–1.5 天 |
-| S2 | `ast.rs`（按 `docs/spec-mapping.md` §2 的映射列节点，每个带 Span） | 1 天 |
-| S3 | item 层：`use`（含 use tree/glob/alias）、`fn`（含接收者）、`struct`（含 derive 属性）、`const`、`impl`；以及 `Type` / `Path`（含 `GenericArgs` 与 turbofish）/ `WhereClause` / 生命周期参数 | 2–3 天 |
-| S4 | statement / block（含**块尾规则**与**块形式表达式语句的边界规则**） | 1 天 |
-| S5 | **表达式优先级爬升** + 前缀/后缀/原子 + 三个边界规则（条件与循环体、cast 后的 `<`、struct 字面量） | 2–3 天 |
-| S6 | 错误信息与恢复、span 贯穿、AST 打印；`parse_const_value`（受限常量语法） | 1 天 |
-
-合计 **8–10.5 个工作日**（旧规范估 4–6 天）。S6 完成打 tag `ast`。
+| 0 | `ast.rs`：列节点 + 6 个 `*Id` newtype + 6 个 arena（**parser 的地基**） | `cargo build` 通过 |
+| 1 | `parse_function` / `parse_block` / `parse_statement` / `parse_atom`，**不做运算符** | `fn main() { }` |
+| 2 | "全程爬升"的表达式版本 | `let value = if true { 10 } else { 20 } - 1;` |
+| 3 | 加语句边界分支 | `if true {} else {} -1;`（这步之前它是**错**的） |
+| 4 | 加块尾（记 `semi`，`tail()` 派生） | `{ a; b }` / `{ a }` / `{ if c {1} else {2} }`（最后一条取决于 Q11） |
+| 5 | 加 `no_struct_literal` | `if (S{flag:true}).flag {}` / `if check(S{flag:true}) {}` / `if { true } {}` |
+| 6 | 加标点切分 | `Vec<Vec<i32>>= x;` / `&&x` / `&&i32` |
 
 ### 2.3 词法部分核对结果：清单已清空（2026-09-19）
 
@@ -127,40 +225,121 @@
 
 > 踩过的坑（写新错误类型时别再犯）：span 起点一开始取在**跳空白之前**，于是 `\n\n/* x` 报成 `1:1`。起点必须在看到 `/*` 的那一刻取 ⇒ `skip_whitespace_and_comments` 的返回类型是 `Result<(), usize>`，`Err` 里是未终止块注释 `/*` 的起始偏移。
 
+### 2.4 待办（文档已定、代码还没跟上）
+
+| # | 位置 | 待办 |
+|---|---|---|
+| 1 | ~~`.gitignore`~~ | ✅ **已由 §2.5 解决**：`tests/official/` 改走子模块（不再有嵌套仓库需要忽略），`tests/`、`scripts/` 也随模板建好了 |
+| 2 | `ast.rs` | 空壳。[`arch.md`](arch.md) §1.2.2 已给出六个 arena 的**逐变体定义**与推导，照它抄即可（落地顺序第 0 步）。注意 `Ast` 有 `items`（池子）和 `root`（顶层列表）两个字段，遍历程序入口读 `root`；`Stmt` **不在** arena 里（`Block.stmts: Vec<Stmt>`，§1.2.2.1） |
+| 3 | `parser.rs` | 空壳。按 [`arch.md`](arch.md) §1.2.1 的字段表起步；四个非纯递归的机制见 §1.5，**五个入口见 §1.5.5** |
+| 4 | `main.rs` | 现在**只 lex 然后 dump token**（没有 parser、没有 `.ll`/`.s` 输出、没有 `--stage=`/`--entry=`）。接口契约见 [`arch.md`](arch.md) §0.5；token dump 建议挪到 `--stage=tokens` 或 `--dump-tokens` 下，别挡着正常路径 |
+| 5 | `scripts/` | ✅ 官方 `test.py` 已就位（§2.5）。**仍需自写**：`lex`/`parse` 两个 stage 的运行器（§2.0 的缺口） |
+
+### 2.5 模板脚手架接入（2026-09-22 新增）
+
+课程发布了模板仓库 `ACMClassCourse-2025/rx-compiler`（含官方测试脚手架、G4 文法、REIMU 子模块）。**决定不 fork**，改为把它接成 `upstream` 远端、用 `git merge --allow-unrelated-histories` 合进现有仓库：
+
+- README-ZH 建议 fork 的**唯一理由**是"官方用例更新好同步"，但用例是**子模块**，同步靠 `git submodule update --remote`，**与 fork 无关**。
+- fork 反而会把已有的 3 个 commit 和模板历史切成两条无关线，还多一个仓库要维护。
+- 回头路很便宜：将来真想 fork，`git push` 到 fork 出来的仓库即可。
+
+**评测接口 = `config.mk` 里的四条命令**（`Makefile` 只负责把它们 export 给 `scripts/test.py`）：
+
+| 命令 | 作用 | 硬契约 |
+|---|---|---|
+| `BUILD` | 跑测试前构建一次编译器，可为空 | 退出码 0 |
+| `SEMANTIC` | 对 `{source}` 做语义检查 | **退出码 0 = 接受，1 = 拒绝** |
+| `CODEGEN` | 编译 `{source}`，**RV32IM 汇编写到 `{output}`** | 退出码 0 |
+| `RUN` | 跑 `{output}`；`{stdout}` 收程序输出，`{profile}` 收 cycle | — |
+
+**先别改 `config.mk`**：模板默认值拿 `rustc` 当参考实现（`crates/rx` 是配套的 no_std 运行时），所以**接入当天就有全绿基线**，还能拿到每条用例的参考 cycle 数——既是靶子也是差分 oracle。等自己的阶段写好了，再一条命令一条命令替换掉。
+
+**本机环境（2026-09-22 就位）**：xmake 3.1.1、GCC 16（brew）、rustup target `riscv32im-unknown-none-elf`。**REIMU 已编译通过，且 `make test` 全绿基线达成：309 passed（236 semantic + 60 codegen + 13 optimization），39 组 cycle 数据全出。**
+
+⚠ **macOS 上编译 REIMU 必须用 gcc，不能用 clang**。原因不是"缺 include"这种小事，而是**架构性的**：
+
+- `include/utility/error.h` 自己写了一句 `namespace std { extern std::ostream cerr; }`，而 `src/utility/error.cpp` 等 4 个文件又直接 `#include <iostream>`。
+- **libstdc++**（GCC 的，Ubuntu CI 用的）把 `std::cerr` 直接声明在 `std` 里 ⇒ 那两个声明是**同一个实体**，重复声明无害，编过（所以 CI 从未暴露）。
+- **libc++**（macOS 默认）把标准库装在 `std::__1` 内嵌命名空间里，真身是 `std::__1::cerr` ⇒ 自造的那个 `std::cerr` 是**另一个实体**，两者抢同一个名字 ⇒ `reference to 'cerr' is ambiguous`。
+- ⇒ **REIMU 假定的是 libstdc++**，靠补预包含头文件救不了（已试过，能修掉缺 `<string>`/`<bit>`/`<ostream>` 那类，修不了这个）。
+
+**正确做法（已在本机验证）**：
+
+```sh
+brew install gcc
+xmake f -y -P vendor/REIMU -m release -o target/reimu \
+    --toolchain=gcc --cc=gcc-16 --cxx=g++-16 --ld=g++-16 --sh=g++-16 --ar=gcc-ar-16
+xmake -y -P vendor/REIMU
+```
+
+两个必须注意的点（都踩过）：
+1. **`--ld`/`--sh` 也要一起换**。只换 `--cc`/`--cxx` 的话，目标文件是 libstdc++ 编的、链接却用 clang++（libc++），会报一堆 `std::filesystem::__cxx11::path` / `std::__basic_file` 之类的 **undefined symbols**。
+2. 只给 `--cc`/`--cxx` 而**不加 `--toolchain=gcc`**，xmake 会把 clang 的 `-target` 标志传给 gcc，报 `unrecognized command-line option '-target'`。
+
+配置结果缓存在 `vendor/REIMU/.xmake/`（已 gitignore），所以日常只需要 `xmake f` 一次；但**换机器或清了缓存要重跑上面这两行**。
+
+**一条直接影响后端的实测结论**：模板默认 `CODEGEN` 传了 `-mllvm -riscv-no-aliases`。实测（brew LLVM 23.1.1）把 `ret i32 0` 编出来是：
+
+```asm
+	addi	a0, zero, 0
+	jalr	zero, 0(ra)
+```
+
+**全是非别名形式**（不是 `li a0, 0` / `ret`）⇒ **REIMU 要的是非别名写法**。自写后端照这个形式发：`li rd,imm` → `addi rd, zero, imm`；`ret` → `jalr zero, 0(ra)`；`mv rd,rs` → `addi rd, rs, 0`。
+
+**REIMU 1.0.1 的 CLI**（`xmake run -P vendor/REIMU reimu --help` 实测）：`-f=<file>,...` 汇编输入、`-o=` 程序输出、`-p=` profile 输出、`-i=` 程序输入、`-m=`/`--memory=`（默认 256MB）、`-s=`/`--stack=`（默认 32KB）、`--silent`（会**关掉 profile**，统计 cycle 时不能加）、`-t=`/`--time=` 指令数上限、`-w<name>=<value>` 给指令设权重。
+
 ---
 
 ## 3. 暂留的疑问与难点
 
-### 3.1 待确认（**本周就发邮件问清**）
+### 3.1 待确认（✅ = 测试点已答掉，不必再问）
 
-| # | 问题 | 影响 |
+| # | 问题 | 状态 / 影响 |
 |---|---|---|
-| Q1 | 课程 `.g4` 与 `.rs` 测试点何时发布？ | 差分测试 oracle、负例覆盖 |
-| Q2 | 自写 lexer/parser 与课程 g4 等价是否合规？**负例测试的判定标准**是什么（精确拒绝 vs 只要非 0 退出）？ | 前端方案合规性 + parser 严格程度 |
-| Q3 | REIMU 具体版本与获取方式？`--stack=1M` 的 flag 拼写？ | 本地跑通（本机**尚未安装**） |
-| Q4 | Resource guarantees 的堆预算（64 MiB？）是否生效？ | `Vec` 增长策略与内存上限 |
-| Q5 | 本机 LLVM 是 23.1.1，规范钉版是 22。本地验证够用吗？提交环境用什么？ | 验证环境 |
-| Q6 | `backend.md` 说 "No specific optimization is mandatory"，`tasks.md` 说六项必做优化"作为通过测试的点出现"——以哪个为准？排名公式与基线是什么？ | 优化阶段的交付判定 |
+| Q1 | 课程 `.g4` 与 `.rs` 测试点何时发布？ | ✅ **两者都已发布**（2026-09-22）：测试点 804 例 / 98 manifest / 5 stage 走子模块 [`tests/official/`](tests/official/)；**`.g4` 在 [`grammar/`](grammar/)**（`Lexer.g4` 13 KB + `Parser.g4` 17 KB）⇒ [`arch.md`](arch.md) §1.1 里它的两项用途（覆盖度清单、差分 oracle）**重新生效**。注意：拿它做差分 oracle ≠ 改用 ANTLR 做前端，§1.1 手写前端的决策不变 |
+| Q2 | 负例测试的判定标准是什么？ | ✅ **已答**（`manifest.schema.json` + `README-ZH.md`）：`compilation_success: false` 要求**正常拒绝**，**crash / signal / timeout 算失败**；且明说 **No AST serialization or diagnostic wording is required**。⇒ 我们的"退出码只有 0/1"正好合用。**但"自写 lexer/parser 与课程 g4 等价是否合规"仍是课程行政问题**，随 Q1 一起问 |
+| Q3 | REIMU 具体版本与获取方式？`--stack=1M` 的 flag 拼写？ | ✅ **已答**（2026-09-22）：REIMU 随模板作为子模块 [`vendor/REIMU`](vendor/REIMU)（`wanoful/REIMU`，pin `66dcdbd`）。`config.mk` 的 `RUN` 给出权威调用式：`xmake run -P vendor/REIMU reimu --memory=256M --stack=1M -f {output} -o {stdout} -p {profile} 1>&2`（注意是 `-f`/`-o`/`-p`，不是规范 `backend.md` 里那套 `--file=`/`--output=`）。⚠ **本机 macOS 编译必须用 gcc（libstdc++），不能用 clang**——REIMU 与 libc++ 架构性不兼容，见 §2.5 |
+| Q4 | Resource guarantees 的堆预算（64 MiB？）是否生效？ | ✅ **已答**（规范 `bf4c255`，2026-09-20）：`backend.md` 现在写 **256 MiB 总执行内存 + 1 MiB 栈**，text/static/stack/heap **共享**那 256 MiB。⚠ **"64 MiB 堆"不再是保证**——那段（含参考 `Vec` 增长策略）在规范里被**整段 HTML 注释掉了**。细节见 [`spec-mapping.md`](spec-mapping.md) §5 |
+| Q5 | 本机 LLVM 是 23.1.1，规范钉版是 22。本地验证够用吗？提交环境用什么？ | 验证环境。**2026-09-22 补充实测**：brew 的 LLVM 23.1.1 在 `/opt/homebrew/opt/llvm/bin/clang`，**有** RISC-V 后端且**认得** `-mllvm -riscv-no-aliases`——用它编 `ret i32 0` 得到 `addi a0, zero, 0` + `jalr zero, 0(ra)`，**全是非别名形式** ⇒ REIMU 要的就是这个形式（见 §2.5 的伪指令结论）。⚠ 系统 `clang`（Apple 21）**没有** RISC-V 后端，别用 |
+| Q6 | `backend.md` 说 "No specific optimization is mandatory"，`tasks.md` 说六项必做优化"作为通过测试的点出现"——以哪个为准？排名公式与基线是什么？ | ⚠ **半答，且答案反直觉**：**测试点里没有任何时间/体积阈值**（翻遍 98 个 manifest 只有 "timeout = 失败"）⇒ `optimization` stage 考的是**规模下的输出正确性**，不是速度。**六项必做优化只能以 [`tasks.md`](tasks.md) 为准**；排名公式与基线**仍未知**，必问 |
 | Q7 | `Struct` 允许 `OuterAttribute*`，但其他构造上的属性不支持——`#[derive]` 放错位置的**报错**要求进负例测试吗？ | parser 严格程度 |
 | Q8 | 空 struct `struct S {}` 语法上要解析通过，但数据使用是 UB。负例测试会拿它考吗？ | 同上 |
 | **Q9** | `return`/`break`/`continue` 能否出现在**原子位置**（如 `f(return 1)`）？`expressions.md` 的 `ExpressionWithoutBlock` 列表包含它们，那按产生式就该能 | parser 严格程度 |
-| **Q10** | **规范自相矛盾**：`grammar.md` 的上下文标点表只列 4 个（`&&` `>>` `>=` `>>=`），但 `operator-expr.md:108` 明说 `<<` 的前导 `<` 也要进泛型实参解析。**我们按 5 个实现**，请确认 | 负例边界 |
+| **Q10** | **规范自相矛盾**：`grammar.md` 的上下文标点表只列 4 个（`&&` `>>` `>=` `>>=`），但 `operator-expr.md:108` 明说 `<<` 的前导 `<` 也要进泛型实参解析。**我们按 5 个实现**，请确认 | ✅ **测试点已经把架吵完了**：`parser/reject/cast-angle-bracket-precedence-*.rx`（`entry=expression`）里两条是 `a as usize < 4` 与 `a as usize << long_name`，**都是负例**。若按移位解析，后者是**完全合法的表达式** ⇒ 只可能是"`<<` 的前导 `<` 进了泛型实参" ⇒ **必须切 5 个**。规范的表格漏了一行，**不用再问，但值得在周报里提一句** |
 | **Q11** | **规范自相矛盾**：`block-expr.md:7-10` 的 `Statements` 产生式把块尾限制为 **`ExpressionWithoutBlock`**（即 `{}`/`if`/`loop` 等块形式**不能**当块尾）；但同文件 `block-expr.md:22-25` 的例子 `fn select(flag: bool) -> i32 { let base = …; { base + 1 } }`，注释明说 inner block 与函数体都 yield `i32`，`statements.md` 的注释也同向。**块形式到底能不能作块尾？** | 块类型规则（sema）、负例边界 |
+| **Q12** | `x.self()` / `x.Self()`：`MethodCallExpression` 的段是 `PathIdentSegment`，语法上可导出这两种写法，但规范对语义**保持沉默**（既没说合法也没说是错误）。本实现让它们自然落到「方法查找找不到」⇒ compile error | 负例边界 |
+
+**测试点发布后新增的疑问**：
+
+| # | 问题 | 状态 / 我们的做法 |
+|---|---|---|
+| ~~Q13~~ | ~~内建命名规范书没跟上？~~ | ✅ **问题不成立**。规范书**已经改完**了：`27b1875`（2026-09-19）"rename builtin functions to adhere to rust naming conventions"，全仓库 `grep getInt\|printInt\|printlnInt` = **0 处命中**，`names.md:43` 的保护名表就是 `get_i32` / `print_i32` / `println_i32`。**规范与测试点完全一致，没有岔路** |
+| **Q14** | **官方运行器怎么调 driver？** `--stage=` / `--entry=` 的**拼写**有没有约定？ | 暂定 `--stage=<lex\|parse\|semantic\|codegen\|optimization>` + `--entry=<crate\|expression\|typeRef\|item\|letStatement>`（[`arch.md`](arch.md) §0.5）。**拼写是我们自己定的**，值得问一次——但改起来的成本只有 driver 里一个 `match` |
+| **Q15** | `parser` 的 442 条里 **323 条是语法碎片**（`metadata.entry` 指定入口）。碎片入口的成功判据是不是"**解析完且吃满输入**"？ | 暂定：五个入口**一律要求消费到 `Eof`**，尾部有剩即语法错误。**证据支持这个读法**：`entry=crate` 的 `foo` 与 `entry=expression` 的 `f<X>()` 都只能靠"吃满输入 + 既有边界规则"拒掉 |
+| ~~Q16~~ | ~~`use` 丢不丢弃？内建靠什么绑定？~~ | ✅ **规范明文答了**（`names.md:7`）：*Use declarations do not introduce names in Rx and participate in neither name resolution nor collision checks… **the builtin environment is independent of these declarations***。加上 `undefined-behavior.md` §Use compatibility：*Any imported name used by the program denotes an Rx builtin **under its existing spelling*** ⇒ **`use` 整条丢弃，内建按名字直接认**。测试点 `acc-lifetimes-and-unused-valid-import-aliases-do-not-affect-rx-resolution` 是同一结论的实证。**不用问** |
 
 （旧清单里的"标识符能否下划线开头""`if x {}` 是否报错""`const C: i32;` 是否合法"等**新规范已全部写明**，不再是问题。）
+
+⚠ **一条方法论提醒**：规范仓库在 **9/19–9/20 连推了 10 个 commit**（含上面两处关键变更）。**引用规范前先 `git pull` 再 `grep`**——本文档里几处"规范没写"的旧结论就是这么过期的。
 
 ### 3.2 待未来攻克的难点与风险
 
 | 难点 | 说明 | 何时必须解决 |
 |---|---|---|
-| **REIMU 未安装** | 本机既无 `reimu` 也无 `ravel`，整个验证闭环无从谈起 | W5 之前（前端阶段不受影响） |
+| ~~**REIMU 未安装**~~ | ✅ **已解决**（2026-09-22）：子模块 + xmake + gcc 就位，本机编译通过，`make test` 全绿（macOS 必须用 gcc 编译，见 §2.5） | — |
 | **前端 1800 行要自己敲** | "不能整段使用 AI" ⇒ 这是本计划最大的单点工期风险 | W1–W3 |
 | **LLVM IR 是强制项** | W8 交付的 IR 要能被 Clang/LLVM 22 接受。若拖到 W7 才做 `.ll` 打印器风险很高 ⇒ **建议 W5 第一件事就打通"最小函数 → `.ll` → clang → REIMU 打印一个数"** | W5 第一周 |
-| **测试点与 `.g4` 未发布** | 在拿到之前无差分 oracle；测试集由课程下发，**不需要自己生成** | Q1 有答案后 |
+| ~~**测试点未发布**~~ | ✅ **已解决**（2026-09-22）：804 例已发布，判分口径明确。`.g4` 仍可能不发，但**不再是阻塞项** | — |
+| **267 个负例才是真分母** | `lexer` 23 + `parser` 77 + `semantic` **167**。正例靠"能解析"就能过，负例必须**真的检查**——而且**崩/超时/被信号打死统统算失败** | 全程 |
+| **167 个 semantic 负例集中在少数几条规则上** | `vec-index-mutability` 一个目录就 **22 条**（最大），`namespace-errors` 16、`invalid-impls-and-generics` 12、`copy-clone-and-equality` 12、`constant-errors` 10——**这几条规则写不完，W8 就打不满**。逐条对照 [`spec-mapping.md`](spec-mapping.md) §6 | W5–W8 |
+| **72 个 parser 负例是 rust-analyzer 回归用例** | 不是"拒掉 enum/match/for"这种粗活，而是**残缺/畸形输入的边角拒绝**（缺逗号、缺分号、空参数槽、坏 use 路径、`issue-NNNNN`…）。**不需要错误恢复**（首个错误即返回），但每条都得真的报到错 | S6（W3–W4） |
+| **五个解析入口的官方调用方式未知** | 碎片靠 `metadata.entry` 指定入口，但**官方运行器怎么把 entry 传给 driver 是猜的**（Q14）。猜错的代价：442 条里 323 条判不了 | 写运行器时（W2），随 Q14 确认 |
+| **`use rx::core::*;` 一行不落地** | 每份程序都有这行，但 `use` **解析后整体丢弃**（规范明文 + 测试点印证）⇒ 内建 `get_i32` 等**必须按名字直接认**，不能指望导入绑定。写名字解析时别顺手去实现导入 | W5–W8 |
 | **图着色寄存器分配 + 溢出处理** | 优化阶段最重的一块；先用线性扫描兜底正确性 | W13–W16 |
 | **支配树 / 支配边界** | mem2reg 算 phi 插入点的前置，也是循环优化的基础 | W5–W8 |
 | **单人开发，无并行冗余** | 每阶段结束打 tag，保证任何时刻都有一个可交付版本 | 全程 |
-| **W4 只有约 3.5 周** | 前端比旧规范大 50%；拖到 W3 末就会挤压语义检查 | 9/26 复评 |
+| **W4 只剩 2.5 周，parser 还是空壳** | 前端比旧规范大 50%（8–10.5 个工作日），而 **10/4 是前端 ddl**。今天 9/22 仍未开工 S2/S3 ⇒ **9/26 这个复评点必须动真格**：要么下调 W4 的验收范围（如只保 `lexer` + `parser`，语义挪到 W5），要么加投入 | **9/26 复评** |
 
 ---
 
@@ -172,6 +351,7 @@
 - **线下答疑**：预计每周一次，周四晚翁老师课后
 - **考试**：W4 / W8 / W12 / W16
 - **Code Review**：至少 4 次；每次前跑 §4.2 自查清单
+- **跑测试点并记通过率**（§2.0）：每周记一次各 stage 的 x/y，**挂在周报里**——这是唯一能提前发现"W4 要交白卷"的信号
 
 ### 4.2 工程规范（为 Code Review 服务）
 
