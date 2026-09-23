@@ -38,21 +38,28 @@ fn is_digit_run(s: &[u8], base: Base) -> bool {
     s.iter().all(|b| base.is_digit(*b) || *b == b'_') && s.iter().any(|b| base.is_digit(*b))
 }
 
-fn is_valid_int_literal(run: &[u8]) -> bool {
-    let (base, digits_at) = match run {
+fn base_and_digits_at(run: &[u8]) -> (Base, usize) {
+    match run {
         [b'0', b'b', ..] => (Base::Bin, 2),
         [b'0', b'o', ..] => (Base::Oct, 2),
         [b'0', b'x', ..] => (Base::Hex, 2),
         _ => (Base::Dec, 0),
-    };
-    for suffix in [b"i32".as_slice(), b"u32", b"isize", b"usize"] {
-        if let Some(body) = run.strip_suffix(suffix) {
-            if is_digit_run(&body[digits_at..], base) {
-                return true;
-            }
-        }
     }
-    is_digit_run(&run[digits_at..], base)
+}
+
+pub fn int_literal_suffix(run: &[u8]) -> Option<usize> {
+    let (base, digits_at) = base_and_digits_at(run);
+    [b"i32".as_slice(), b"u32", b"isize", b"usize"]
+        .iter()
+        .find_map(|suffix| {
+            let body = run.strip_suffix(*suffix)?;
+            is_digit_run(&body[digits_at..], base).then_some(body.len())
+        })
+}
+
+fn is_valid_int_literal(run: &[u8]) -> bool {
+    let (base, digits_at) = base_and_digits_at(run);
+    int_literal_suffix(run).is_some() || is_digit_run(&run[digits_at..], base)
 }
 
 impl<'a> Lexer<'a> {

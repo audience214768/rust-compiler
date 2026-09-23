@@ -154,8 +154,10 @@
 
 ### 2.1 当前进度与本周（W2）要做的三件事
 
-> **当前代码进度**（截至 2026-09-22）：只走到 ① 前端。① 里 `token.rs` / `lexer.rs` / `error.rs` / `ast.rs` **已完成**；`parser.rs` 的**骨架**已完成（`Parser` 四字段、游标原语、五个入口 wrapper、`Restrictions`、arena 写入辅助），五个 `parse_*_root` 还是**直接报错的占位**；driver 的 `--stage=` / `--entry=` 开关与自写运行器 `scripts/parse_test.py` 已就绪。② 语义 / ③ 中端 / ④ 后端 / ⑤ 优化 的目录尚未创建。
-> 已知遗留：`SyntaxErrorKind` / `FrontendError` 的构造点**只有 `expect` 与五个占位**（真实现还没写），`never constructed` 与既有的 `Parser is never constructed` 同源，parser 落地即消。
+> **当前代码进度**（截至 2026-09-23）：只走到 ① 前端。① 里 `token.rs` / `lexer.rs` / `error.rs` / `ast.rs` **已完成**；`parser.rs` 里 `Parser` 四字段、游标原语、五个入口 wrapper、`Restrictions`、arena 写入辅助、语句层三支与 `fn` 全链**已落地**，并且 **S3 类型层 + S4 表达式层 + S5 语句收口全部写完**（`parse_type_root` / `parse_path` / `parse_generic_args` / `parse_const_value` / `expr_bp` 爬升引擎 / 原子分派 / 后缀循环 / 标点切分 / `parse_let`）。入口 wrapper **不再单开 `_root` 层**（一个产生式一个函数，见 [`spec-mapping.md`](spec-mapping.md) §2.0）。driver 的 `--stage=` / `--entry=` 开关与自写运行器 `scripts/parse_test.py` 已就绪。② 语义 / ③ 中端 / ④ 后端 / ⑤ 优化 的目录尚未创建。
+>
+> **剩下的是 S6（item 层）**：`parse_items` 已接上 `root`（循环 + `push_root`），`parse_item` 的六路分派骨架也已就位，`fn` 一支通到底；**余下四支 `use` / `struct` / `const` / `impl`（+ `parse_outer_attributes`）仍是 stub**（各自 `expect` 掉开头关键字后无条件报错）⇒ `--entry=crate` 28/47、`--entry=item` 17/28，**剩下的 30 条逐条都可归因到那五个 stub**。⚠ **`crate` 那 72 条负例现在仍是假绿**（stub 照样拒），S6 余下四支落地时这一格会先掉再涨。
+> 已知遗留：`cargo build` 61 条 warning，全是"AST 字段从没被读过"（AST 还没有下游消费者，sema 接上即消），外加 `parser.rs:414` 一条 `unused_mut`（在 `parse_param` 里，2026-09-23 之前就在）。`SyntaxErrorKind` 的 `never constructed` 已随本轮实现消掉。
 > **主动推迟的一项**（2026-09-21）：名字暂不 interning，用 `Name { span }` + sema 的 `Names` 现切现比——理由与将来的替换成本见 [`arch.md`](arch.md) §5.2.1。**等 sema 把名字解析写出来后再评估一次**（那时才知道比较点长什么样）。
 
 **实测基线（2026-09-22，用现有 driver 逐个跑 manifest、只比退出码）**——这张表比任何估时都诚实：
@@ -179,7 +181,28 @@ passed = (r.returncode == 0) == e['compilation_success']
 ```
 
 1. ✅ **接官方运行器**（§2.5）**+ 给 `lex`/`parse` 补自写运行器**（§2.0 的缺口）——**已完成**：`scripts/parse_test.py` + driver 的 `--stage=` / `--entry=`，并用三个 shim 自检过（全 0 → 365/442；全拒 → 77/442；只 lex → **370/442**，与 §2.1 的基线逐格对上）
-2. **开工 S3 + S4**（类型层 → 表达式层；`ast.rs` 与 `Parser` 骨架已完成）：**前端 ddl 是 10/4，今天已是 W2 周一**，§1.1 里"9/26 还没跑通 item/type 层就要下调验收目标"的预警**已经触发一半**——`parse_*` 的真实现一行都还没写
+2. ✅ **S3 + S4 + S5 已完成**（类型层 / 表达式层 / 语句收口，2026-09-23）。**首次实测分母**（`make parse-test`，判据是退出码、accept/reject 分开数）：
+
+   | entry | accept | reject | 说明 |
+   |---|---|---|---|
+   | `typeRef` | **101/101** | — | ✅ |
+   | `expression` | **176/176** | **5/5** | ✅ 负例 5 条是链式比较等，真的拒了 |
+   | `letStatement` | **13/13** | — | ✅ |
+   | `crate` | **28/47** | 72/72 | ⚠ 负例仍**假绿**：`struct`/`const`/`impl`/`use` 四条 stub 照样拒 |
+   | `item` | **17/28** | — | 同上，17 条全是 `fn` |
+   | **合计** | **335/365** | **77/77** | **412/442** |
+
+   ⇒ **范围内 295/295 全绿**（13+181+101），前端的表达式与类型两层实测无坑。
+   **下一件是 S6 的余下四支**——`crate` 与 `item` 两格剩下的 **30 条全部**压在
+   `use` / `struct` / `const` / `impl` / `parse_outer_attributes` 这五个 stub 上
+   （逐条核过：报错位置**全部**是「吃掉开头关键字之后的那个 token」，没有一条是别的原因），
+   而它们里 23 条需要完整的表达式+语句能力（§2.2 下面那张表），**那部分已经就位了**。
+   §1.1 里"9/26 还没跑通 item/type 层就要下调验收目标"的预警**已解除一半**（type 层跑通、item 层未开工）
+
+   > **2026-09-23 晚：`root` 接上了**（`parse_items` 从空壳改成循环 + `parse_item` 六路分派；
+   > 见下面的 S6 行）。`crate` 0→28、`item` 0→17，**这 45 条全部来自 S4 早已写好的
+   > `parse_function`，本次只是第一次把它接上 `root`**——别记成 item 层的功劳。
+   > 负例 72/72 **仍是假绿**（四条 stub 照拒），S6 余下四支落地时这一格会先掉再涨。
 3. **发邮件问 §3.1 里还没答案的那几条**（Q1/Q2/Q3 已被测试点答掉大半；**真正要问的只剩 Q6、Q7–Q9、Q11–Q12、Q14–Q15**，Q10/Q13/Q16 已被规范原文或测试点答掉，Q10 只需在周报里提一句）
 
 > **REIMU 已到位（2026-09-22 更新）**：不必再去 `DarkSharpness/REIMU` 找预编译二进制了——模板把它作为**子模块 `vendor/REIMU`**（`wanoful/REIMU`，pin `66dcdbd`）固定住。本机已装 xmake 并编译通过（macOS 需要一个编译补丁，见 §2.5）。
@@ -192,10 +215,10 @@ passed = (r.returncode == 0) == e['compilation_success']
 |---|---|---|---|
 | S1 | `token.rs` + `lexer.rs`：空白（**只有 4 种**）、嵌套注释、标识符/38+13 个关键字、整数字面量（radix + `_` + 后缀切分，**不设量级上限**）、lifetime token、44 个标点、ASCII 校验 + 报错通道 | ~~1–1.5 天~~ | ✅ **已完成：`lexer` 53/53** |
 | S2 | `ast.rs`（按 [`spec-mapping.md`](spec-mapping.md) §2 的映射列节点，每个带 Span；名字用 `Name` 不用裸 `Span`，见 §3.1 Q12） | ~~1 天~~ | ✅ **已完成**（节点 + 6 个 `*Id` newtype + 6 个 arena + 3 条尺寸断言） |
-| S3 | **类型层**：`parse_type`（`(` / path / `&` / `[T; N]`）、`parse_type_path`、`parse_generic_args`、极简 `parse_const_value`、`&&` 切分 | 1 天 | `typeRef` **101 正 / 0 负** |
-| S4 | **表达式层**：原子 + 后缀循环 → 前缀 + 优先级爬升 → 块形式（`{` `if` `while` `loop` `break` `continue` `return`）+ 三条边界规则 | 4–5 天 | `expression` **176 正 / 5 负** |
-| S5 | **语句 / 块收口**：`parse_statement` 三分支、`parse_let`、`;` 可选性、空语句、块尾 | 0.5 天 | `letStatement` **13 正** |
-| S6 | **item 层**：`use`（use tree / glob / alias）、`fn`（含接收者）、`struct`（含 derive 属性）、`const`、`impl`；`parse_crate` 收口 | 1.5–2 天 | `item` **28 正** + `crate` **47 正** |
+| S3 | **类型层**：`parse_type`（`(` / path / `&` / `[T; N]`）、`parse_type_path`、`parse_generic_args`、极简 `parse_const_value`、`&&` 切分 | ~~1 天~~ | ✅ **已完成：`typeRef` 101/101** |
+| S4 | **表达式层**：原子 + 后缀循环 → 前缀 + 优先级爬升 → 块形式（`{` `if` `while` `loop` `break` `continue` `return`）+ 三条边界规则 | ~~4–5 天~~ | ✅ **已完成：`expression` 176/176 + 5/5** |
+| S5 | **语句 / 块收口**：`parse_stmt` 三分支、`parse_let`、`;` 可选性、空语句、块尾 | ~~0.5 天~~ | ✅ **已完成：`letStatement` 13/13** |
+| S6 | **item 层**：`use`（use tree / glob / alias）、`fn`（含接收者）、`struct`（含 derive 属性）、`const`、`impl`；`parse_crate` 收口 <br>**进度（2026-09-23 晚）**：`root` 收口 + 六路分派骨架 + `fn` 一支 = **已完成**（`crate` 28/47、`item` 17/28）；**余下四支 `use` / `struct` / `const` / `impl`**（+ `parse_outer_attributes`，另 `parse_associated_item` 随 `parse_impl` 一起） | 1.5–2 天（已用 ~0.5） | `item` **28 正** + `crate` **47 正**（现 45/75，剩 30 条全部可归因到那五个 stub） |
 | S7 | **负例加固**（**不做错误恢复**，只需每条都真的报到错） | 2–3 天 | **77 负**（72 `crate` + 5 `expression`） |
 
 合计 **9–11.5 个工作日**（旧规范估 4–6 天）。S7 完成打 tag `ast`。**全部跑通 = 365 正 + 77 负 = 442/442。**
@@ -219,13 +242,15 @@ passed = (r.returncode == 0) == e['compilation_success']
 | 步 | 做什么 | 最小验证用例 |
 |---|---|---|
 | 0 | ✅ `Parser` 骨架：游标原语（`bump`/`nth`/`eat`/`expect`/`mark`/`span_from`）+ 五个入口 wrapper + `Restrictions` + arena 写入辅助（**parser 的地基**） | `cargo build` 干净、`cargo test` 全绿 |
-| 1 | 类型层：`parse_type` 的四个分支 + `parse_const_value` | `&&i32` / `[u32; 1]` / `&'static ()`（→ `typeRef` 101） |
-| 2 | `parse_atom` + **后缀循环**，不做运算符 | `f(1).x[0]` / `S { x: 5 }` |
-| 3 | 加"全程爬升"的表达式版本 | `1 + 2 * 3` / `a - b - c` |
-| 4 | 加语句边界分支（`Restrictions::prefer_stmt`；**判据是后缀跑完之后**的 lhs） | `{p}.x = 10;` 与 `if true {} else {} -1;`（这步之前必错一个） |
-| 5 | 加块尾（记 `semi`，`tail()` 派生） | `{ a; b }` / `{ a }` / `{ if c {1} else {2} }`（最后一条取决于 Q11） |
-| 6 | 加条件边界（`Restrictions::CONDITION` 的 `forbid_structs`）与 `break` 的不吃 `{` 判据 | `if (S{flag:true}).flag {}` / `if check(S{flag:true}) {}` / `if break {}` / `loop { break { 9 }; }` |
-| 7 | 加标点切分 | `Vec<Vec<i32>>= x;` / `&&x` / `&&i32` |
+| 1 | ✅ 类型层：`parse_type_root` 的四个分支 + `parse_const_value` | `&&i32` / `[u32; 1]` / `&'static ()`（→ `typeRef` **101/101**） |
+| 2 | ✅ `parse_atom` + **后缀循环**，不做运算符 | `f(1).x[0]` / `S { x: 5 }` |
+| 3 | ✅ 加"全程爬升"的表达式版本 | `1 + 2 * 3` / `a - b - c` |
+| 4 | ✅ 加语句边界分支（`Restrictions::prefer_stmt`；**判据是后缀跑完之后**的 lhs） | `{p}.x = 10;` 与 `if true {} else {} -1;`（这步之前必错一个） |
+| 5 | ✅ 加块尾（记 `semi`，`tail()` 派生） | `{ a; b }` / `{ a }` / `{ if c {1} else {2} }`（最后一条取决于 Q11） |
+| 6 | ✅ 加条件边界（`Restrictions::CONDITION` 的 `forbid_structs`）与 `break` 的不吃 `{` 判据 | `if (S{flag:true}).flag {}` / `if check(S{flag:true}) {}` / `if break {}` / `loop { break { 9 }; }` |
+| 7 | ✅ 加标点切分 | `Vec<Vec<i32>>= x;` / `&&x` / `&&i32` |
+
+> 7 步全部落地（2026-09-23），`expression` 的第一遍就是 176/176 + 5/5——**没有一步是"先红后绿"**。落地时对出的三条文档错已订正（[`spec-mapping.md`](spec-mapping.md) §2.9.1(2) / §2.10 / §3）：方法段类型实参**不是** parser 报的（语义阶段才报，parser 只记 `has_type_args`）、`1 + return 2` **合法**、不可链式比较**读 bp 不读 AST**（标志是循环局部的）。
 
 ### 2.3 词法部分核对结果：清单已清空（2026-09-19）
 
@@ -245,7 +270,8 @@ passed = (r.returncode == 0) == e['compilation_success']
 |---|---|---|
 | 1 | ~~`.gitignore`~~ | ✅ **已由 §2.5 解决**：`tests/official/` 改走子模块（不再有嵌套仓库需要忽略），`tests/`、`scripts/` 也随模板建好了 |
 | 2 | `ast.rs` | ✅ **已完成**（节点 + 6 个 `*Id` newtype + 6 个 arena + 3 条尺寸断言）。**2026-09-22 与文档对齐了两处字段名**：`ExprKind::Grouped` → `Paren`、`If.else_block` → `else_branch`；文档那边的 `ItemKind::Fn.receiver` 改成 `recv`（与 `Field`/`Method`/`Index` 三个兄弟字段一致） |
-| 3 | `parser.rs` | **骨架已完成**：`Parser` 四字段（§1.2.1）、游标原语、arena 写入辅助、`Restrictions` 三个常量、五个入口 wrapper + 共用的 `finish`（吃满 `Eof`）。**待办：五个 `parse_*_root` 的真实现**，按 §2.2 的 S3→S7。坑清单见 [`spec-mapping.md`](spec-mapping.md) §2 与 `arch.md` §1.5 |
+| 3 | `parser.rs` | **S0–S5 已完成**：`Parser` 四字段（§1.2.1）、游标原语 + 切分 wrapper（`eat_gt`/`eat_lt`/`eat_and`/`split_cur`）、arena 写入辅助、`Restrictions`（含 `sub()`）、五个入口 wrapper + 共用的 `finish`、语句层三支、`fn` 全链、**类型层 / 表达式层 / 语句收口**（§2.2 的 7 步全绿）。**2026-09-23 晚：`root` 收口**——`push_root` + `parse_items` 循环 + `parse_item` 六路分派（`mark()` 在属性之前），`parse_impl` 的报错种类订正为 `ExpectedItem`，表达式侧的 `parse_struct` 按 [`spec-mapping.md`](spec-mapping.md) §2.9 改名 `parse_struct_expr` 把名字让给 item 级。**待办 = S6 余下四支：`parse_use` / `parse_struct` / `parse_const` / `parse_outer_attributes` / `parse_impl` 体**（现为 stub，各自 `expect` 掉开头关键字后报错），然后是 S7 负例加固。入口不再单开 `_root` 层（[`spec-mapping.md`](spec-mapping.md) §2.0 的"一个产生式一个函数"）。坑清单见 [`spec-mapping.md`](spec-mapping.md) §2 与 `arch.md` §1.5 |
+| 6 | `parse_stmts` 的"块内 item" | ⚠ **文档已定、代码没跟上（2026-09-23 核出）**：[`spec-mapping.md`](spec-mapping.md):122 要求块内遇 `fn`/`struct`/`impl`/`use` 报错，但 `parse_stmts` 没有这条显式检查——它靠"这些关键字起不了表达式"、由**表达式原子分派**兜底报错。**行为是对的**（四个都是严格关键字，永远进不了表达式），**故意不补**：补它要新加一个 `SyntaxErrorKind`（现有的 `ExpectedItem` 渲染成"期望 use / fn / struct / const / impl 之一"，而这里用户**恰恰写了 item**、只是位置错，报这句是反的），判分又只看退出码。**只在将来给原子分派加关键字分支时才需要它。** |
 | 4 | `main.rs` | ✅ **已完成**：`--stage=` / `--entry=` 就位（默认 `--stage=optimization --entry=crate`，用法错退 2、正常拒退 1、无 panic）；`--stage=lex` 保留 token dump，`parse` 不 dump。**待办：`semantic`/`codegen`/`optimization` 三个 stage 还是"未实现"占位** |
 | 5 | `scripts/` | ✅ 官方 `test.py` 已就位（§2.5）；`parse_test.py`（`lex`/`parse` 的自写运行器）**已完成并通过三个 shim 的自检**（§2.1 第 1 条）。**待办：`lex` stage 的运行器**（parser 那份稍改 `STAGES` 即可，优先级低——lexer 53/53 已定） |
 
@@ -319,7 +345,7 @@ xmake -y -P vendor/REIMU
 | Q6 | `backend.md` 说 "No specific optimization is mandatory"，`tasks.md` 说六项必做优化"作为通过测试的点出现"——以哪个为准？排名公式与基线是什么？ | ⚠ **半答，且答案反直觉**：**测试点里没有任何时间/体积阈值**（翻遍 98 个 manifest 只有 "timeout = 失败"）⇒ `optimization` stage 考的是**规模下的输出正确性**，不是速度。**六项必做优化只能以 [`tasks.md`](tasks.md) 为准**；排名公式与基线**仍未知**，必问 |
 | Q7 | `Struct` 允许 `OuterAttribute*`，但其他构造上的属性不支持——`#[derive]` 放错位置的**报错**要求进负例测试吗？ | parser 严格程度 |
 | Q8 | 空 struct `struct S {}` 语法上要解析通过，但数据使用是 UB。负例测试会拿它考吗？ | 同上 |
-| **Q9** | `return`/`break`/`continue` 能否出现在**原子位置**（如 `f(return 1)`）？`expressions.md` 的 `ExpressionWithoutBlock` 列表包含它们，那按产生式就该能 | parser 严格程度 |
+| **Q9** | `return`/`break`/`continue` 能否出现在**原子位置**（如 `f(return 1)`）？`expressions.md` 的 `ExpressionWithoutBlock` 列表包含它们，那按产生式就该能 | ✅ **已答（规范书 + 语料双向，2026-09-23）**：`expressions.md:8-19` 的 `ExpressionWithoutBlock` 列表确实含 `BreakExpression`/`ReturnExpression`/`ContinueExpression`，而 `CallParams`/`GroupedExpression` 取的是 `Expression` ⇒ 语法上就该能；语料 `parser/accept/0035_weird_exprs-*.rx` 里 `f(return)`、`(return 0)`、`(continue)`、`if (return) { break; }` 四条正例。**不用问助教** |
 | **Q10** | **规范自相矛盾**：`grammar.md` 的上下文标点表只列 4 个（`&&` `>>` `>=` `>>=`），但 `operator-expr.md:108` 明说 `<<` 的前导 `<` 也要进泛型实参解析。**我们按 5 个实现**，请确认 | ✅ **测试点已经把架吵完了**：`parser/reject/cast-angle-bracket-precedence-*.rx`（`entry=expression`）里两条是 `a as usize < 4` 与 `a as usize << long_name`，**都是负例**。若按移位解析，后者是**完全合法的表达式** ⇒ 只可能是"`<<` 的前导 `<` 进了泛型实参" ⇒ **必须切 5 个**。规范的表格漏了一行，**不用再问，但值得在周报里提一句** |
 | **Q11** | **规范自相矛盾**：`block-expr.md:7-10` 的 `Statements` 产生式把块尾限制为 **`ExpressionWithoutBlock`**（即 `{}`/`if`/`loop` 等块形式**不能**当块尾）；但同文件 `block-expr.md:22-25` 的例子 `fn select(flag: bool) -> i32 { let base = …; { base + 1 } }`，注释明说 inner block 与函数体都 yield `i32`，`statements.md` 的注释也同向。**块形式到底能不能作块尾？** | 块类型规则（sema）、负例边界 |
 | **Q12** | `x.self()` / `x.Self()`：`MethodCallExpression` 的段是 `PathIdentSegment`，语法上可导出这两种写法，但规范对语义**保持沉默**（既没说合法也没说是错误）。本实现让它们自然落到「方法查找找不到」⇒ compile error | 负例边界 |
@@ -332,6 +358,9 @@ xmake -y -P vendor/REIMU
 | **Q14** | **官方运行器怎么调 driver？** `--stage=` / `--entry=` 的**拼写**有没有约定？ | 暂定 `--stage=<lex\|parse\|semantic\|codegen\|optimization>` + `--entry=<crate\|expression\|typeRef\|item\|letStatement>`（[`arch.md`](arch.md) §0.5）。**拼写是我们自己定的**，值得问一次——但改起来的成本只有 driver 里一个 `match` |
 | **Q15** | `parser` 的 442 条里 **323 条是语法碎片**（`metadata.entry` 指定入口）。碎片入口的成功判据是不是"**解析完且吃满输入**"？ | 暂定：五个入口**一律要求消费到 `Eof`**，尾部有剩即语法错误。**证据支持这个读法**：`entry=crate` 的 `foo` 与 `entry=expression` 的 `f<X>()` 都只能靠"吃满输入 + 既有边界规则"拒掉 |
 | ~~Q16~~ | ~~`use` 丢不丢弃？内建靠什么绑定？~~ | ✅ **规范明文答了**（`names.md:7`）：*Use declarations do not introduce names in Rx and participate in neither name resolution nor collision checks… **the builtin environment is independent of these declarations***。加上 `undefined-behavior.md` §Use compatibility：*Any imported name used by the program denotes an Rx builtin **under its existing spelling*** ⇒ **`use` 整条丢弃，内建按名字直接认**。测试点 `acc-lifetimes-and-unused-valid-import-aliases-do-not-affect-rx-resolution` 是同一结论的实证。**不用问** |
+| **Q17** | **条件边界上，`break`/`return` 操作数后面的 `{` 归谁？规范书没写**。书里只有三条相关文字，都**不覆盖**这个形状：`if-expr.md:9` 的 `Conditions` 例外**只**提 unparenthesized StructExpression（`:20` 还专门声明 `if { true } { … }` 是**块值条件** ⇒ 不是"体块一律胜"）；`loop-expr.md` 只有 `BreakExpression -> 'break' Expression?`；`expressions.md:185` 把 `break`（带值）与 `return` **并列**为「Consume the following expression」（按字面两者都贪婪）。**默认它的是 `.g4`**：`break` 的操作数走一条窄链（`:626 BREAK conditionBreakExpression?` → `:489 conditionBreakPostfixExpression : conditionPrimaryWithoutBareBlock postfixSuffix*`，头一个 primary 不许是裸块），`return` 走普通条件链（`:627`，而 `:611 conditionPrimary` 含 `blockExpression`）。语料 `parser/accept/break_ambiguity-*.rx`（`entry=expression`）把 `if break {}` 钉成 `if (break) {}` | 请确认三件事：**(1)** `if break {}` / `while break {}` 读成 `if (break) {}`（体块胜）？**(2)** `return` 有没有同样的例外（`if return {} {}` 里第一个 `{}` 是不是 `return` 的操作数）？**(3)** 条件里 `return S{x:1}` 那个 `{` 算结构体字面量（我们现在的做法）还是体块（`.g4` 的做法）？现状按 `.g4`+语料实现（[`spec-mapping.md`](spec-mapping.md) §2.9.1）；若 (3) 判给 `.g4`，只换一行（`parse_return` 的 `VALUE`→`r.sub()`） |
+| **Q18** | **块形式语句的"身份"被后缀吃掉后，中缀运算符还能不能继续？`(`/`[` 能不能直接跟在块形式后面？规范书没写全**：`statements.md:47-49` 说块形式语句「terminates immediately rather than greedily consuming any subsequent **infix operator**」，只放行 "postfix field accesses or method calls"（例 `{ make() }.value;`），但**没写**"吃下后缀之后就不再是块形式"。语料 `parser/accept/expression_after_block-*.rx`（`entry=crate`）= `{p}.x = 10;` 是正例 ⇒ 「后缀之后 `=` 照吃」已被钉住；而 `(`/`[` 那条**零正反例**，只有 `.g4:493/588-590`（`expressionWithBlock dotSuffix postfixSuffix*`，只给 dot）撑着 | 请确认：**(1)** `{p}.x = 10;` 是一条赋值语句？**(2)** `while c {break}();` 读成 `while c {break}; ();`（即 `(` `[` 不跟在块形式后面）？ |
+| **Q19** | **`&&'a mut T` 的分组**：`.g4:122` 注释「ANDAND constructs TWO references; lifetime/MUT belong to the inner one」⇒ `&(&'a mut T)`。规范书 `types/pointer.md:11` 只说 `&&T` 是两个嵌套引用构造器、`&&` 要上下文拆分，**没说 `'a`/`mut` 挂哪一层**；语料里 `&&'a` 与 `&&mut` 两种写法都零命中 | AST 形状（引用嵌套层数与可变性归属），W1 阶段就要定 ⇒ 请确认 `&&'a mut T` = `&(&'a mut T)` |
 
 （旧清单里的"标识符能否下划线开头""`if x {}` 是否报错""`const C: i32;` 是否合法"等**新规范已全部写明**，不再是问题。）
 

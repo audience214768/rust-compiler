@@ -234,6 +234,7 @@ pub enum ExprKind {
         recv: ExprId,
         name: PathIdentSegment,
         args: Vec<ExprId>,
+        has_type_args: bool,
     },
     Field {
         recv: ExprId,

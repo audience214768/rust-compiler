@@ -16,6 +16,7 @@ const STAGES: [&str; 5] = ["lex", "parse", "semantic", "codegen", "optimization"
 const ENTRIES: [&str; 5] = ["crate", "expression", "typeRef", "item", "letStatement"];
 
 fn main() {
+    
     let args: Vec<String> = env::args().collect();
     let mut path: Option<String> = None;
     let mut stage = String::from("optimization");

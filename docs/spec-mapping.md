@@ -107,6 +107,8 @@ let nested: Vec<Vec<i32>>=Vec::<Vec<i32>>::new();
 
 **这五个函数本来都在**——`parse_item` / `parse_type` / `parse_let` 都是 `parse_crate` 内部的递归环节，只需把它们变成 pub 的入口包装（多一个"吃满输入"的收尾）。
 
+⇒ **规则：一个产生式一个函数**。真实现是 `impl Parser` 上的方法，`pub fn parse_xxx(src)` 只是"起 lexer + 调它 + `finish()`"的薄壳；**不要**再为入口单开一层 `parse_xxx_root`（那层只在"入口要的东西和递归函数不一样"时才有理由，现在五个入口一个都没有）。**壳与方法同名不冲突**：Rust 里方法调用必须走接收者 `p.parse_let()`、函数调用走路径 `parser::parse_let(src)`，不加限定符也天然分得开——同一个产生式的两个门同名反而好认。
+
 **"强制 `Eof`"是五个入口的统一约定**，不是 `parse_crate` 的专利：解析完必须停在 `Eof`，尾部有剩余 token 即语法错误。上表那 5 个 `expression` 负例全靠这条 + §3 的既有规则拒掉（`f<X>()`、`false == false == false`、`false == 0 < 2`、`a as usize < 4`、`a as usize << long_name`）。
 
 ⚠ **入口必须由命令行显式传入，不能"挨个入口试一遍"**：`parser/reject/path_item_without_excl-….rx` 内容就是 `foo`，`entry=crate` 时该拒，而 `expression` 入口会把它当路径表达式**正常收下** ⇒ 负例被判成通过。完整理由见 [`../arch.md`](../arch.md) §1.5.5。
@@ -117,7 +119,7 @@ let nested: Vec<Vec<i32>>=Vec::<Vec<i32>>::new();
 |---|---|
 | `Crate` | `parse_crate()` = `item*` + **强制 EOF**（没有 EOF 则尾部垃圾不报错） |
 | `Item` | `parse_item()` 按首个 token 分派：`use` / `fn` / `#[` / `struct` / `const` / `impl` |
-| — | **item 不能出现在表达式块里**，所以 `parse_block_body` 遇到 `fn`/`struct`/`impl`/`use` 要报错而不是递归下去 |
+| — | **item 不能出现在表达式块里**，所以 `parse_stmts` 遇到 `fn`/`struct`/`impl`/`use` 要报错而不是递归下去 |
 
 **`Item` 里没有 enum**：`enum` 是 strict 关键字但它导出的构造在 Language subset 的排除表里。`enum` 关键字要认，`enum` 声明要作为语法错误拒绝。
 
@@ -220,9 +222,9 @@ self.expect(TokenKind::RParen)?;
 |---|---|
 | `GenericParams` / `GenericParam` / `LifetimeParam` | `parse_generic_params()`——**只可能含生命周期参数**，没有类型参数 |
 | `Lifetime` / `LifetimeBounds` / `TypeParamBounds` / `TypeParamBound` | `parse_lifetime()` / `parse_lifetime_bounds()` |
-| `WhereClause` + 3 个子产生式 | `parse_where_clause()`；`parse_where_clause_item() -> Result<bool>`（有 item 就吃并返回 `true`，没有就一个 token 都不动返回 `false`），循环 `while ...? { if !eat(Comma) { break } }`；两个分支按"`:` 前是生命周期还是类型"分派，类型支靠 FIRST(`typeRef`) = `at_type_start()` 起头；**支持尾逗号** |
+| `WhereClause` + 3 个子产生式 | `parse_where_clause()`；`parse_where_clause_item() -> Result<()>`，两个分支按"`:` 前是生命周期还是类型"分派；循环 `while !at(LBrace) { parse_item()?; if !eat(Comma) { break } }`，**支持尾逗号** |
 
-`WhereClause` 的列表**没有自己的终结符**——`Parser.g4:104-106` 是 `WHERE (whereClauseItem (COMMA whereClauseItem)* COMMA?)?`，读完最后一个 item 就结束了。终止条件只能由 parser 自己判：FIRST（下一个 token 还能起 item 吗）或 FOLLOW（下一个 token 是不是外层的后继，三个宿主的后继都是 `{`）。**我们选 FIRST**，理由与统一约定见 [`arch.md`](arch.md) §1.5.6。语料里带真 `where` 子句的 `.rx` 只有 `semantic/lifetimes-and-use/acc-lifetimes-and-unused-valid-import-aliases-do-not-affect-rx-resolution.rx` 和它的 codegen 孪生文件；前者里那两处（struct 一处、fn 一处）都是 `'a: 'a,` / `'long: 'short,` 这种**带尾逗号**的形状，正好压在这条规则上。类型条目那一支**没有任何正例**，它存在的意义就是拒掉畸形输入。
+`WhereClause` 的列表**没有自己的终结符**——`Parser.g4:104-106` 是 `WHERE (whereClauseItem (COMMA whereClauseItem)* COMMA?)?`，读完最后一个 item 就结束了。终止条件由 parser 自己判，**取宿主那个 `{`**（FOLLOW）：三个宿主（fn / struct / impl）后面都是 `{`，且 `{` ∉ FIRST(`WhereClauseItem`) ⇒ 不会和「新 item 开始」撞车。两个前提与「为什么不用 FIRST」见 [`arch.md`](arch.md) §1.5.6。语料里带真 `where` 子句的 `.rx` 只有 `semantic/lifetimes-and-use/acc-lifetimes-and-unused-valid-import-aliases-do-not-affect-rx-resolution.rx` 和它的 codegen 孪生文件；前者里那两处（struct 一处、fn 一处）都是 `'a: 'a,` / `'long: 'short,` 这种**带尾逗号**的形状，正好压在这条规则上。类型条目那一支**没有任何正例**，它存在的意义就是拒掉畸形输入。
 
 **关键点**：泛型**参数**只有生命周期，但泛型**实参**（`GenericArgs`，§2.8）含具体类型。这份语法必须能解析，然后**整体丢弃生命周期**（`grammar.md` 的 "Syntax that may be discarded after parsing"）。丢弃是编译器内部步骤，去掉生命周期注解后剩下的文本**不必**是合法 Rust。
 
@@ -288,13 +290,15 @@ self.expect(TokenKind::RParen)?;
 
 | 规范产生式 | 实现 |
 |---|---|
-| `Statement` | `parse_statement()` |
+| `Statement` | `parse_stmt()` |
 | `LetStatement` + `IdentifierBinding` | `parse_let()`——**类型可选（有推断）、初始化器必需** |
-| `ExpressionStatement` | `parse_expr_statement()`，拆两支 |
-| `Statements` | `parse_block_body()` = `statement* expressionWithoutBlock?`（吸收规范里三条冗余分支） |
+| `ExpressionStatement` | `parse_expr_stmt()`，拆两支 |
+| `Statements` | `parse_stmts()` = `statement* expressionWithoutBlock?`（吸收规范里三条冗余分支） |
 | `BlockExpression` | `parse_block()` |
 
 **块尾规则**：`ExpressionStatement` 必须拆两支——`ExpressionWithoutBlock` **必须带 `;`**，`ExpressionWithBlock`（`{...}` / `if` / `while` / `loop`）的 `;` 可选。否则 `{ a; b }` 的尾表达式判断会错：`{ a; b }` 合法（`b` 是块的值），`{ a }` 里 `a` 是尾表达式也合法。
+
+⚠ 块形式那一支不带 `;` 时**后面还能再跟语句**（`if true {} else {} -1;` 是两条语句；`parser/accept/block-expr-statement-vs-expr-9daf5fa6c1.rx` 的 `fn t4()` 里 `if true {…} else {…}` 后面紧跟 `()` 同理；`semantic/…/rej-a-non-final-block-statement-without-semicolon-must-be-unit.rx` 是**语义**负例，parser 必须接受它）⇒ 循环**不能**见到"没吃到 `;`"就收工，详见 §2.9 中间那张四档表。
 
 ⇒ 推论：**`Stmt::Expr` 必须如实记录 `semi: bool`**，不能"反正都是语句"就丢掉。**parser 不要替语义分析丢信息。**
 
@@ -326,19 +330,42 @@ if true {} else {} -1;                       // if 语句，然后 -1 表达式�
 | `parser/accept/binop_resets_statementness-*.rx` | `fn f() { v = {1}&2; }` | **中缀右侧按值位置解**（语句性在运算符右侧被重置） |
 | `semantic/blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx` | `if true {} else {}` 换行 `-1;` 与 `let y = if true {10} else {20} - 1;` 同处一份 | 前者**两条语句**、后者**一个表达式** ⇒ 「不爬升」和「总是爬升」两个偷懒版**会挂在同一个文件上** |
 
-⇒ `parse_statement()` 是三分支：`;` → 空语句；`let` → let 语句；否则看首 token——是 `{` `if` `while` `loop` 之一就走语句位置入口（`;` 可选），其它走普通入口并**强制** `;`。**注意只有那 4 个 token 算块形式**：`(` `-` `!` `*` `&` 标识符 字面量都不算。
+⇒ `parse_stmt()` 是三分支：`;` → 空语句；`let` → let 语句（`;` 强制，`expect(Semi)`）；否则走语句位置的表达式入口 `parse_expr_stmt()`，**`;` 的强制性由它事后判**（下表）。
 
-**后缀第一步还有一条**：语句位置且 lhs 是块形式时，**第一个后缀不许是 `(` / `[`**，只许 `.`；一旦吃下任何后缀，块形式身份就没了，后续一切恢复正常。这条是为了让 `while c {break}();` 读成 `while c {break}; ();` 而不是 `while c { break(); }`。
+**不需要"看首 token 决定走哪个入口"那层路由**（2026-09-23 删）：`prefer_stmt` 只在 lhs 是块形式时才起作用，而块形式只能来自那 4 个块形式原子（`{` `if` `while` `loop`；`(` `-` `!` `*` `&` 标识符 字面量都不算），首 token 不是它们时传 `STATEMENT` 与传 `VALUE` 逐字节相同 ⇒ 路由是冗余的，少一处要同步维护的东西。
+
+**`parse_expr_stmt()` 的形状**：`parse_expr_bp(0, STATEMENT)` → 吃 `;` → 按**后缀跑完之后**的 lhs 判四档：
+
+| 情况 | 判据 | 结果 |
+|---|---|---|
+| 吃到 `;` | — | 语句，`semi: true`，循环继续 |
+| 没吃到，lhs **仍**是块形式 | `block_like` | 语句（`;` 可选），`semi: false`，**循环继续**（后面还能再跟语句） |
+| 没吃到，lhs **非**块形式，当前是 `}` | `!block_like && at(RBrace)` | **块尾**，`semi: false`，循环收工 |
+| 没吃到，lhs **非**块形式，当前不是 `}` | 其余 | 报 `Expected(Semi)` |
+
+⇒ **`parse_expr_bp` 返回 `(ExprId, bool)`，那个 `bool` = "后缀跑完之后 lhs 是否仍是块形式"**（参考实现返回同义的 `(CompletedMarker, BlockLike)`）。它**必须由表达式解析器带出来**，不许在 `parse_stmts` 里拿 `ExprKind` 重判——那会让"块形式"这个集合有第二份（第一份住在爬升与后缀那两个判据点），将来加一支只改一处 ⇒ 合法程序被静默判错（同 §1.5.6 的"同一个判据集合不许有第二份"）。
+
+⇒ `parse_stmts()` 因此只有一条规则：**停在 `}` 或 `Eof`**（`!at(Eof)` 是明知故犯的守卫：`bump` 在 `Eof` 上不推进，少了它会空转 ⇒ 超时 = 失败），"谁是块尾"完全不判——`Block` 没有 `tail` 字段，块尾 = `stmts` 里最后一条 `StmtKind::Expr{semi:false}`，语义阶段派生。
+
+**后缀第一步还有一条**：语句位置且 lhs 是块形式时，**第一个后缀不许是 `(` / `[`**，只许 `.`；一旦吃下任何后缀，块形式身份就没了，后续一切恢复正常。这条是为了让 `while c {break}();` 读成 `while c {break}; ();` 而不是 `while c { break(); }`。**规范书只有 `statements.md:49` 的枚举**（"postfix field accesses or method calls may continue"，= `.` 那一支）撑着，"后缀之后身份消失"与"`(`/`[` 不行"两句书上都没写（`.g4:493/588-590` 只给 `dotSuffix`；语料对 `(`/`[` 零正反例）⇒ 见 [`plan.md`](plan.md) Q18。
 
 #### 2.9.1 未写进规范的解析细则（2026-09-22 补，逐条转录自参考实现）
 
-规范只给产生式，没给"`break` 的操作数在条件里到底吃不吃 `{`"。（1）（2）两条是从 **rust-analyzer 的 parser**（本语料期望树的来源，commit `971903d9`）逐字读出来的，并用判分语料双向验证过；（3）是随之而来的实现形状：
+**规范书里没有这条规则**：`loop-expr.md` 的语法块只有 `BreakExpression -> 'break' Expression?`，正文讲的是 break 的目标循环、不讲 `{`；`if-expr.md:9` 的 `Conditions` 例外**只**写了 unparenthesized StructExpression；`expressions.md:185` 的优先级表还把 `break`（带值）与 `return` 并列为「Consume the following expression」（按字面两者都贪婪）；`grammar.md:49-62` 的 Rule locations 表里也没有这一行。**默认它的是 `.g4`**——`Parser.g4:393-395` 的注释原文「Break operands in conditions: the first primary cannot be a bare block.」＋紧跟的那条 `conditionBreakExpression` 规则链（读法见下）。⇒ **已列为待问助教的 [`plan.md`](plan.md) §3.1 Q17；在答复前按 `.g4` + 语料实现**（语料 `parser/accept/break_ambiguity-*.rx` 是 `entry=expression` 的正例，与 `.g4` 同向）。（1）（2）两条由 `.g4` 读出，再用 **rust-analyzer 的 parser**（本语料期望树的来源，commit `971903d9`）与判分语料双向验证；（3）是随之而来的实现形状：
 
 **（1）`break` 的操作数**：下一个 token 能起表达式，**且不是**（当前在 `forbid_structs` 上下文 且 下一个是 `{`）时，才吃操作数。
 
 ```rust
 if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) { expr(p); }
 ```
+
+**`.g4` 怎么默认这条**（规范书对应处沉默）：条件边界的表达式走的是专用链 `condition*`，链底那个 primary 有两种写法，**普通条件两种都行、`break` 的操作数只能用窄的那种**：
+
+| 位置 | 规则 | 头一个 primary 可以是裸块吗 |
+|---|---|---|
+| 普通条件（含条件里的 `-x`、`&&x`、`(x)`） | `conditionPrimary:611` = `conditionPrimaryWithoutBareBlock \| blockExpression` | ✅ —— 规范书同向：`if-expr.md:20` 明说 `if { true } { … }` 是块值条件 |
+| **条件里 `break` 的操作数** | `conditionBreakPostfixExpression:489` = `conditionPrimaryWithoutBareBlock postfixSuffix*` | ❌ ⇒ 那个 `{` 只能归 `if`/`while` 当体块，这就是 `if break {}` —— **规范书沉默，见 [`plan.md`](plan.md) Q17** |
+| 语句 / 值位置 | `nonBlockPrimary:599` 里那一支 `BREAK expression?`（`:604`），而 `expression → … → primaryExpression:594 → expressionWithBlock:203 → blockExpression` | ✅ ⇒ `loop { break { 9 }; }` 吃 `{9}`（规范书 `expressions.md:185` 同向：「consume the following expression」） |
 
 两个方向都有正例逼着：
 
@@ -349,18 +376,25 @@ if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) { expr(p); }
 | `parser/accept/0035_weird_exprs-4a680eac1a.rx` = `loop { if break { } }` | 条件 | 同上 |
 | `codegen/expected-types/acc-no-inference-through-operators-or-borrows-is-required.rx` = `loop { break { 9 }; }` | **语句** | `break` **吃** `{9}`，循环值必须是 `9`（该文件是 codegen 正例，会真的跑） |
 
-⇒ 「`break` 永不把 `{` 当操作数」是**错的**，会挂掉上面第 4 条。判据里那个 `forbid_structs` 就是条件边界的同一个标志——**两个边界规则共用一只开关**，不是各自一套。
+⇒ 「`break` 永不把 `{` 当操作数」是**错的**，会挂掉上面第 4 条。判据里那个 `forbid_structs` 就是「现在走在 `condition*` 这条链上」的白话版——**两个边界规则共用一只开关**，不是各自一套：结构体那一半同理，`conditionPrimaryWithoutBareBlock:620` 的 `pathInExpression` 后面**没有** `(LBRACE structExprFields? RBRACE)?`，而 `nonBlockPrimary:601` 有。
 
-**（2）`return` 与 `continue` 不对称**：`return` 的操作数解析**不继承当前限制**（直接按普通值位置解），所以 `return {}` 在条件里也会把 `{}` 吃掉；`continue` 根本没有操作数（`ContinueExpression -> 'continue'`，规范里就没有 `Expression?`）。
+**（2）`return` 与 `continue` 不对称**：`return` 的操作数解析**不继承当前限制**（直接按普通值位置解，即传 `Restrictions::VALUE`），所以 `return {}` 在条件里也会把 `{}` 吃掉；`continue` 根本没有操作数（`loop-expr.md` 的 `ContinueExpression -> 'continue'` 没有 `Expression?`，`.g4:606`/`:628` 两支也都是光秃秃的 `CONTINUE`）。
 
-**（3）限制怎么传**：参考实现是**按值传参**（`expr_bp(min_bp, r)`），不是可变字段 + 存/恢复。进 `(` `[`、调用实参、数组元素、字段值、块体、`break`/`return` 的操作数时**传 `VALUE` 常量**即可，不存在"忘了恢复"这条 bug。⇒ 我们的 `Parser` 因此**只有四个字段**（`arch.md` §1.2.1 原写的第 5 个 `no_struct_literal` 已删）。
+> ⚠ **`.g4` 与规范书在这条上不一致，知情选择**（2026-09-23 记，同日二次订正）。**规范书对 `return` 的操作数边界同样没有规则**（`return-expr.md` 只有 `ReturnExpression -> 'return' Expression?`，`expressions.md:185` 把它与 `break` 并列 ⇒ 按字面两者对称、都贪婪）。`.g4` 反而**故意不对称**：`break` 走窄链 `BREAK conditionBreakExpression?`（`:626`），`return` 走普通条件链 `RETURN conditionExpression?`（`:627`），并给了注释说明（`:616`：只有 break 的操作数不许以裸块开头，"All other operands remain greedy"）。
+> **但「继承 `conditionExpression`」不等于「不许裸块操作数」**：条件链自己的 `conditionPrimary:611` 就含 `blockExpression`（`if { true } { … }` 是块值条件，`if-expr.md` 正文明说）⇒ 按 `.g4`，`if return {} { }` 里那个 `{}` **照样是 `return` 的操作数**，与现行实现一致。（原文把它推断成"`{}` 要留给 `if` 当体块"，是错的。）
+> **真正剩下的差异只有细的一处**：`if return S{x:1} {}`——`.g4` 条件链里的 `pathInExpression`（`:620`）不带结构体后缀，不认它是结构体字面量；我们按 `VALUE` 解则会认。
+> 全语料零个 `return {`、零个 `return S{`（`grep -rnE "return *\{" tests/official/` 零命中）⇒ 判不了，也不影响判分。
+> **决定：保持现状**（`return` 的操作数一律 `VALUE`）——裸块那一半已经与 `.g4` 一致，剩下的差异无语料、不值得为它加一条特例。**已随 [`plan.md`](plan.md) Q17 一起问助教**。
+> **想完全贴 `.g4`**：`parse_return` 里把 `Restrictions::VALUE` 换成 `r.sub()`，一行——`sub()` 正好是「`VALUE` ＋ 继承 `forbid_structs`」。（不能换成 `r`：语句位置 `r` 带着 `prefer_stmt`，会让 `return {} + 1;` 里的操作数不爬升。）
+
+**（3）限制怎么传**：参考实现是**按值传参**（`expr_bp(min_bp, r)`），不是可变字段 + 存/恢复。进 `(` `[`、调用实参、数组元素、字段值、块体、`break`/`return` 的操作数时**传 `VALUE` 常量**即可，不存在"忘了恢复"这条 bug。**唯一的例外是运算符内部**（前缀的操作数、中缀的右侧）：那里传 `r.sub()` = `{ forbid_structs: r.forbid_structs, prefer_stmt: false }`，理由与 `.g4` 依据见 §2.10 的「条件/循环体边界」那一段。⇒ 我们的 `Parser` 因此**只有四个字段**（`arch.md` §1.2.1 原写的第 5 个 `no_struct_literal` 已删）。
 
 ### 2.10 表达式
 
 | 规范产生式 | 实现 |
 |---|---|
-| `Expression` / `ExpressionWithoutBlock` / `ExpressionWithBlock` | `parse_expression()` / `parse_expr_with_block()` |
-| 全部运算符表达式（`OperatorExpression` 及 9 个子产生式） | **一个 `parse_expr_bp(min_bp)` 优先级爬升函数**（表见 §3） |
+| `Expression` | 没有独立函数：`Expression` ≡ `parse_expr_bp(0, Restrictions::VALUE)`。入口那份薄壳 `parse_expression()` 也只调它，不另开一层（§2.0）。`ExpressionWithBlock` 不是函数，是**原子分派里的一个分支组**（`{` / `if` / `while` / `loop` 四个原子） |
+| 全部运算符表达式（`OperatorExpression` 及 9 个子产生式） | **一个 `parse_expr_bp(min_bp, r)` 优先级爬升函数**（表见 §3）。返回 `(ExprId, bool)`——那个 `bool` = "后缀跑完之后 lhs 是否仍是块形式"，唯一的消费者是 `parse_expr_stmt()`（§2.9 的四档表） |
 | `LiteralExpression` | 原子：`INTEGER_LITERAL` / `true` / `false` |
 | `PathExpression` | 原子：`parse_path_expr()` |
 | `GroupedExpression` / `UnitExpression` | 原子：`(` 后看是不是 `)` |
@@ -377,7 +411,20 @@ if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) { expr(p); }
 
 **后缀循环里的消歧**：`.` 之后先解析 `PathExprSegment`，再看是否紧跟 `(`——是则方法调用，否则该段必须是单个 IDENTIFIER 的字段访问。
 
-**方法段上的泛型实参**（`method-call-expr.md`，本文档之前漏了这条规范规则）：`MethodCallExpression -> Expression . PathExprSegment ( CallParams? )`，而这个段上的**类型**实参是 **compile error**（`x.foo::<i32>()`），**生命周期**实参合法且照旧解析完丢（§2.4）。⇒ parser 在消歧处拿到 `PathExprSegment` 后：`args.types` 非空即报 `SyntaxErrorKind::TypeArgsOnMethodSegment`（负例测试项，见 §4）。这也是 `Method.name` 只存 `PathIdentSegment`、不带 `args` 的原因——方法段上那个 `args` 的每个取值只有「空 / 丢弃 / 报错」三种，没有第四种（见 [`arch.md`](arch.md) §1.2.2）。
+**方法段上的泛型实参**（`method-call-expr.md`）：`MethodCallExpression -> Expression . PathExprSegment ( CallParams? )`，而这个段上的**类型**实参是 **compile error**（`x.foo::<i32>()`），**生命周期**实参合法且照旧解析完丢（§2.4）。
+
+> **⚠ 这条 2026-09-23 订正过，原文写反了。** 原文说"parser 在消歧处 `args.types` 非空即报
+> `TypeArgsOnMethodSegment`"——**错**。判分口径看的是**编译是否成功**，而这条规则的违例出现在
+> **语义阶段**。三条语料钉死：
+> - `parser/accept/method_call_expr-ae960be064.rx` = `y.bar::<T>(1, 2,)`，`entry=expression`，**必须接受**；
+> - `semantic/invalid-impls-and-generics/rej-method-segments-have-no-type-parameters.rx` = `v.len::<i32>();`
+>   ——**语义**阶段的负例，parser 必须放行；
+> - `parser/reject/type-parameters-in-field-exprs-1bdf11cf66.rx`（`f.x::<isize>;` / `f.x::<>;` / `f.x::();`）
+>   拒的理由**不是**"段上有类型实参"，而是**后面没有 `(`**——三条里没有一条是方法调用。
+>
+> ⇒ parser 的职责只有一条：**照收，记下来**。`ExprKind::Method.has_type_args: bool` 就是这个记录位；
+> 带实参却不跟 `(` 时报 `Expected(LParen)`（两个分支都要求 `(`，所以这就是"缺的那个"）。
+> 非法性留给语义阶段，`SyntaxErrorKind` 里因此**没有** `TypeArgsOnMethodSegment` 这个变体了。
 
 **`x.self` / `x.Self` 不是字段访问**：`FieldExpression -> Expression . IDENTIFIER` 只收 IDENTIFIER，而 `self` / `Self` 是关键字（`keywords.md`）。`x.self()` / `x.Self()` 按语法可导出（方法名位置是 `PathExprSegment`），但规范对它们**保持沉默**——本实现让它们自然落到「方法查找找不到」那一支（`method-call-expr.md`：No matching method is a compile error），不额外判、也不假装规范有规定。
 
@@ -385,7 +432,7 @@ if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) { expr(p); }
 
 **条件/循环体边界**（`if-expr.md`）：`if` / `while` 的条件里，`Name {` 处的 `{` 视为**体块**的开始。要把 struct 构造放进条件必须显式加括号：`if (S { flag: true }).flag { ... }`。但 `if { true } { ... }` 里前一个 `{` 是块值条件、后一个是体块，不适用本规则。
 
-实现：**没有字段**——`forbid_structs` 是按值传进 `parse_expr_bp(min_bp, r)` 的限制之一（§2.9.1 之（3））。生效点**只有一处**——解析出一个路径之后，若当前是 `{` 且 `!r.forbid_structs` 才转去解析结构体字面量。进入 `(` `[`、调用实参、数组元素、字段值、块体时**传 `Restrictions::VALUE`**（§2.9 那张表的第二行），于是 `if f(S{x:1}) && S { }` 里出括号后自动回到条件的 `CONDITION`，后面那个 `S {` 照旧是体块——**不需要"恢复"这个动作，也就没有"忘了恢复"**。反过来，**前缀运算符的操作数原样继承 `r`**——`if &S { x: 1 } { }` 里 `&` 后面那个 `{` 必须仍然是体块，所以 `Neg` / `Not` / `Deref` / `Ref` 求操作数时既不能换成 `VALUE` 也不能换成 `CONDITION`。最典型的翻车方式：这个限制传丢了 ⇒ `if flag { }` 被读成"条件是结构体字面量 `flag {}`，然后缺体块"。
+实现：**没有字段**——`forbid_structs` 是按值传进 `parse_expr_bp(min_bp, r)` 的限制之一（§2.9.1 之（3））。生效点**只有一处**——解析出一个路径之后，若当前是 `{` 且 `!r.forbid_structs` 才转去解析结构体字面量。进入 `(` `[`、调用实参、数组元素、字段值、块体时**传 `Restrictions::VALUE`**（§2.9 那张表的第二行），于是 `if f(S{x:1}) && S { }` 里出括号后自动回到条件的 `CONDITION`，后面那个 `S {` 照旧是体块——**不需要"恢复"这个动作，也就没有"忘了恢复"**。反过来，**运算符内部（前缀的操作数、中缀的右侧）走的是 `r.sub()`（2026-09-23 订正，原文说"原样继承 `r`"）**——**语句性重置、条件限制继承**：`if &S { x: 1 } { }` 里 `&` 后面的 `{` 必须仍然是体块，所以 `forbid_structs` **不能丢**（`Neg` / `Not` / `Deref` / `Ref` 求操作数时既不能换成 `VALUE` 也不能换成 `CONDITION`）；而 `prefer_stmt` **必须重置**。依据是 `.g4` 两条链的运算符右侧写的都是**普通链**：`statementUnaryExpression : unaryOperator unaryExpression`（`:583`）、`statementMultiplicativeExpression : statementCastExpression (multiplicativeOperator castExpression)*`（`:564`）⇒「我在语句位置」不往运算符里面传。最典型的翻车方式：`forbid_structs` 传丢了 ⇒ `if flag { }` 被读成"条件是结构体字面量 `flag {}`，然后缺体块"。
 
 **cast 后的 `<`**（`operator-expr.md` §Cast parsing）：`as` 后面解析 `TypeNoBounds` 时，类型路径段之后的 `<` 进入 `GenericArgs` 而非比较；`<<` 的开头 `<` 同理。括号化的 cast 已经闭合类型语法，所以 `x as (usize) < y` 与 `x as (usize) << y` 按比较/移位解析。
 
@@ -419,7 +466,7 @@ if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) { expr(p); }
 | 12 | `&&` | 左 | |
 | 13 | `\|\|` | 左 | |
 | 14（最弱） | `=` `+=` `-=` `*=` `/=` `%=` `&=` `^=` `\|=` `<<=` `>>=` | **右** | 右侧以最低 bp 重新解析，支持 `x = y = z` |
-| 15 | `return` / `break` 带值 | — | **消耗其后整个表达式**；不参与中缀爬升（`1 + return 2` 必须报错） |
+| 15 | `return` / `break` 带值 | — | **操作数是普通原子**（`nonBlockPrimary` 里的两支），照常参与中缀爬升。`1 + return 2` **合法**（原文说它必须报错，是错的，见下） |
 
 **四个必须钉死的点**（都是容易写错的地方）：
 
@@ -428,10 +475,16 @@ if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) { expr(p); }
 3. **`&` 既是前缀（借用）又是中缀（按位与）**，也是 §1.2 里可切分的 `&&`：前缀只在原子位置试，中缀只在爬升循环里试，不冲突
 4. **`.` 后面紧跟 `(` 是方法调用，否则是字段访问**
 
-**不可链式比较的实现**：爬升循环里吃到比较运算符时，检查**左边已经建好的节点**是不是一个比较表达式，是就报错。
+**不可链式比较的实现（2026-09-23 订正**：原文说"检查左边已经建好的节点是不是比较表达式"，那是**看 AST**的写法，我们没用**）**：爬升循环里带一个**循环局部的** `lhs_is_cmp` 标志，吃到比较运算符（判据是 `bp == BP_CMP`）时：已置位就报错，否则置位。
 
-- `a < b < c` → 第一次爬升得 `Binary(Lt, a, b)` 成为左边 → 第二次看到 `<` → 报错 ✅
-- `(a < b) < c` → 左边是 `Paren(Binary(Lt, ..))` → **不是**裸的比较节点 → 放行 ✅
+- `a < b < c` → 同一个循环里第一次 `<` 置位 → 第二次 `<` 见已置位 → 报错 ✅
+- `(a < b) < c` → `(` 走原子，**递归进一个全新的 `expr_bp`**，它的 `lhs_is_cmp` 是新的、在内层置位、随栈帧一起丢掉 → 外层那一位仍是 `false` → 放行 ✅
+
+**必须是循环局部、不能是 `Parser` 的字段**：若做成字段，`{ 1 < 2; 3 < 4; }` 里第二条语句会读到第一条留下的 `true`，**合法程序被误拒**。递归调用天然给了"进括号就重置"的语义，这正是它要的。
+
+**为什么读 `bp == BP_CMP` 而不写一张表**：`spec-mapping` 的分类若写成 `matches!(op, Lt | Le | Gt | Ge | Eq | Ne)`，比较运算符集合就有了第二份（`peek_infix` 里一份）。改读 bp ⇒ **规范将来加一个比较运算符时只改一处**（`peek_infix` 的那一档），见 [`arch.md`](arch.md) §1.5.6。
+
+**`Paren` 在 AST 里保留，但理由不是这条规则**（同一处订正）：原文说"若括号透明化，`(a < b) < c` 的左边也是 `Binary(Lt)`，会被误判成链式比较"——**在循环局部标志的写法下这个理由不成立**（内层那个标志随栈帧丢了，透不透明都放行）。真正的理由是三条，都是"别提前销毁信息"：① 语料期望树来自 rust-analyzer，它的树里有 `Expr::Paren`，AST 同构 ⇒ 对不上时好排查；② 括号带自己的 `span`，诊断能指到用户写的那对括号；③ 代价是**一个零载荷变体**，而删掉是不可逆的（语义阶段若要它就得回头改 parser）。⇒ **保留，但别拿链式比较当挡箭牌。**
 
 **这就是 `Paren`（括号表达式）在 AST 里必须保留、不能"透明化"的原因**：若括号被无视，第二种情况的左边也是 `Binary(Lt)`，会被误判成链式比较而拒绝——而规范明确要求括号能解这个歧义。
 
@@ -448,6 +501,10 @@ if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) { expr(p); }
 | **Undefined behavior** | 无诊断或行为要求 | 按各自规则**排除** |
 
 ⇒ **会出现在负例测试里、因此必须真正报错的**：语法错误、普通的名字/类型/place 可变性错误、`Box`/`Vec` 类型实参数量或种类错误、`impl` 目标不是具名 struct、常量依赖成环、禁止形式的常量上下文、`break`/`continue` 在循环外、`while` 条件里的 `break` 指向外层循环、重名（顶层/字段/参数/关联项）、保护内置名重定义、重复 derive、derive 能力不满足、路径解析失败、方法段上的类型实参（`x.foo::<i32>()`，见 §2.10）、`enum`/`match`/tuple/闭包/宏等子集外语法。
+
+> **这条清单里唯一要看清阶段的是"方法段上的类型实参"**：它在**语义**阶段报，parser 必须**放行**
+> （`y.bar::<T>(1, 2,)` 是 parse 正例）。别把"必须报错"读成"parser 报错"——清单说的是整个编译器。
+> 各条落在哪一阶段见 §2.10 的 ⚠ 与 [`arch.md`](arch.md) §1.2.2。
 
 > ⚠ **不可达代码里的检查，边界很窄，别记反**（2026-09-22 修正）。规则是三段式：
 > 1. **不可达代码默认仍要做全部检查**——名字解析、类型检查、place 可变性检查（`types/never.md` §Unreachable code）。

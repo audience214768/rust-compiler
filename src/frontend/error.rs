@@ -57,11 +57,6 @@ pub enum SyntaxErrorKind {
     ExpectedItem,
     /// 链式比较 `a < b < c`：规范要求加括号消歧（§1.5.3）
     ChainedComparison,
-    /// 方法段上的**类型**实参：`x.foo::<i32>()`。
-    ///
-    /// 规范把它定为 compile error（`method-call-expr.md`），而同一位置上的**生命周期**
-    /// 实参是合法的、照旧解析完丢。`span` 指那段 `::<…>` 本身，所以渲染时不加「实际是」。
-    TypeArgsOnMethodSegment,
     /// 子集外的保留字（`match` / `enum` / `trait` / `pub` …）。
     ///
     /// 无载荷：13 个 reserved 关键字在词法层已塌成一个 `TokenKind::Reserved`，
@@ -79,7 +74,6 @@ impl fmt::Display for SyntaxErrorKind {
             SyntaxErrorKind::ExpectedType => write!(f, "期望一个类型"),
             SyntaxErrorKind::ExpectedItem => write!(f, "期望 use / fn / struct / const / impl 之一"),
             SyntaxErrorKind::ChainedComparison => write!(f, "链式比较需要括号"),
-            SyntaxErrorKind::TypeArgsOnMethodSegment => write!(f, "方法段不能有类型实参"),
             SyntaxErrorKind::ReservedKeyword => write!(f, "Rx 子集不支持保留字"),
         }
     }
@@ -116,9 +110,7 @@ impl FrontendError {
             // 词法错误的载荷自带全部信息，直接用它自己的 Display
             FrontendErrorKind::Lex(k) => k.to_string(),
             FrontendErrorKind::Syntax(k) => match k {
-                SyntaxErrorKind::ChainedComparison | SyntaxErrorKind::TypeArgsOnMethodSegment => {
-                    k.to_string()
-                }
+                SyntaxErrorKind::ChainedComparison => k.to_string(),
                 // 保留字要把那个词点出来才说得通，且不加「实际是」
                 SyntaxErrorKind::ReservedKeyword => format!("{k} {}", snippet(src, self.span)),
                 _ => format!("{k}，实际是 {}", snippet(src, self.span)),
