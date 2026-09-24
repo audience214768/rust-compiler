@@ -59,7 +59,23 @@ fn main() {
         process::exit(2);
     }
 
-    let raw = match fs::read(&path) {
+    // 递归下降遇到深嵌套会爆栈（"被信号打死" = 判分失败）⇒ 放进大栈线程跑。
+    let worker = std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(move || compile(&path, &stage, &entry))
+        .expect("无法创建编译线程");
+    // panic 是内部错误，别翻译成 exit(1)：那会让负例靠崩溃通过（假绿）。
+    if worker.join().is_err() {
+        process::exit(101);
+    }
+}
+
+/// 64 MiB：实测括号嵌套上限从约 3000 层提到约 1.7 万层（`arch.md` §0.5.2）。
+const STACK_SIZE: usize = 64 << 20;
+
+/// 读文件 → 校验 → 归一化 → 按 `--stage=` 分发。跑在大栈线程里。
+fn compile(path: &str, stage: &str, entry: &str) -> ! {
+    let raw = match fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("无法读取 {path}: {e}");
@@ -82,9 +98,9 @@ fn main() {
     // CRLF→LF 的单遍归一，必须在 lexer 启动之前（`arch.md` §1.4）。
     let src = normalize(&raw);
 
-    match stage.as_str() {
-        "lex" => dump_tokens(&path, &src),
-        "parse" => run_parse(&path, &src, &entry),
+    match stage {
+        "lex" => dump_tokens(path, &src),
+        "parse" => run_parse(path, &src, entry),
         _ => {
             // semantic / codegen / optimization 还没接上。诚实地拒，不要拿
             // "只跑词法然后 exit(0)"冒充——那会让整批用例假过。
