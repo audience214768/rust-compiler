@@ -209,7 +209,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// 泛型参数表的收尾。`expect(Gt)` 不能直接用——`>>` 要切。
     fn expect_gt(&mut self) -> Result<(), FrontendError> {
         if self.eat_gt() {
             Ok(())
@@ -218,15 +217,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `<` 这一类 token：单字符 `Lt`，以及被 `<<` 吞掉头的 `Shl`（§1.2 要切）。
-    ///
-    /// **这个集合只此一处**——`eat_lt` 用它决定吃不吃，需要前瞻 `nth(1)` 的地方也读它
-    /// （表达式路径判 `::<`、类型路径判 `::` 是不是实参引子）。
     fn opens_generic_args(k: TokenKind) -> bool {
         matches!(k, TokenKind::Lt | TokenKind::Shl)
     }
 
-    /// 吃掉一个 `<`。当前不是泛型开头就返回 false 且**不动游标**。
     fn eat_lt(&mut self) -> bool {
         if !Self::opens_generic_args(self.cur()) {
             return false;
@@ -252,6 +246,11 @@ impl<'a> Parser<'a> {
             }
             _ => false,
         }
+    }
+
+    /// `span` 那一段源码字节。名字不带载荷，比文本只能这样切。
+    fn text(&self, span: Span) -> &[u8] {
+        &self.src[span.start as usize..span.end as usize]
     }
 
     /// 把一个 `IntLiteral` 的 span 切成数字体与后缀两段。
@@ -308,7 +307,7 @@ impl Parser<'_> {
         ItemId(self.ast.items.len() - 1)
     }
 
-    /// 顶层 item 记进 `root`；impl 的关联项不进这里（`parse_associated_item`）。
+    /// 顶层 item 记进 `root`；impl 的关联项不进这里
     fn push_root(&mut self, id: ItemId) {
         self.ast.root.push(id);
     }
@@ -411,7 +410,7 @@ impl Parser<'_> {
         Ok(())
     }
     fn parse_param(&mut self) -> Result<Param, FrontendError> {
-        let mut mutable;
+        let mutable;
         if self.eat(TokenKind::Mut) {
             mutable = true;
         } else {
@@ -482,10 +481,9 @@ impl Parser<'_> {
         })
     }
 
-
     fn parse_if(&mut self) -> Result<ExprId, FrontendError> {
         let start = self.mark();
-        self.bump(); 
+        self.bump();
         let cond = self.parse_expr_bp(0, Restrictions::CONDITION)?.0;
         let then_block = self.parse_block()?;
         let else_branch = if self.eat(TokenKind::Else) {
@@ -588,7 +586,7 @@ impl Parser<'_> {
         let mut elems = vec![first];
         while self.eat(TokenKind::Comma) {
             if self.at(TokenKind::RBracket) {
-                break; 
+                break;
             }
             elems.push(self.parse_expr_bp(0, Restrictions::VALUE)?.0);
         }
@@ -596,11 +594,7 @@ impl Parser<'_> {
         Ok(ExprKind::Array(elems))
     }
 
-    /// `StructExpression -> pathInExpression '{' structExprFields? '}'`，字段是
-    /// `identifier ':' Expression`。**调用点**已经判过"路径后紧跟 `{` 且不在禁 struct
-    /// 的上下文"（§1.5.3 的条件边界），所以进来就直接吃 `{`。
-    ///
-    /// `base` 恒为 `None`：`.g4` 的 `structExprFields` 里**没有** `..base`。
+    /// `StructExpression -> pathInExpression '{' structExprFields? '}'`
     fn parse_struct_expr(&mut self, path: PathId) -> Result<ExprKind, FrontendError> {
         self.bump(); // `{`
         let mut fields = Vec::new();
@@ -733,7 +727,7 @@ impl Parser<'_> {
         })
     }
 
-        /// `CallParams -> '(' (Expression (',' Expression)* ','?)? ')'`。
+    /// `CallParams -> '(' (Expression (',' Expression)* ','?)? ')'`。
     fn parse_call_args_list(&mut self) -> Result<Vec<ExprId>, FrontendError> {
         self.expect(TokenKind::LParen)?;
         let mut args = Vec::new();
@@ -753,7 +747,8 @@ impl Parser<'_> {
         let seg_start = self.mark();
         let name = self.parse_path_ident_segment()?;
         let args_mark = self.mark();
-        let has_type_args = if self.at(TokenKind::PathSep) && Self::opens_generic_args(self.nth(1)) {
+        let has_type_args = if self.at(TokenKind::PathSep) && Self::opens_generic_args(self.nth(1))
+        {
             self.bump();
             self.parse_generic_args()?;
             true
@@ -779,16 +774,10 @@ impl Parser<'_> {
         }
         let PathIdentSegment::Ident(field) = name else {
             let span = self.span_from(seg_start);
-            return Err(self.syntax_err(
-                SyntaxErrorKind::Expected(TokenKind::Ident),
-                span,
-            ));
+            return Err(self.syntax_err(SyntaxErrorKind::Expected(TokenKind::Ident), span));
         };
         Ok(self.push_expr(
-            ExprKind::Field { 
-                recv, 
-                name: field 
-            },
+            ExprKind::Field { recv, name: field },
             Span {
                 start,
                 end: field.span.end,
@@ -849,7 +838,9 @@ impl Parser<'_> {
         // Chained comparisons such as a < b < c are not permitted direct
         let mut lhs_is_cmp = false;
         loop {
-            let Some(infix) = self.peek_infix() else { break };
+            let Some(infix) = self.peek_infix() else {
+                break;
+            };
             let bp = match infix {
                 Infix::Cast => BP_CAST,
                 Infix::Binary(_, bp) | Infix::Assign(_, bp) => bp,
@@ -867,46 +858,17 @@ impl Parser<'_> {
                 Infix::Cast => {
                     let ty = self.parse_type()?;
                     let end = self.ast.types[ty.0].span.end;
-                    self.push_expr(
-                        ExprKind::Cast { 
-                            expr: lhs, 
-                            ty 
-                        }, 
-                        Span { 
-                            start, 
-                            end 
-                        }
-                    )
+                    self.push_expr(ExprKind::Cast { expr: lhs, ty }, Span { start, end })
                 }
                 Infix::Binary(op, _) => {
                     let rhs = self.parse_expr_bp(rhs_min, r.sub())?.0;
                     let end = self.ast.exprs[rhs.0].span.end;
-                    self.push_expr(
-                        ExprKind::Binary { 
-                            op, 
-                            lhs, 
-                            rhs 
-                        }, 
-                        Span { 
-                            start, 
-                            end 
-                        }
-                    )
+                    self.push_expr(ExprKind::Binary { op, lhs, rhs }, Span { start, end })
                 }
                 Infix::Assign(op, _) => {
                     let rhs = self.parse_expr_bp(rhs_min, r.sub())?.0;
                     let end = self.ast.exprs[rhs.0].span.end;
-                    self.push_expr(
-                        ExprKind::Assign { 
-                            op, 
-                            lhs, 
-                            rhs 
-                        }, 
-                        Span { 
-                            start, 
-                            end 
-                        }
-                    )
+                    self.push_expr(ExprKind::Assign { op, lhs, rhs }, Span { start, end })
                 }
             };
             lhs_is_cmp = bp == BP_CMP;
@@ -914,7 +876,11 @@ impl Parser<'_> {
         Ok(Some((lhs, false)))
     }
 
-    fn parse_expr_bp(&mut self, min_bp: usize, r: Restrictions) -> Result<(ExprId, bool), FrontendError> {
+    fn parse_expr_bp(
+        &mut self,
+        min_bp: usize,
+        r: Restrictions,
+    ) -> Result<(ExprId, bool), FrontendError> {
         self.expr_bp(min_bp, r)?
             .ok_or_else(|| self.err(SyntaxErrorKind::ExpectedExpression))
     }
@@ -928,10 +894,7 @@ impl Parser<'_> {
         }
         let span = self.span_from(start);
         Ok(Stmt {
-            kind: StmtKind::Expr { 
-                expr, 
-                semi 
-            },
+            kind: StmtKind::Expr { expr, semi },
             span,
         })
     }
@@ -1098,7 +1061,7 @@ impl Parser<'_> {
         let mut types = Vec::new();
         loop {
             if self.eat_gt() {
-                break; 
+                break;
             }
             if !self.eat(TokenKind::LifeTime) {
                 types.push(self.parse_type()?);
@@ -1178,36 +1141,192 @@ impl Parser<'_> {
     /// `InherentImpl -> 'impl' …`（`spec-mapping.md` §2.5）。只有 inherent impl。
     fn parse_impl(&mut self) -> Result<ItemKind, FrontendError> {
         self.expect(TokenKind::Impl)?;
-        Err(self.err(SyntaxErrorKind::ExpectedItem))
+        self.parse_generic_params()?;
+        let target = self.parse_type()?;
+        self.parse_where_clause()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut items = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let item_start = self.mark();
+            let kind = match self.cur() {
+                TokenKind::Const => {
+                    self.parse_const()?
+                }
+                TokenKind::Fn => {
+                    self.parse_function()?
+                }
+                _ => {
+                    return Err(self.err(SyntaxErrorKind::ExpectedExpression));
+                }
+            };
+            items.push(self.push_item(
+                kind,
+                self.span_from(item_start)
+            ));
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(ItemKind::Impl {
+            target, 
+            items,
+        })
     }
 
-    /// `UseDeclaration -> 'use' UseTree ';'`（`spec-mapping.md` §2.2）。整条丢弃，不产节点。
+    fn starts_use_path_seg(k: TokenKind) -> bool {
+        matches!(k, TokenKind::Ident | TokenKind::SelfValue | TokenKind::Super | TokenKind::Crate)
+    }
+
+    fn parse_use_path_seg(&mut self) -> Result<(), FrontendError> {
+        if Self::starts_use_path_seg(self.cur()) {
+            self.bump();
+            Ok(())
+        } else {
+            Err(self.err(SyntaxErrorKind::Expected(TokenKind::Ident)))
+        }
+    }
+
+    fn start_use_path(&mut self) -> bool {
+        Self::starts_use_path_seg(self.cur())
+            || (self.at(TokenKind::PathSep) && Self::starts_use_path_seg(self.nth(1)))
+    }
+
+    fn parse_use_path(&mut self) -> Result<(), FrontendError> {
+        self.eat(TokenKind::PathSep);
+        self.parse_use_path_seg()?;
+        while self.at(TokenKind::PathSep) && Self::starts_use_path_seg(self.nth(1)) {
+            self.bump();
+            self.parse_use_path_seg()?;
+        }
+        Ok(())
+    }
+
+    fn parse_use_tree(&mut self) -> Result<(), FrontendError> {
+        if self.start_use_path() {
+            self.parse_use_path()?;
+            if !self.eat(TokenKind::PathSep) {
+                if self.eat(TokenKind::As) {
+                    if !self.eat(TokenKind::Ident) {
+                        self.expect(TokenKind::Underscore)?;
+                    }
+                }
+                return Ok(());
+            }
+        } else {
+            self.eat(TokenKind::PathSep);
+        }
+        if !self.eat(TokenKind::Star) {
+            self.expect(TokenKind::LBrace)?;
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                self.parse_use_tree()?;
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RBrace)?;
+        }
+        Ok(())
+    }
+
+    /// `UseDeclaration -> 'use' UseTree ';'`（`spec-mapping.md` §2.2）。解析完整条丢弃。
     fn parse_use(&mut self) -> Result<(), FrontendError> {
         self.expect(TokenKind::Use)?;
-        Err(self.err(SyntaxErrorKind::ExpectedItem))
+        self.parse_use_tree()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(())
     }
 
     /// `StructStruct -> 'struct' …`（`spec-mapping.md` §2.5）。`derives` 可为空。
-    fn parse_struct(&mut self, _derives: Vec<Name>) -> Result<ItemKind, FrontendError> {
+    fn parse_struct(&mut self, derives: Vec<Derive>) -> Result<ItemKind, FrontendError> {
         self.expect(TokenKind::Struct)?;
-        Err(self.err(SyntaxErrorKind::ExpectedItem))
+        let name_start = self.mark();
+        self.expect(TokenKind::Ident)?;
+        let name_span = self.span_from(name_start);
+        self.parse_generic_params()?;
+        self.parse_where_clause()?;
+        let mut fields = Vec::new();
+        self.expect(TokenKind::LBrace)?;
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let name_start = self.mark();
+            self.expect(TokenKind::Ident)?;
+            let name_span = self.span_from(name_start);
+            self.expect(TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            fields.push(FieldDef {
+                name: Name { span: name_span },
+                ty,
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(ItemKind::Struct {
+            derives,
+            name: Name { span: name_span },
+            fields,
+        })
     }
 
     /// `ConstantItem -> 'const' …`（`spec-mapping.md` §2.5）。类型与初始化器都必需。
     fn parse_const(&mut self) -> Result<ItemKind, FrontendError> {
         self.expect(TokenKind::Const)?;
-        Err(self.err(SyntaxErrorKind::ExpectedItem))
+        let name_start = self.mark();
+        self.expect(TokenKind::Ident)?;
+        let name_span = self.span_from(name_start);
+        self.expect(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_const_value()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(ItemKind::Const {
+            name: Name { span: name_span },
+            ty,
+            value,
+        })
     }
 
-    /// `OuterAttribute -> '#' '[' DeriveAttribute ']'`（`spec-mapping.md` §2.6），只认 `derive`。
-    fn parse_outer_attributes(&mut self) -> Result<Vec<Name>, FrontendError> {
-        Err(self.err(SyntaxErrorKind::ExpectedItem))
+    /// `derive` 是上下文关键字：只在 `#[` 后这一处有固定拼写，别处仍是普通标识符。
+    fn expect_derive(&mut self) -> Result<(), FrontendError> {
+        let t = self.expect(TokenKind::Ident)?;
+        match self.text(t.span) {
+            b"derive" => Ok(()),
+            _ => Err(self.syntax_err(SyntaxErrorKind::ExpectedDerive, t.span)),
+        }
+    }
+
+    /// `DeriveName -> Copy | Clone | PartialEq | Eq`：。
+    fn parse_derive_name(&mut self) -> Result<Derive, FrontendError> {
+        let t = self.expect(TokenKind::Ident)?;
+        match self.text(t.span) {
+            b"Copy" => Ok(Derive::Copy),
+            b"Clone" => Ok(Derive::Clone),
+            b"PartialEq" => Ok(Derive::PartialEq),
+            b"Eq" => Ok(Derive::Eq),
+            _ => Err(self.syntax_err(SyntaxErrorKind::ExpectedDeriveName, t.span)),
+        }
+    }
+
+    /// `OuterAttribute*`（`traits-and-attributes.md`）。多个属性的 derive 拍平进一个 `Vec`。
+    fn parse_outer_attributes(&mut self) -> Result<Vec<Derive>, FrontendError> {
+        let mut derives = Vec::new();
+        while self.at(TokenKind::Pound) {
+            self.bump(); // #
+            self.expect(TokenKind::LBracket)?;
+            self.expect_derive()?;
+            self.expect(TokenKind::LParen)?;
+            while !self.at(TokenKind::RParen) {
+                derives.push(self.parse_derive_name()?);
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen)?;
+            self.expect(TokenKind::RBracket)?;
+        }
+        Ok(derives)
     }
 
     /// `Item -> UseDeclaration | Function | Struct | ConstantItem | Implementation`。
-    /// 每支**自己吃**开头关键字；`use` 返回 `Ok(None)`：整条丢弃、没有节点（`arch.md` §1.2.2.2）。
     fn parse_item(&mut self) -> Result<Option<ItemId>, FrontendError> {
-        // span 起点必须在属性之前：`#[derive(...)]` 是 struct 的一部分（`arch.md` §1.2.2.2）。
         let start = self.mark();
         let kind = match self.cur() {
             TokenKind::Use => {
@@ -1236,5 +1355,75 @@ impl Parser<'_> {
         }
         Ok(())
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(src: &str) -> Result<Ast, FrontendError> {
+        parse_item(src.as_bytes())
+    }
+
+    /// parse 阶段的 442 条语料里一条属性都没有，这几种形状只能靠这里兜住。
+    #[test]
+    fn attributes_accept() {
+        for src in [
+            "#[derive(Copy, PartialEq, Eq,)] struct Point { x: i32, y: i32 }",
+            "#[derive()] struct E {}",
+            "#[derive(Clone)] #[derive(Copy)] struct S { x: i32 }",
+            // 重复 derive 属于语义阶段（语料两条 rej-* 都标 stage=semantic）
+            "#[derive(Clone, Clone)] struct S { x: i32 }",
+            // `derive` 不是关键字：别处仍是普通标识符
+            "struct derive { x: i32 }",
+            "fn derive() {}",
+        ] {
+            assert!(item(src).is_ok(), "应当接受: {src}");
+        }
+    }
+
+    #[test]
+    fn attributes_reject() {
+        for src in [
+            "#[derive(Foo)] struct S { x: i32 }",
+            "#[derive(Debug)] struct S { x: i32 }",
+            "#[derive(,)] struct S { x: i32 }",
+            "#[derive] struct S { x: i32 }",
+            "#[inline] struct S { x: i32 }",
+            "#![derive(Clone)] struct S { x: i32 }",
+            // 属性只能出现在顶层具名 struct 之前
+            "#[derive(Clone)] fn f() {}",
+            "#[derive(Clone)] const C: i32 = 1;",
+            // 截断在 Eof：空循环的写法会在这里挂死
+            "#[derive(Clone",
+            "#",
+        ] {
+            assert!(item(src).is_err(), "应当拒绝: {src}");
+        }
+    }
+
+    /// 语料 reject/ 里零个 impl 用例，「块没关上」这个形状只能靠这里兜住。
+    #[test]
+    fn impl_block_must_close() {
+        for src in [
+            "impl S {}",
+            "impl S { fn f() {} }",
+            "impl S { const C: i32 = 1; }",
+            "impl S { fn f() {} const C: i32 = 1; }",
+            "impl Vec<i32> {}",
+        ] {
+            assert!(item(src).is_ok(), "应当接受: {src}");
+        }
+        for src in [
+            // 少了右花括号：不 expect(RBrace) 的写法会一路吞到 Eof
+            "impl S {",
+            "impl S { fn f() {}",
+            // 少了左花括号
+            "impl S",
+            // 关联项只可能是 fn / const
+            "impl S { struct T { x: i32 } }",
+        ] {
+            assert!(item(src).is_err(), "应当拒绝: {src}");
+        }
+    }
 }

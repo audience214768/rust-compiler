@@ -359,7 +359,7 @@ pub enum ItemKind {
         ret: Option<TypeId>,          // None ⇒ 返回 ()
         body: BlockId,
     },
-    Struct { derives: Vec<Name>, name: Name, fields: Vec<FieldDef> },
+    Struct { derives: Vec<Derive>, name: Name, fields: Vec<FieldDef> },
     Const  { name: Name, ty: TypeId, value: ConstValueId },  // 类型与初始化器都必需
     Impl   { target: TypeId, items: Vec<ItemId> },           // 关联项也是 Item，进同一个池子
     // 没有 Use —— 见下面「解析完就丢的两类」
@@ -1173,6 +1173,37 @@ span_from(mark) = [toks[mark].span.start, toks[pos-1].span.end)    // pos > mark
 3. **方法段上的类型实参：parser 只记录，不报错**（2026-09-23 订正，原文说"在 parser 报错"）。位置是 `ExprKind::Method.has_type_args: bool`——**一个 bit**，非法性的判定留给语义阶段（那里才有 `method-call-expr.md` 的方法查找上下文）。语法层在这里只剩一条自己的活：带实参却不跟 `(` 时报 `Expected(LParen)`（`f.x::<isize>;` 那条 parse 负例）。⚠ 与「`#[derive]` 放错位置」「`parse_associated_item` 只产出两种 `ItemKind`」**不再同类**——那两条是 parser 真的拦下来的。
 4. **不上 interner**。理由见上表第 2 行——这个语言的名字工作量极小，为不存在的性能问题上机器不划算。**但 `Name` 把将来的成本压成了局部替换**：要 interning 时只改三处——`Name` 的定义（`{ sym: Symbol, span }`）、`Names::eq` 的实现（`a.sym == b.sym`）、parser 里每个标识符一次 intern 调用；**所有比较点一行都不用动**。届时要如实修正上面「AST 不存文本」这条——interner 会存一份**去重后**的名字字节，不是每个出现位置。
 5. **`Span` 的 `PartialEq` 保留**（lexer/parser 要用「是否相等、谁前谁后」），`TokenKind` 保持无载荷——interner 没有加在词法层，§1.3.3 的分层规则不受影响。
+
+#### 5.2.2 derive 名的表示（2026-09-24 定）
+
+规范的三条产生式是**全部**（`traits-and-attributes.md:7-17`）：
+
+```
+OuterAttribute  -> `#` `[` DeriveAttribute `]`
+DeriveAttribute -> `derive` `(` (DeriveName (`,` DeriveName)* `,`?)? `)`
+DeriveName      -> `Copy` | `Clone` | `PartialEq` | `Eq`
+```
+
+**决定一：`DeriveName` 是闭集，用 `enum Derive`，不是 `Name`。**
+`DeriveName` 的右部是**四个字面终结符**，不是 `IDENTIFIER`。所以 AST 里 `derives: Vec<Derive>`（四变体枚举），而不是 `Vec<Name>` + 留给下游切文本比字符串。这与 §5.2.1 决定 1「名字统一用 `Name`」**不矛盾**：`Name` 是"标识符"的表示，而 `DeriveName` 根本不是标识符位置。`Derive` **派生 `PartialEq`/`Eq`**（`Name` 故意不派生）——变体无载荷，相等就是"同一个 trait"，不存在"按位置比名字"那种静默错误。
+
+**决定二：`derive` 不做成 `TokenKind`，是上下文关键字。**
+`keywords.md` 的 strict 38 + reserved 13 两张表**都没有** `derive`，而 `identifiers.md:12` 把非关键字标识符定义成 `IDENTIFIER_OR_KEYWORD` 去掉 `_` 和这两张表 ⇒ **`derive` 是合法标识符**。做成 `TokenKind` 等于在类型层面断言相反的结论，代价是 6 处误拒（`struct derive {}`、`fn derive() {}`、`let derive = 1;`、`x.derive`、`S { derive: 1 }`、路径段）。所以 parser 在 `#[` 后那一处按文本比 `b"derive"`（`expect_derive()`）。`.g4` 是同一结论的另一种写法：`DERIVE` 做成 token 之后又补进 `identifier` 规则，补的正是那 6 处。代价是两个新 `SyntaxErrorKind`（`ExpectedDerive` / `ExpectedDeriveName`）——`derive` 词法上是 `Ident`，借不到现成的 `Expected(TokenKind)`。
+
+**决定三：三种"非法 derive"分两处报。**
+
+| 形状 | 报在哪 | 依据 |
+|---|---|---|
+| 名字不在那四个里（`#[derive(Foo)]`） | **parser**（`parse_derive_name`） | 闭集产生式直接否定它 ⇒ 不在文法里（`undefined-behavior.md:13,39`）。且 `Derive` 枚举一落下，这种输入就**不可表示**，下游无处再补 |
+| 重复（`#[derive(Clone, Clone)]`、跨属性） | **语义阶段** | 规范措辞是 "a compile-time error"（非 syntax error），框在 *the same **set** of requested traits* 上；语料 `rej-repeated-*` 两条 `manifest.json` 明写 `"stage": "semantic"` |
+| 能力不满足（`Copy` 缺 `Clone`、`Box` 挡 `Copy`…） | **语义阶段** | `builtin-traits.md` 四段 Requirements 全要看字段类型 |
+
+属性**拍平**进一个 `Vec`（多属性叠加也只有一个集合），于是一次覆盖"同一属性内 / 跨属性"两种读法。
+
+**⚠ 两条语料事实，别记反**：
+
+1. **parse 阶段的 442 条里一条属性都没有**（`#` 只出现在 4 个 `reject/crate` 文件的注释里）⇒ 这一层**没有官方用例兜底**，只能靠 `parser.rs` 的单元测试钉住。
+2. `rej-repeated-derive-across-attributes.rx` 与 `rej-repeated-derive-entry.rx` **逐字节相同**（都只有一条属性内重复）⇒ "跨属性重复"**实际没被考到**。另外 `scripts/parse_test.py` 只跑 `stage == "parse"` 的用例，官方 `scripts/test.py` 又硬编码跳过 `parse` ⇒ 重复 derive 这条负例**永远不会**经 parser 判分，放 parser 里既错位又白写。
 
 ### 5.3 语义信息不进 AST
 

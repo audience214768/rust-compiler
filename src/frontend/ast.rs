@@ -84,6 +84,15 @@ pub struct FieldDef {
     pub ty: TypeId,
 }
 
+/// `DeriveName -> Copy | Clone | PartialEq | Eq`（`traits-and-attributes.md`）。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Derive {
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+}
+
 #[derive(Debug)]
 pub enum ItemKind {
     Fn {
@@ -94,7 +103,7 @@ pub enum ItemKind {
         body: BlockId,
     },
     Struct {
-        derives: Vec<Name>,
+        derives: Vec<Derive>,
         name: Name,
         fields: Vec<FieldDef>,
     },
@@ -293,7 +302,6 @@ pub struct Path {
 pub enum EntryRoot {
     Expr(ExprId),
     Type(TypeId),
-    /// `use` 声明没有对应的 `Item`（`parse_use` 返回 `Ok(None)`，见 `arch.md` §2.2）。
     Item(Option<ItemId>),
     Let(Stmt),
 }

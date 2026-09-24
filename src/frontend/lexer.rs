@@ -523,8 +523,8 @@ mod tests {
 
     #[test]
     fn contextual_names_are_plain_identifiers() {
-        // keywords.md §Contextual names：这三个不是关键字
-        for src in ["union", "macro_rules", "gen"] {
+        // keywords.md §Contextual names：这些都不是关键字（`derive` 只在 `#[` 后那一处有固定拼写）
+        for src in ["union", "macro_rules", "gen", "derive"] {
             one(src, TokenKind::Ident);
         }
     }

@@ -129,11 +129,23 @@ let nested: Vec<Vec<i32>>=Vec::<Vec<i32>>::new();
 |---|---|
 | `UseDeclaration` | `parse_use()` |
 | `UseTree` | `parse_use_tree()`，递归（brace group 里还是 `UseTree`） |
-| `UsePath` / `UsePathSegment` | `parse_use_path()` |
+| `UsePath` / `UsePathSegment` | `parse_use_path()` / `parse_use_path_seg()` |
 
 - 语法要**完整支持**：glob `*`、嵌套花括号、尾逗号、`as` 别名（含 `as _`）、前导 `::`。
 - **解析后整个声明丢弃**：不做导入解析、不加名字、不查冲突、不生成 IR。
 - `UsePath` 与 `PathInExpression` 是**两套独立语法**：use 里允许 `crate`/`super`/更深路径，类型/表达式路径不允许。
+
+**唯一的算法坑：一个 `::` 归 `UsePath` 还是归 `UseTree`**（2026-09-24 定）。规范里 `::` 出现在两处、
+写法完全一样——`UsePath` 的分隔符（`a::b`）与第一支的 `(UsePath? `::`)`（`foo::*`、`foo::{a}`），
+而后者允许 `UsePath` 为空（`use ::*;` / `use ::{};`）。判据只有一条：
+
+> **段后的 `::` 当且仅当「它后面那个 token 起得了段」时属于 `UsePath`**；起不了（`*` / `{` / `;` / 整数字面量 / `.` / `as`）
+> ⇒ 它是 `UseTree` 的分隔符，`parse_use_path` 必须**留住不吃**，交给 `parse_use_tree` 收尾。
+
+⇒ `parse_use_path` 的循环条件**不能**是 `while self.eat(PathSep)`（那会吃掉 `foo::*` 的 `::` 再要一个段，
+`use rx::core::*;` 直接挂），必须 `while self.at(PathSep) && starts_use_path_seg(self.nth(1))`。
+同一条判据也决定 `parse_use_tree` 的分支：**这一支收在 `*`/`{` 上（第一支）还是收在名字上（第二支）**——
+`cur` 是 `*`/`{`，或 `cur` 是 `::` 且 `nth(1)` 是 `*`/`{`，就生成第一支。纯 LL(2)，不用回溯。
 
 ### 2.3 函数
 
@@ -236,10 +248,11 @@ self.expect(TokenKind::RParen)?;
 | `StructFields` / `StructField` | `parse_struct_fields()` |
 | `ConstantItem` | `parse_const()`——**类型与初始化器都必需**（旧规范里 `=` 可选，现已强制，坑消失） |
 | `Implementation` / `InherentImpl` | `parse_impl()`；注意目标位置是 `Type` 不是 `TypePath`，所以 `impl (S)` 合法 |
-| `AssociatedItem` | `parse_associated_item()` = `const` 或 `fn` |
+| `AssociatedItem` | 原先设计是单开 `parse_associated_item()`；**实现在 `parse_impl()` 的循环里就地两路分派**（只有这一处用它，不单开函数） |
 
 - **只有 inherent impl**，没有 `impl Trait for Type`。
 - 一个 struct 可以有**多个 impl 块**；所有 impl 共享同一个关联值命名空间（重名 = 编译错误，语义阶段查）。
+- ⚠ **关联项循环退出后必须 `expect(RBrace)`**（`parse_struct` 是同形写法，改一个记得对一眼另一个）。漏掉它的后果不是"少报一个错"而是**两个方向同时错**：`}` 漏给 `parse_items` 当新 item 解 ⇒ `impl S {}` 被**拒**、而截断的 `impl S {` 反而**通过**。`reject/` 里零个 impl 用例，所以 442 条语料拦不住这个形状——靠单测 `impl_block_must_close` 兜（2026-09-24 实际踩过，影响 3 条 parse 用例 + 20 个后续 stage 正例程序 + 10 个语义负例被提前拒）。
 
 ### 2.6 属性
 
@@ -248,6 +261,12 @@ self.expect(TokenKind::RParen)?;
 | `OuterAttribute` / `DeriveAttribute` / `DeriveName` | `parse_outer_attributes()`，返回 `Vec<Derive>` |
 
 这是**属性语法的全部**。内层属性 `#![...]`、其他属性名、其他 derive 名都不支持。属性**只能出现在顶层 named-field struct 之前**（`pub fn f()` 前的 `#[...]` 要报错）。derive 列表可为空、可有尾逗号。
+
+**三种"非法 derive"分两处报**（2026-09-24 定，理由与语料证据见 `arch.md` §5.2.2）：
+
+- **名字不在那四个里**（`#[derive(Foo)]` / `#[derive(Debug)]`）= **parser 的语法错误**。`DeriveName` 是**闭集**产生式（`Copy | Clone | PartialEq | Eq`，不是 `IDENTIFIER`）⇒ AST 用 `enum Derive`，这种输入不可表示。
+- **重复**（同一属性内 / 跨属性）与**能力不满足**（`Copy` 缺 `Clone`、`Box` 挡 `Copy`、逐字段检查）= **语义阶段**。语料 `rej-repeated-*` 与 `copy-clone-and-*` 全部标 `stage: semantic`。
+- `derive` 本身**不是关键字**（`keywords.md` 的 strict 38 + reserved 13 都没有它）⇒ 只在 `#[` 后那一处按文本比，别处照旧是普通标识符。
 
 ### 2.7 类型
 

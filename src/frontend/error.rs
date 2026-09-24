@@ -62,6 +62,10 @@ pub enum SyntaxErrorKind {
     /// 无载荷：13 个 reserved 关键字在词法层已塌成一个 `TokenKind::Reserved`，
     /// parser 分不出是哪个，点名只能靠渲染层切 `&src[span]`（§1.3.3）。
     ReservedKeyword,
+    /// `#[` 后面不是 `derive`。`derive` 不是关键字，借不到 `Expected(TokenKind)`。
+    ExpectedDerive,
+    /// `derive(...)` 里出现了四个名字之外的标识符（`#[derive(Foo)]`）。
+    ExpectedDeriveName,
 }
 
 impl fmt::Display for SyntaxErrorKind {
@@ -75,6 +79,10 @@ impl fmt::Display for SyntaxErrorKind {
             SyntaxErrorKind::ExpectedItem => write!(f, "期望 use / fn / struct / const / impl 之一"),
             SyntaxErrorKind::ChainedComparison => write!(f, "链式比较需要括号"),
             SyntaxErrorKind::ReservedKeyword => write!(f, "Rx 子集不支持保留字"),
+            SyntaxErrorKind::ExpectedDerive => write!(f, "期望 `derive`"),
+            SyntaxErrorKind::ExpectedDeriveName => {
+                write!(f, "期望 `Copy` / `Clone` / `PartialEq` / `Eq` 之一")
+            }
         }
     }
 }

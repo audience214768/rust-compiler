@@ -156,8 +156,8 @@
 
 > **当前代码进度**（截至 2026-09-23）：只走到 ① 前端。① 里 `token.rs` / `lexer.rs` / `error.rs` / `ast.rs` **已完成**；`parser.rs` 里 `Parser` 四字段、游标原语、五个入口 wrapper、`Restrictions`、arena 写入辅助、语句层三支与 `fn` 全链**已落地**，并且 **S3 类型层 + S4 表达式层 + S5 语句收口全部写完**（`parse_type_root` / `parse_path` / `parse_generic_args` / `parse_const_value` / `expr_bp` 爬升引擎 / 原子分派 / 后缀循环 / 标点切分 / `parse_let`）。入口 wrapper **不再单开 `_root` 层**（一个产生式一个函数，见 [`spec-mapping.md`](spec-mapping.md) §2.0）。driver 的 `--stage=` / `--entry=` 开关与自写运行器 `scripts/parse_test.py` 已就绪。② 语义 / ③ 中端 / ④ 后端 / ⑤ 优化 的目录尚未创建。
 >
-> **剩下的是 S6（item 层）**：`parse_items` 已接上 `root`（循环 + `push_root`），`parse_item` 的六路分派骨架也已就位，`fn` 一支通到底；**余下四支 `use` / `struct` / `const` / `impl`（+ `parse_outer_attributes`）仍是 stub**（各自 `expect` 掉开头关键字后无条件报错）⇒ `--entry=crate` 28/47、`--entry=item` 17/28，**剩下的 30 条逐条都可归因到那五个 stub**。⚠ **`crate` 那 72 条负例现在仍是假绿**（stub 照样拒），S6 余下四支落地时这一格会先掉再涨。
-> 已知遗留：`cargo build` 61 条 warning，全是"AST 字段从没被读过"（AST 还没有下游消费者，sema 接上即消），外加 `parser.rs:414` 一条 `unused_mut`（在 `parse_param` 里，2026-09-23 之前就在）。`SyntaxErrorKind` 的 `never constructed` 已随本轮实现消掉。
+> **S6（item 层）已完成**（2026-09-24）：`parse_items` 接上 `root`（循环 + `push_root`），`parse_item` 六路分派 + `fn` / `struct`（含 `#[derive(...)]` 属性）/ `use` / `const` / **`impl`** 五支全部通到底 ⇒ `make parse-test` 实测 **442/442**（`crate` 47/47 + `expression` 176/176 + 5/5 + `typeRef` 101/101 + `item` 28/28 + `letStatement` 13/13）。`impl` 的落地坑：**关联项循环退出后必须 `expect(RBrace)`**——漏掉它 `}` 就漏给 `parse_items` 去解，于是 `impl S {}` 被拒、而截断的 `impl S {` 反而"通过"（`parse_impl` 与 `parse_struct` 是同形写法，改一个记得对一眼另一个）。`use` 那一支的坑记在 [`spec-mapping.md`](spec-mapping.md) §2.2（`::` 的归属判定）。✅ **`crate` 那 72 条负例不再是假绿**：真解析之后 10 条 use 负例仍然真拒。
+> 已知遗留：`cargo build` **60 条 warning，全部在 `ast.rs`**，全是"AST 字段从没被读过"（AST 还没有下游消费者，sema 接上即消）。2026-09-24 顺手清掉 `parser.rs` 开头两条 unused import（`RBrace`、`FromBytesUntilNulError`）后，**`parser.rs` 现在零 warning**（早先记的那条 `unused_mut` 也已不在）。`SyntaxErrorKind` 的 `never constructed` 已随本轮实现消掉。
 > **主动推迟的一项**（2026-09-21）：名字暂不 interning，用 `Name { span }` + sema 的 `Names` 现切现比——理由与将来的替换成本见 [`arch.md`](arch.md) §5.2.1。**等 sema 把名字解析写出来后再评估一次**（那时才知道比较点长什么样）。
 
 **实测基线（2026-09-22，用现有 driver 逐个跑 manifest、只比退出码）**——这张表比任何估时都诚实：
@@ -188,22 +188,25 @@ passed = (r.returncode == 0) == e['compilation_success']
    | `typeRef` | **101/101** | — | ✅ |
    | `expression` | **176/176** | **5/5** | ✅ 负例 5 条是链式比较等，真的拒了 |
    | `letStatement` | **13/13** | — | ✅ |
-   | `crate` | **28/47** | 72/72 | ⚠ 负例仍**假绿**：`struct`/`const`/`impl`/`use` 四条 stub 照样拒 |
-   | `item` | **17/28** | — | 同上，17 条全是 `fn` |
-   | **合计** | **335/365** | **77/77** | **412/442** |
+   | `crate` | **47/47** | **72/72** | ✅ 2026-09-24 修掉 `parse_impl` 漏吃 `}` 后全绿 |
+   | `item` | **28/28** | — | ✅ 含 `impl` 的两条 |
+   | **合计** | **365/365** | **77/77** | **442/442** |
 
-   ⇒ **范围内 295/295 全绿**（13+181+101），前端的表达式与类型两层实测无坑。
-   **下一件是 S6 的余下四支**——`crate` 与 `item` 两格剩下的 **30 条全部**压在
-   `use` / `struct` / `const` / `impl` / `parse_outer_attributes` 这五个 stub 上
-   （逐条核过：报错位置**全部**是「吃掉开头关键字之后的那个 token」，没有一条是别的原因），
-   而它们里 23 条需要完整的表达式+语句能力（§2.2 下面那张表），**那部分已经就位了**。
-   §1.1 里"9/26 还没跑通 item/type 层就要下调验收目标"的预警**已解除一半**（type 层跑通、item 层未开工）
+   ⇒ **442/442 全绿**（365 正 + 77 负），前端的表达式 / 类型 / item 三层实测无坑。
+   §1.1 里"9/26 还没跑通 item/type 层就要下调验收目标"的预警**已完全解除**。
 
-   > **2026-09-23 晚：`root` 接上了**（`parse_items` 从空壳改成循环 + `parse_item` 六路分派；
-   > 见下面的 S6 行）。`crate` 0→28、`item` 0→17，**这 45 条全部来自 S4 早已写好的
-   > `parse_function`，本次只是第一次把它接上 `root`**——别记成 item 层的功劳。
-   > 负例 72/72 **仍是假绿**（四条 stub 照拒），S6 余下四支落地时这一格会先掉再涨。
-3. **发邮件问 §3.1 里还没答案的那几条**（Q1/Q2/Q3 已被测试点答掉大半；**真正要问的只剩 Q6、Q7–Q9、Q11–Q12、Q14–Q15**，Q10/Q13/Q16 已被规范原文或测试点答掉，Q10 只需在周报里提一句）
+   > **2026-09-24：S6 收口。** `parse_impl` 通到底之后 `crate` 28→47、`item` 17→28，全套 442/442。
+   > 卡住的根因是 `impl` 体循环退出后漏了 `expect(RBrace)`：`}` 被漏给 `parse_items` 当新 item 解，
+   > 于是 **`impl S {}` 被拒、而截断的 `impl S {` 反而"通过"**——`reject/` 里零个 impl 用例，
+   > 所以语料没拦住这个形状。
+   > **影响面比那 3 条大得多**：`semantic`/`codegen`/`optimization` 的 **142 个正例程序里有 20 个含
+   > impl 块**（`methods-and-self`、`vec-index-mutability` 等整片），**167 个负例里有 10 个被"语法错"
+   > 提前拒掉**（清单见 §2.4 第 4 条）。修完补了一条单测 `impl_block_must_close` 兜住这个形状。
+   >
+   > **2026-09-23 晚：`root` 接上了**（`parse_items` 从空壳改成循环 + `parse_item` 六路分派）。
+   > `crate` 0→28、`item` 0→17，**这 45 条全部来自 S4 早已写好的 `parse_function`**，
+   > 那次只是第一次把它接上 `root`——别记成 item 层的功劳。
+3. **发邮件问 §3.1 里还没答案的那几条**（Q1/Q2/Q3 已被测试点答掉大半；**真正要问的只剩 Q6、Q8–Q9、Q11–Q12、Q14–Q15**，Q10/Q13/Q16 已被规范原文或测试点答掉，Q10 只需在周报里提一句）
 
 > **REIMU 已到位（2026-09-22 更新）**：不必再去 `DarkSharpness/REIMU` 找预编译二进制了——模板把它作为**子模块 `vendor/REIMU`**（`wanoful/REIMU`，pin `66dcdbd`）固定住。本机已装 xmake 并编译通过（macOS 需要一个编译补丁，见 §2.5）。
 
@@ -218,7 +221,7 @@ passed = (r.returncode == 0) == e['compilation_success']
 | S3 | **类型层**：`parse_type`（`(` / path / `&` / `[T; N]`）、`parse_type_path`、`parse_generic_args`、极简 `parse_const_value`、`&&` 切分 | ~~1 天~~ | ✅ **已完成：`typeRef` 101/101** |
 | S4 | **表达式层**：原子 + 后缀循环 → 前缀 + 优先级爬升 → 块形式（`{` `if` `while` `loop` `break` `continue` `return`）+ 三条边界规则 | ~~4–5 天~~ | ✅ **已完成：`expression` 176/176 + 5/5** |
 | S5 | **语句 / 块收口**：`parse_stmt` 三分支、`parse_let`、`;` 可选性、空语句、块尾 | ~~0.5 天~~ | ✅ **已完成：`letStatement` 13/13** |
-| S6 | **item 层**：`use`（use tree / glob / alias）、`fn`（含接收者）、`struct`（含 derive 属性）、`const`、`impl`；`parse_crate` 收口 <br>**进度（2026-09-23 晚）**：`root` 收口 + 六路分派骨架 + `fn` 一支 = **已完成**（`crate` 28/47、`item` 17/28）；**余下四支 `use` / `struct` / `const` / `impl`**（+ `parse_outer_attributes`，另 `parse_associated_item` 随 `parse_impl` 一起） | 1.5–2 天（已用 ~0.5） | `item` **28 正** + `crate` **47 正**（现 45/75，剩 30 条全部可归因到那五个 stub） |
+| S6 | **item 层**：`use`（use tree / glob / alias）、`fn`（含接收者）、`struct`（含 derive 属性）、`const`、`impl`；`parse_crate` 收口 <br>**2026-09-24：已完成**——`root` 收口 + 六路分派 + `fn` + `struct`（含 `#[derive(...)]`）+ `use`（use tree 全形态）+ `const` + **`impl`**，`crate` 与 `item` 两格打满 | ~~1.5–2 天~~ | ✅ `item` **28/28** + `crate` **47/47** |
 | S7 | **负例加固**（**不做错误恢复**，只需每条都真的报到错） | 2–3 天 | **77 负**（72 `crate` + 5 `expression`） |
 
 合计 **9–11.5 个工作日**（旧规范估 4–6 天）。S7 完成打 tag `ast`。**全部跑通 = 365 正 + 77 负 = 442/442。**
@@ -270,9 +273,9 @@ passed = (r.returncode == 0) == e['compilation_success']
 |---|---|---|
 | 1 | ~~`.gitignore`~~ | ✅ **已由 §2.5 解决**：`tests/official/` 改走子模块（不再有嵌套仓库需要忽略），`tests/`、`scripts/` 也随模板建好了 |
 | 2 | `ast.rs` | ✅ **已完成**（节点 + 6 个 `*Id` newtype + 6 个 arena + 3 条尺寸断言）。**2026-09-22 与文档对齐了两处字段名**：`ExprKind::Grouped` → `Paren`、`If.else_block` → `else_branch`；文档那边的 `ItemKind::Fn.receiver` 改成 `recv`（与 `Field`/`Method`/`Index` 三个兄弟字段一致） |
-| 3 | `parser.rs` | **S0–S5 已完成**：`Parser` 四字段（§1.2.1）、游标原语 + 切分 wrapper（`eat_gt`/`eat_lt`/`eat_and`/`split_cur`）、arena 写入辅助、`Restrictions`（含 `sub()`）、五个入口 wrapper + 共用的 `finish`、语句层三支、`fn` 全链、**类型层 / 表达式层 / 语句收口**（§2.2 的 7 步全绿）。**2026-09-23 晚：`root` 收口**——`push_root` + `parse_items` 循环 + `parse_item` 六路分派（`mark()` 在属性之前），`parse_impl` 的报错种类订正为 `ExpectedItem`，表达式侧的 `parse_struct` 按 [`spec-mapping.md`](spec-mapping.md) §2.9 改名 `parse_struct_expr` 把名字让给 item 级。**待办 = S6 余下四支：`parse_use` / `parse_struct` / `parse_const` / `parse_outer_attributes` / `parse_impl` 体**（现为 stub，各自 `expect` 掉开头关键字后报错），然后是 S7 负例加固。入口不再单开 `_root` 层（[`spec-mapping.md`](spec-mapping.md) §2.0 的"一个产生式一个函数"）。坑清单见 [`spec-mapping.md`](spec-mapping.md) §2 与 `arch.md` §1.5 |
+| 3 | `parser.rs` | **S0–S5 已完成**：`Parser` 四字段（§1.2.1）、游标原语 + 切分 wrapper（`eat_gt`/`eat_lt`/`eat_and`/`split_cur`）、arena 写入辅助、`Restrictions`（含 `sub()`）、五个入口 wrapper + 共用的 `finish`、语句层三支、`fn` 全链、**类型层 / 表达式层 / 语句收口**（§2.2 的 7 步全绿）。**2026-09-23 晚：`root` 收口**——`push_root` + `parse_items` 循环 + `parse_item` 六路分派（`mark()` 在属性之前），`parse_impl` 的报错种类订正为 `ExpectedItem`，表达式侧的 `parse_struct` 按 [`spec-mapping.md`](spec-mapping.md) §2.9 改名 `parse_struct_expr` 把名字让给 item 级。**2026-09-24：S6 全部落地，`make parse-test` 442/442**——`parse_use` / `parse_const` / **`parse_impl`**（关联项就地两路分派，没单开 `parse_associated_item`）均已通到底。`parse_impl` 的坑（关联项循环退出后漏吃 `}`）与回归单测 `impl_block_must_close` 见 §2.1。**待办 = S7 负例加固**（77 条已全绿，剩下的是边角形状）。入口不再单开 `_root` 层（[`spec-mapping.md`](spec-mapping.md) §2.0 的"一个产生式一个函数"）。坑清单见 [`spec-mapping.md`](spec-mapping.md) §2 与 `arch.md` §1.5 |
 | 6 | `parse_stmts` 的"块内 item" | ⚠ **文档已定、代码没跟上（2026-09-23 核出）**：[`spec-mapping.md`](spec-mapping.md):122 要求块内遇 `fn`/`struct`/`impl`/`use` 报错，但 `parse_stmts` 没有这条显式检查——它靠"这些关键字起不了表达式"、由**表达式原子分派**兜底报错。**行为是对的**（四个都是严格关键字，永远进不了表达式），**故意不补**：补它要新加一个 `SyntaxErrorKind`（现有的 `ExpectedItem` 渲染成"期望 use / fn / struct / const / impl 之一"，而这里用户**恰恰写了 item**、只是位置错，报这句是反的），判分又只看退出码。**只在将来给原子分派加关键字分支时才需要它。** |
-| 4 | `main.rs` | ✅ **已完成**：`--stage=` / `--entry=` 就位（默认 `--stage=optimization --entry=crate`，用法错退 2、正常拒退 1、无 panic）；`--stage=lex` 保留 token dump，`parse` 不 dump。**待办：`semantic`/`codegen`/`optimization` 三个 stage 还是"未实现"占位** |
+| 4 | `main.rs` | ✅ **已完成**：`--stage=` / `--entry=` 就位（默认 `--stage=optimization --entry=crate`，用法错退 2、正常拒退 1、无 panic）；`--stage=lex` 保留 token dump，`parse` 不 dump。**待办：`semantic`/`codegen`/`optimization` 三个 stage 还是"未实现"占位**。⚠ **连带一件事**：`parse_impl` 修好之后，下面 10 条**语义**负例已经能通过 parser 了——占位实现照样 `exit(1)`，所以它们现在的"绿"是**假的**（拒它们的不是语义阶段），s3 落地时必须真拒：<br>`constant-errors/rej-associated-constant-cycle`、`invalid-impls-and-generics/{rej-impl-target-must-be-a-user-struct, rej-no-array-inherent-impl, rej-no-container-inherent-impl, rej-a-reference-is-not-a-struct-impl-target}`、`methods-and-self/{rej-mutable-receiver-needs-a-mutable-place, rej-explicit-associated-call-does-not-autoref-an-owned-argument, rej-an-associated-function-is-not-a-dot-call-method, rej-associated-values-share-a-namespace-across-impl-blocks}`、`vec-index-mutability/rej-mutable-method-through-stored-reference` |
 | 5 | `scripts/` | ✅ 官方 `test.py` 已就位（§2.5）；`parse_test.py`（`lex`/`parse` 的自写运行器）**已完成并通过三个 shim 的自检**（§2.1 第 1 条）。**待办：`lex` stage 的运行器**（parser 那份稍改 `STAGES` 即可，优先级低——lexer 53/53 已定） |
 
 ### 2.5 模板脚手架接入（2026-09-22 新增）
@@ -343,7 +346,7 @@ xmake -y -P vendor/REIMU
 | Q4 | Resource guarantees 的堆预算（64 MiB？）是否生效？ | ✅ **已答**（规范 `bf4c255`，2026-09-20）：`backend.md` 现在写 **256 MiB 总执行内存 + 1 MiB 栈**，text/static/stack/heap **共享**那 256 MiB。⚠ **"64 MiB 堆"不再是保证**——那段（含参考 `Vec` 增长策略）在规范里被**整段 HTML 注释掉了**。细节见 [`spec-mapping.md`](spec-mapping.md) §5 |
 | Q5 | 本机 LLVM 是 23.1.1，规范钉版是 22。本地验证够用吗？提交环境用什么？ | 验证环境。**2026-09-22 补充实测**：brew 的 LLVM 23.1.1 在 `/opt/homebrew/opt/llvm/bin/clang`，**有** RISC-V 后端且**认得** `-mllvm -riscv-no-aliases`——用它编 `ret i32 0` 得到 `addi a0, zero, 0` + `jalr zero, 0(ra)`，**全是非别名形式** ⇒ REIMU 要的就是这个形式（见 §2.5 的伪指令结论）。⚠ 系统 `clang`（Apple 21）**没有** RISC-V 后端，别用 |
 | Q6 | `backend.md` 说 "No specific optimization is mandatory"，`tasks.md` 说六项必做优化"作为通过测试的点出现"——以哪个为准？排名公式与基线是什么？ | ⚠ **半答，且答案反直觉**：**测试点里没有任何时间/体积阈值**（翻遍 98 个 manifest 只有 "timeout = 失败"）⇒ `optimization` stage 考的是**规模下的输出正确性**，不是速度。**六项必做优化只能以 [`tasks.md`](tasks.md) 为准**；排名公式与基线**仍未知**，必问 |
-| Q7 | `Struct` 允许 `OuterAttribute*`，但其他构造上的属性不支持——`#[derive]` 放错位置的**报错**要求进负例测试吗？ | parser 严格程度 |
+| Q7 | `Struct` 允许 `OuterAttribute*`，但其他构造上的属性不支持——`#[derive]` 放错位置的**报错**要求进负例测试吗？ | ✅ **已答（2026-09-24）**：规范明文（`traits-and-attributes.md:15`）"Attributes on other constructs … are unsupported" ⇒ 该拒；现有分派已经拒（`#[derive(Clone)] fn f() {}` → `Expected(struct)`）。⚠ 但**全库 804 条无一条考它**，不必为它加码 |
 | Q8 | 空 struct `struct S {}` 语法上要解析通过，但数据使用是 UB。负例测试会拿它考吗？ | 同上 |
 | **Q9** | `return`/`break`/`continue` 能否出现在**原子位置**（如 `f(return 1)`）？`expressions.md` 的 `ExpressionWithoutBlock` 列表包含它们，那按产生式就该能 | ✅ **已答（规范书 + 语料双向，2026-09-23）**：`expressions.md:8-19` 的 `ExpressionWithoutBlock` 列表确实含 `BreakExpression`/`ReturnExpression`/`ContinueExpression`，而 `CallParams`/`GroupedExpression` 取的是 `Expression` ⇒ 语法上就该能；语料 `parser/accept/0035_weird_exprs-*.rx` 里 `f(return)`、`(return 0)`、`(continue)`、`if (return) { break; }` 四条正例。**不用问助教** |
 | **Q10** | **规范自相矛盾**：`grammar.md` 的上下文标点表只列 4 个（`&&` `>>` `>=` `>>=`），但 `operator-expr.md:108` 明说 `<<` 的前导 `<` 也要进泛型实参解析。**我们按 5 个实现**，请确认 | ✅ **测试点已经把架吵完了**：`parser/reject/cast-angle-bracket-precedence-*.rx`（`entry=expression`）里两条是 `a as usize < 4` 与 `a as usize << long_name`，**都是负例**。若按移位解析，后者是**完全合法的表达式** ⇒ 只可能是"`<<` 的前导 `<` 进了泛型实参" ⇒ **必须切 5 个**。规范的表格漏了一行，**不用再问，但值得在周报里提一句** |
