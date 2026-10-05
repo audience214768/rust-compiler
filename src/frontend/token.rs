@@ -44,7 +44,7 @@ pub enum TokenKind {
 /// token 的规范拼写，用于报错消息（`期望 \`;\``）。
 ///
 /// 存在这张表的理由：`Parser::expect(k: TokenKind)` 失败时手里只有一个
-/// `TokenKind`（§1.5.1），没有它就只能报「期望 `Semi`」这种给机器看的话。
+/// `TokenKind`（§1.3.3），没有它就只能报「期望 `Semi`」这种给机器看的话。
 ///
 /// 前 38 个关键字与 `lexer.rs` 的 `lex_ident_or_keyword` 一一对应，
 /// 标点与 `lex_punct` 一一对应——改那边记得改这边。

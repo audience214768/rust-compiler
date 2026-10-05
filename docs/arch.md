@@ -1,8 +1,9 @@
 # 编译器架构
 
-> 本文写**整体架构、运行流程，以及各阶段的内部架构 / 数据结构 / 运行机制**（每节配例子），架构选择一律附理由。
-> 排期与任务见 [`plan.md`](plan.md)；实现算法与产生式→函数映射见 [`spec-mapping.md`](spec-mapping.md)（规范原文请搜[在线版](https://acmclasscourse-2025.github.io/rx-compiler-specification/)）。
-> 随实现推进更新。
+> 本文写**整体架构、运行流程，以及各阶段的内部架构 / 维护的数据结构 / 运行机制**；每处架构选择说明**它服务什么、被谁消费**。
+> **完整推导与决策经过**按阶段归档在 [`arch-phase1.md`](arch-phase1.md)（一阶段）与 [`arch-phase2.md`](arch-phase2.md)（二阶段）——归档是 Code Review 的答题材料（[`plan.md`](plan.md) §4.2 会问"为什么不用方案 a 而用方案 b"），**实现时不必读**；两份归档按同一阶段组织，但**小节编号与本文不对应**。
+> 排期与任务见 [`plan.md`](plan.md)；实现算法与产生式→函数映射见 [`spec-mapping.md`](spec-mapping.md)（规范原文搜[在线版](https://acmclasscourse-2025.github.io/rx-compiler-specification/)）。
+> **技术名词不用去别处查**——§0.2 一个词一段白话解释。
 
 ---
 
@@ -21,7 +22,7 @@
    │     Ast ──► Ast + Tables        不改 AST，信息挂 side table
    │
    │  ③ 中端  src/ir/                LLVM 形状的内存 IR（强制中间表示）
-   │     Ast ──► Module{ Function{ BasicBlock{ Instruction } } }    typed SSA + phi
+   │     Ast ──► Module{ Function{ BasicBlock{ Instruction }, Value* } }   typed SSA + phi
    │     ＋ 文本 .ll 打印器          必须能被 Clang/LLVM 22 接受
    │
    │  ④ 后端  src/backend/           自写：IR ──► RISC-V 汇编
@@ -34,65 +35,48 @@ GNU 风格 RISC-V 汇编（RV32IM / ILP32）
 Clang 集成汇编器与钉版 REIMU 都必须接受
 ```
 
-几个定型的选择：
+四条定型的选择：
 
-- **中端必须走 LLVM IR**，不是自造 IR。所以 ③ 的形态是"LLVM 的形状"，内存里直接建它，再写一个 `.ll` 文本打印器。
-- **后端直接消费内存里的 IR**，不要"打印成 `.ll` 再解析回来"——那是白白多写一个 parser，还丢内部信息。
-- **③ 和 ⑤ 共用同一份 IR**：优化 pass 就是遍历/改写内存 IR，不引入第二套表示。
-- **不建独立 HIR**。desugar（去 `Paren`、拆 `+=`、`while`→`loop`、coercion 显式化）在 AST→IR lowering 里顺手做。
+- **中端走 LLVM IR**（课程硬要求）：内存里直接建"LLVM 的形状"，再写一个 `.ll` 文本打印器。
+- **后端直接消费内存里的 IR**，不落回文本重解析：`printer` 与 `backend` 是 `Module` 的两个平级消费者。
+- **③ 和 ⑤ 共用同一份 IR**：优化 pass 就是遍历/改写内存 IR。
+- **不建独立 HIR**：desugar（去 `Paren`、拆 `+=`、`while`→`loop`、coercion 显式化）在 AST→IR lowering 里顺手做。
 
-**driver 怎么选起点**（2026-09-22 加，起因见 [`plan.md`](plan.md) §2.0）：判分 oracle 按 `stage` 分阶段判，所以 driver 必须能"只跑一半"。`--stage=` 决定停在哪个阶段并输出什么；`--entry=` 只在 `parse` 阶段用（§1.5.5）。
+**driver 怎么选起点**：判分按 `stage` 分阶段判，所以 driver 要能"只跑一半"。`--stage=` 决定停在哪个阶段并输出什么；`--entry=` 只在 `parse` 阶段用（§1.3.6）。
 
 | `--stage=` | 走到哪一步停 | 交付物 | 测试点（`compilation_success: false` ⇒ 必须非 0 退出） |
 |---|---|---|---|
 | `lex` | ① 词法 | 无（成功即 0） | `lexer` 53 |
 | `parse` | ① 语法（**吃 `--entry=`**） | `Ast` | `parser` 442 |
-| `semantic` | ② 语义 | `Ast` + `Tables` | `semantic` 236 |
+| `semantic` | ② 语义 | `Ast` + `Checked`（§2.1） | `semantic` 236 |
 | `codegen` | ④ 后端 | **`.s`** → 汇编 → REIMU 跑 io | `codegen` 60（115 组 io） |
 | `optimization` | ⑤ 优化后的 ④ | 同上，跑的是优化过的代码 | `optimization` 13（39 组 io） |
 
-`.ll` 文本**不属于任何 stage**——它是 ③ 的**旁路产物**，只服务两件事：W5 起用 clang 提前搭端到端闭环（§2.1），以及自查。所以它挂在自己的开关下（如 `--emit-ll`），**不要**把它塞进 `--stage=` 的枚举里。
+`.ll` 文本**不属于任何 stage**——它是 ③ 的**旁路产物**，由 `--emit-ll` 单独开关控制（§2.1 的 `ir::printer::print`、§2.3.5 的 clang 闭环）。
 
-### 0.2 代码组织
+### 0.2 名词表
 
-```
-src/
-  frontend/   # ① 手写词法/语法 + AST 定义
-    token.rs  #   TokenKind（关键字/Ident/LifeTime/标点/Reserved）+ Span + Token
-    lexer.rs  #   扫描器：空白、嵌套注释、整数字面量、lifetime token、ASCII 校验
-    error.rs  #   词法/语法错误类型：Span + 行列号 + 期望/实际
-    ast.rs    #   AST 节点（每个带 Span）+ arena + 访问器
-    parser.rs #   递归下降 + 优先级爬升 + 上下文切分（≈60 个 parse_* 函数）
-  sema/       # ② 符号表、作用域、类型检查、coercion、方法查找、常量求值
-  ir/         # ③ LLVM 形状的内存 IR + 文本 .ll 打印器
-  passes/     # ⑤ 各优化 pass（每个 pass 一个文件）
-  backend/    # ④ 指令选择、寄存器分配、汇编输出
-  main.rs     #   driver：读文件 → 归一化 → 前端 → 语义 → IR → 后端
-docs/
-  spec-mapping.md  # 施工图（后缀切分算法、上下文切分、93 条产生式→函数、bp 表、UB 边界、测试点→检查项）
-  plan.md          # 排期、验收判据、疑问
-  arch.md          # 本文
-tests/
-  official/   # 官方判分用例（子模块 → rx-compiler-testcases，pin c1e8196）
-  custom/     # 我们自己的小语料：复现某个 bug、锁定某个边界，不凑覆盖率
-scripts/
-  test.py             # 官方运行器（模板提供，勿改）
-  strip_asm_debug.py  # 模板提供，只在"拿 clang 当后端"时才用
-Makefile / config.mk  # 评测入口：四条命令 BUILD / SEMANTIC / CODEGEN / RUN
-crates/rx/            # 参考实现（rustc 当编译器）的 no_std 运行时，模板提供
-grammar/              # 官方 G4 文法（仅作语法参照，前端不用 ANTLR）
-vendor/REIMU/         # RISC-V 模拟器（子模块）
-```
+**后面每一节都要用这些词，这里一次讲完**。每个词按「是什么 → 服务什么 → 对应本文哪个对象」讲。
 
-**测试脚手架的位置**（2026-09-22 更新）：判分 oracle 是**课程下发的**官方用例，已作为**子模块**接入 [`tests/official/`](tests/official/)（→ `rx-compiler-testcases`，pin `c1e8196`）——**不是** `tests/corpus/`。原先"克隆在项目根下、要写进 `.gitignore`"的做法已废弃：子模块不存在嵌套仓库问题，而且 `scripts/test.py` 的 `--tests-dir` 默认就是 `tests/`，放根目录它**根本发现不了**。
+**指令 / 基本块 / 终结指令。** 一条**指令**是一个不可再分的动作（算一个加法、读一次内存）。**基本块**是一串"只要从第一条进来，就一定一路执行到最后一条、中间不会跳走"的指令 ⇒ 它的**最后一条必须是一条跳转**——这条跳转叫**终结指令**。⇒ 对应 `Inst`、`BasicBlock`（`insts` 是块内指令、`term` 是那条跳转）、`Terminator`；控制流图（谁跳到谁）在块这一层描述，活跃性、支配、寄存器分配这些分析都建在它上面（§2.2.2、§3.2）。
 
-- 官方**运行器也是模板提供的**（[`scripts/test.py`](scripts/test.py) + [`config.mk`](config.mk)），不必自己写——**但 `lex`/`parse` 两个 stage 被它主动跳过**，W4 那 495 个点仍要自写运行器（[`plan.md`](plan.md) §2.0）。
-- `tests/custom/` 装**我们自己写的小语料**——复现某个 bug、锁定某个边界，**不是**用来凑覆盖率。
-- 完整接入过程、`config.mk` 四条命令的契约、以及 macOS 上编译 REIMU 的补丁，见 [`plan.md`](plan.md) §2.5。
+**SSA（静态单赋值，Static Single Assignment）。** 一条规矩：**每个名字只能被赋值一次**。⇒ 本文的 IR **从第一条指令起就是 SSA**（§2.1）；守卫它的是不变式 1 与 6（§2.3.4）。
 
-**`Ast` 不持有 `src`**：`parse_crate` 的返回类型就是 `Ast`、不带生命周期参数，源码缓冲区留在 driver 手里。谁要文本，谁把 `(&Ast, &[u8])` 一起带上（AST 打印器、sema 诊断都照此）——见 §1.3.2。
+**φ（phi）。** 站在控制流汇合点回答"这个值从哪条边来"的伪指令：`x3 = φ(x1 从 then 来, x2 从 else 来)`，读作"从哪条边进来就取哪一边的值"，不生成任何机器码。⇒ 对应 `InstKind::Phi` 与 `BasicBlock.phis`（φ 永远在块首，所以单独一列）；由 mem2reg 插入（§2.3.3），lowering 不自己造。
 
-### 0.3 一个程序穿过五个阶段
+**alloca / load / store。** `alloca` 在栈上开一块空间，`store` 往里写，`load` 从里读。⇒ 这是 lowering 出来的**初始形态**（§2.3.2），mem2reg 的输入。`alloca` 是 LLVM 的叫法（allocation），它是**一条指令**，跟"分配堆内存"没关系。
+
+**mem2reg。** 名字就是定义：**mem**ory **to** **reg**ister。干的活：**一个标量变量如果从没被取过地址，就删掉它的 `alloca`/`load`/`store`，改写成 SSA 名，并在需要的地方补 φ**。⇒ 主题在 §2.3.3，前置是那个叫 `is_promotable` 的谓词。
+
+**pass。** 一趟"把整个 IR 走一遍、顺手改写它"的程序。mem2reg、DCE、内联、寄存器分配**都是 pass**。**pass 之间只通过 `Module` 交接**、不共享隐藏状态。⇒ §4.1 的 `passes/` 布局与 §4.2 的"每个 pass 要什么数据"。
+
+**支配 / 支配树 / 支配边界。** "块 A **支配** 块 B" = **从入口走到 B 的每条路径都必经 A**（入口支配所有块）。支配关系排成树就是**支配树**（每个块挂在"离它最近的必经块"下）。块 X 落在 A 的**支配边界**里 ⟺ A 的定义在 X 的一条来路上有效、另一条上无效。⇒ mem2reg 用前两个算 φ 的插入点（§2.3.3），不变式 6 用第一个（§2.3.4）。
+
+**DCE / 内联。** DCE = dead code elimination = **死代码消除**：一条指令的结果没人再用、自己又没有副作用（不是 `store`、不是调用）就删掉。**内联** = 把被调函数的体**搬进调用点**，消掉这次调用。两者都在必做优化里（§4.1）。
+
+**GEP（getelementptr）。** LLVM 的"**算地址**"指令：给基址 + 类型 + 下标，返回"第几个字段 / 第几个元素"的**地址**（不是那个值）。⇒ 对应 `InstKind::Gep` 与 `GepStep`；字段下标取 `StructDef.fields` 的顺序、元素跨步取 `Layout.size`（§2.2.1）。它**只算地址、不访问内存**。
+
+### 0.3 一个程序穿过流水线
 
 ```rust
 fn main() {
@@ -112,7 +96,17 @@ fn main() {
 
 ### 0.4 三条贯穿全流程的约定
 
-**arena + index**（节点间靠 id 引用，定义里不出现 `Box`）、**Span 贯穿**（不存文本、要时现切）、**语义信息不进节点**（类型与解析结果挂 side table）。三条都跨阶段，细节与理由见 §5。
+**一、arena + index。** 节点按种类分 `Vec<T>` 存，各配**自己的 newtype id**（`ExprId` / `BlockId` / `ItemId` / `TypeId` / `PathId` / `ConstValueId`），节点之间靠 id 引用，**节点定义里不出现 `Box`**。自查信号：**如果被迫加了 `Box`，说明某个位置漏了一个 id**。用 `usize` 而不是 `u32`，省掉每处访问的 `as usize`。同一套习惯在 IR 层再用一遍（§2.2.2 的六个 id），**跨 arena 传错 id 是编译错误**。
+
+**二、Span 贯穿，不存文本。** 节点只记**字节区间**（`Span { start: u32, end: u32 }`），要文本时切 `&src[span.start..span.end]`。三条推论：
+
+- 输入一律在 `&[u8]` 上扫描（规范保证 7-bit ASCII，`pos` 天然是字节偏移，不需要 `Vec<char>`）；
+- **CRLF→LF 归一化必须在 lexer 启动之前**（driver 里）完成，否则 span 累积错位；
+- **`Ast` 不带 `src`**（`parse_crate` 的返回类型没有生命周期参数），所以**谁要文本，谁把 `(&Ast, &[u8])` 一起带上**——AST 打印器、`sema::check` 都照此（§2.1）。
+
+**同一份缓冲区在接力**，不是"lexer 和 parser 各持一份字符串"：`parse_crate` 内部 lex 完 `Lexer` 就死了，`Vec<Token>` 移交给 `Parser`，全程只有一个持有者。
+
+**三、语义信息不进节点。** 表达式类型、名字解析结果、coercion 插入点一律进 **side table**（按 id 稠密索引、与对应 arena 同序），AST 永远是**纯源码结构**（§1.2.3）。⇒ desugar 在 AST→IR lowering 里顺手做，打印/验收看到的就是源码写的东西，不被编译器偷偷插的转换污染。
 
 ### 0.5 阶段之间的接口契约
 
@@ -123,11 +117,17 @@ fn main() {
 | ① 前端 | `frontend::parse_crate(&[u8]) -> Result<Ast, FrontendError>` | 归一化后的字节缓冲区 | `Ast`（值移出） | `FrontendError { kind, span }` | driver 持有缓冲区并全程存活；`Ast` 移交下游，之后只读 |
 | ① 辅助 | `lexer::lex_all(&[u8]) -> Result<Vec<Token>, LexError>` | 同上 | 全量 token（含尾部 `Eof`） | `LexError { kind, span }` | 只被 `parse_crate` / 测试 / token dump 调；**driver 不碰 token 流** |
 
-②–⑤ 的入口形状与 ① 同构（`{kind, span}` 错误 + 值移动），具体签名写到那一阶段时回填。
+② 的入口在 §2.1 给出（`sema::check` / `ir::lower::program` / `ir::printer::print`），③④⑤ 的入口形状与 ① 同构（`{kind, span}` 错误 + 值移动），写到那一阶段时回填。
 
-#### 0.5.1 driver 的命令行契约（2026-09-22 加）
+三条通则：
 
-判分 oracle 按 `stage` 分阶段判（[`plan.md`](plan.md) §2.0），所以 driver 要有"只跑一半"的开关：
+1. **错误类型一律是 `{ kind, span }`**，从词法一路照搬到语义。`span` 是字节区间，`locate()` 才把它换成行列号，只有 driver 负责渲染成人看的消息。
+2. **每阶段只依赖上一阶段的输出值**，不共享可变状态。唯一的例外是前端内部的 token 切分——它被 `Parser` 的独占所有权关在自己肚子里（§1.1）。
+3. **退出码只有两种**：0 = 成功；1 = 一切失败（用法 / IO / 词法 / 语法 / 语义），不细分。
+
+**负例的判分口径**：要求"**正常拒绝，而不是崩溃或超时**"，且不要求诊断措辞、不要求 AST 序列化 ⇒ 我们"只分 0/1、措辞随便"与判分口径一致。**"宽松"是最危险的失败模式**——一个没被检查出来的错误 = 一条挂掉的测试点。另：**不要求所有权 / 借用 / 生命周期分析**，要写的只有 place 可变性。
+
+#### 0.5.1 driver 的命令行契约
 
 ```
 my-compiler <源文件> [--stage=lex|parse|semantic|codegen|optimization] [--entry=<入口>]
@@ -135,24 +135,53 @@ my-compiler <源文件> [--stage=lex|parse|semantic|codegen|optimization] [--ent
 
 - **默认**：`--stage=optimization`（走完全程）、`--entry=crate`。
 - **`--entry=` 只在 `--stage=parse` 下有意义**——其它 stage 的前置一律按 `crate` 解析整份程序。
-- 五个入口见 §1.5.5；`parse_crate` 只是其中一个，**不是唯一入口**。
-- ✅ **官方运行器根本不传这两个开关**（2026-09-22 确认，原 Q14 已答）：stage 靠"调 `SEMANTIC` 还是 `CODEGEN`"隐式表达，而 `parse` 它**根本不跑** ⇒ **拼写完全是我们自己的自由**，没有官方约定要迁就。真正必须守的官方契约只有两条：`SEMANTIC` 用**退出码 0/1** 表达接受/拒绝，`CODEGEN` 把 RV32IM 汇编**写进 `{output}`**（[`plan.md`](plan.md) §2.5）。选 `--stage=` / `--entry=` 是因为它们与 manifest 字段同名，读起来直接。
+- 五个入口见 §1.3.6；`parse_crate` 只是其中一个，**不是唯一入口**。
+- **拼写是我们自己的自由**（官方运行器不传这两个开关）：必须守的官方契约只有两条——`SEMANTIC` 用**退出码 0/1** 表达接受/拒绝，`CODEGEN` 把 RV32IM 汇编**写进 `{output}`**（[`plan.md`](plan.md) §2.2）。`--stage=` / `--entry=` 与 manifest 字段同名。
 
-#### 0.5.2 编译跑在大栈线程里（2026-09-24 加）
+#### 0.5.2 编译跑在大栈线程里
 
-`main` 只做参数解析，真正的编译进 `std::thread::Builder::stack_size(64 MiB)`（`main.rs` 的 `compile()`）。**理由**：递归下降——以及后面每一层的递归 AST 遍历——栈深与输入嵌套深度成正比，而"被信号打死"在判分口径里 = 失败（§5.5）。实测括号嵌套上限：默认 8 MiB 栈约 **3000 层** → 64 MiB **约 1.7 万层**。语料里没有这种输入（最大的 `large-control-flow.rx` 6251 行能过），所以这是**保险不是补分**。
+`main` 只做参数解析，真正的编译进 `std::thread::Builder::stack_size(64 MiB)`（`main.rs` 的 `compile()`）。递归下降、以及后面每一层的递归 AST 遍历（sema / lowering 同样适用）——栈深与输入嵌套深度成正比。实测量级：默认 8 MiB 栈约 3000 层、64 MiB 约 1.7 万层（完整记录见 [`arch-phase1.md`](arch-phase1.md) §0.5.2）。
 
-**残留风险（知道就行）**：上限依旧存在，几万层以上照样爆。根治要在 parser 里加递归深度计数器，但那要么给 `Parser` 加第 5 个字段（§1.2.1 的四字段不变式就没了），要么像 `Restrictions` 一样一路传参（侵入每一层）——为语料里不存在的输入付这个价不值。
+⚠ **子线程 panic 一律 `exit(101)`、不翻译成 1**（翻译成 1 会让崩溃的负例假绿）；⇒ **只对自己的不变量用 `debug_assert`/`expect`，对用户输入一律返回 `SemError`**。
 
-**子线程 panic 一律 `exit(101)`**，不翻译成 1：101 既不是"接受"也不是"正常拒绝"，判分直接算失败；翻译成 1 会让负例**因为崩溃而通过**（假绿）。
+### 0.6 代码组织
 
-三条通则：
+```
+src/
+  frontend/   # ① 手写词法/语法 + AST
+    token.rs  #   TokenKind（关键字/Ident/LifeTime/标点/Reserved）+ Span + Token
+    lexer.rs  #   扫描器：空白、嵌套注释、整数字面量、lifetime token、ASCII 校验
+    error.rs  #   词法/语法错误类型：Span + 行列号 + 期望/实际
+    ast.rs    #   AST 节点（每个带 Span）+ arena + 访问器
+    parser.rs #   递归下降 + 优先级爬升 + 上下文切分（49 个 fn parse_*）
+  sema/       # ② 符号表、类型检查、常量求值（还想拆出 ty / symbols / resolve，纯搬家）
+    mod.rs    #   check()：语义阶段唯一入口；Sema 驱动器 + TyArena + 作用域栈 + 类型/路径解析
+    error.rs  #   SemErrorKind / SemError（与 FrontendError 同形）
+    tables.rs #   侧表 Tables：与 arena 同序同长，按 id 稠密索引
+  ir/         # ③ LLVM 形状的内存 IR + 文本 .ll 打印器
+  passes/     # ⑤ 各优化 pass（每个 pass 一个文件）
+  backend/    # ④ 指令选择、寄存器分配、汇编输出
+  main.rs     #   driver：读文件 → 归一化 → 前端 → 语义 → IR → 后端
+docs/
+  spec-mapping.md   # 施工图（后缀切分算法、上下文切分、93 条产生式→函数、bp 表、UB 边界）
+  plan.md           # 排期、验收判据、疑问
+  arch.md           # 本文
+  arch-phase1.md    # 一阶段细节归档
+  arch-phase2.md    # 二阶段细节归档
+tests/
+  official/   # 官方判分用例（子模块 → rx-compiler-testcases，pin c1e8196）
+  custom/     # 我们自己的小语料：复现某个 bug、锁定某个边界
+scripts/
+  test.py             # 官方运行器（模板提供，勿改）
+  stage_test.py       # 自写运行器：官方跳过 lex/parse，这两个 stage 靠它
+  strip_asm_debug.py  # 模板提供，只在"拿 clang 当后端"时才用
+Makefile / config.mk  # 评测入口：四条命令 BUILD / SEMANTIC / CODEGEN / RUN
+crates/rx/            # 参考实现（rustc 当编译器）的 no_std 运行时，模板提供
+grammar/              # 官方 G4 文法（仅作语法参照，前端不用 ANTLR）
+vendor/REIMU/         # RISC-V 模拟器（子模块）
+```
 
-1. **错误类型一律是 `{ kind, span }`**，从词法一路照搬到语义。`span` 是字节区间，`locate()` 才把它换成行列号，只有 driver 负责渲染成人看的消息。
-2. **每阶段只依赖上一阶段的输出值**，不共享可变状态。唯一的例外是前端内部的 token 切分——它被 `Parser` 的独占所有权关在自己肚子里（§1.3.2）。
-3. **退出码只有两种**：0 = 成功；1 = 一切失败（用法 / IO / 词法 / 语法 / 语义），不细分。
-
-✅ **第 3 条已被测试点验证为正确，不要改**：`manifest.schema.json` 对 `compilation_success: false` 的要求是"正常拒绝，**而不是崩溃或超时**"，且 `README-ZH.md` 明说 **No AST serialization or diagnostic wording is required**。⇒ 我们"只分 0/1、诊断措辞随便"的做法**与判分口径一致**；反过来，**任何 panic / 死循环都是实打实的扣分**（§5.5）。
+**两个运行器，别混**：官方 [`scripts/test.py`](../scripts/test.py)（模板提供，勿改）负责 `semantic`/`codegen`/`optimization`，但**主动跳过 `lex`/`parse`**；自写的 [`scripts/stage_test.py`](../scripts/stage_test.py) 补上这两段（外加 `semantic`，用来跑"正例永不回退"的守卫）。Make 目标：`lex-test` / `parse-test` / `sema-test` / `sema-acc`。接入过程与 `config.mk` 四条命令的契约见 [`plan.md`](plan.md) §2.2。
 
 ---
 
@@ -160,23 +189,19 @@ my-compiler <源文件> [--stage=lex|parse|semantic|codegen|optimization] [--ent
 
 ### 1.1 内部架构
 
-**依赖方向**（箭头读作「用到」）：
+**依赖方向**（箭头读作「用到」）与**数据流**（三个值的接力，不是模块互相调用）：
 
 ```
-token.rs   ── TokenKind / Span / Token        纯数据，无逻辑
+token.rs   ── TokenKind / Span / Token     纯数据，无逻辑
    ▲
 lexer.rs   ── 只认词法，不懂语法
    ▲
 parser.rs  ── 只认语法，不做词法判定
    ▲
-ast.rs     ── 节点类型 + arena + 访问器        被 parser 写、被 sema 读
-```
+ast.rs     ── 节点 + arena + 访问器         被 parser 写、被 sema 读
 
-**数据流方向**（和依赖方向一致，但它是**三个值的接力**，不是模块互相调用）：
-
-```
 main ──&[u8]──► parse_crate ──► lex_all ──Vec<Token>──► Parser ──► Ast ──► sema
-       (只读)      (前端唯一入口)          (值移动)        (值移动)
+       (只读)     (前端唯一入口)           (值移动)        (值移动)
 ```
 
 **对外接口只有两个函数**：
@@ -186,463 +211,20 @@ main ──&[u8]──► parse_crate ──► lex_all ──Vec<Token>──�
 | `parse_crate(src: &[u8]) -> Result<Ast, FrontendError>` | `parser.rs` | driver。**sema 只依赖它的返回值 `Ast`，不依赖 `Parser`** ⇒ 两边可并行开发 |
 | `lex_all(src: &[u8]) -> Result<Vec<Token>, LexError>` | `lexer.rs` | `parse_crate` 内部；另给单测与 driver 的 token dump 用 |
 
-`lex_all` 是词法阶段唯一的对外入口：`Lexer` 与它的 `next_token` 都是私有的内部件，外面没有理由按住一个 lexer 手动推进它。这条也解释了 §1.4 为什么以 `lex_all` 起头讲、却把「三步扫描」写在 `next_token` 名下。
+`lex_all` 是词法阶段唯一的对外入口：`Lexer` 与它的 `next_token` 都是私有的内部件。
 
-#### 为什么是手写 parser（决策记录，2026-09-18 定 / 09-19 复核维持）
-
-这个语言恰好是最不适合上 parser generator 的那类：全书仅 93 条语法产生式；无模式匹配 / 无元组 / 无闭包 / 无宏 / 无用户 trait（parser generator 最大的价值来源在这里不存在）；无类型参数（泛型参数只有生命周期）；优先级表显式给出；上下文标点有限且可枚举。
-
-| | a. `syn` 直接解析 | b. ANTLR + 课程 g4 | c. **手写（选定）** |
-|---|---|---|---|
-| 实现工作量 | 1–2 天转换层 | 0 天写规则 + 1–2 天调歧义 | 8–10.5 天（lexer ~450 行 + parser ~1400 行） |
-| 仍需自己做 | **子集校验器**——`syn` 会超集接受 `match`/`enum`/宏/元组/trait，得再写一遍拒绝逻辑 | **CST→自己的 AST 转换层** | AST 设计（本来就要） |
-| 工具链风险 | 无 | **高**：ANTLR 无官方 Rust target | 无 |
-| 语言风险 | 无 | **选它等于放弃 Rust**（与 `CLAUDE.md` 冲突） | 无 |
-| 负例报错可控性 | 差（超集接受） | 好 | **最好** |
-
-`syn` 路线的真实代价是**子集校验器**而不是语法：规范说 "Every Rx source program uses valid Rust syntax"，所以 `syn` 解析得动所有合法输入；问题在反方向——Rx 是子集，`syn` 会**超集接受**一堆子集外写法，而负例测试要求这些被拒绝。
-
-**g4 的定位**：不进构建链，只留两项用途——覆盖度检查清单、可选的差分测试 oracle（用 ANTLR 的 **Java** target）。是否现在就做见 [`plan.md`](plan.md) §3.1 Q1。
-
-### 1.2 维护的数据结构
-
-分三层看：**每个部件自己的状态**（§1.2.1）、**部件之间传的值**（§1.2.2）、**语义层的侧表**（§1.2.3，属阶段二，形状先定）。
-
-#### 1.2.1 每个部件持有什么
-
-**Lexer —— 全部状态就两个字段**（`src/frontend/lexer.rs`）：
-
-```rust
-struct Lexer<'a> {          // 类型与构造器都不对外，见 §1.1
-    src: &'a [u8],   // 唯一的字节来源：pos 是它的下标 ⇒ span 天然是字节偏移，不需要 Vec<char>
-    pos: usize,      // 下一个待扫描字节
-}
-```
-
-- **没有别的状态**：注释嵌套深度 `depth`、整数的进制 `Base`、各 `lex_*` 里的 `start` 都是**局部变量**——每个 token 的扫描自包含，扫完就丢。
-- **不变式**：`pos <= src.len()` **并不严格成立**。未终止块注释那一支会把 `pos` 推过文件末尾（实测走到 `len + 1`），所以**错误 span 必须 `min(src.len())` clamp**，否则渲染错误时切 `src[start..end]` 会 panic（单测 `unterminated_block_comment_span_is_clamped` 守着这条）。
-- **`Eof` 不推进 `pos`** ⇒ 流末尾之后再调 `next_token` 会**永远返回 `Eof`**。所以「什么时候停」不是 lexer 的事，是 `lex_all` 那个循环里一个显式的 `if eof`（§1.4）。
-
-**Parser —— 四个字段**（`src/frontend/parser.rs`，已落地）：
-
-```rust
-pub struct Parser<'a> {
-    src:  &'a [u8],    // 只给诊断取词用；判定一律不看它（§1.3.3）
-    toks: Vec<Token>,  // 全量 token + 尾部 Eof，必须自有、必须可变
-    pos:  usize,       // 游标 = 下一个待消费的 token 下标
-    ast:  Ast,         // 边解析边填的 arena；结束时整体移出
-}
-```
-
-> **2026-09-22 改动：删掉了原设计的第 5 个字段 `no_struct_literal`。** 起因是逐字读了参考实现（rust-analyzer 的 parser，也就是本语料那份期望树的来源，commit `971903d9`）：它把两个上下文限制（`forbid_structs` / `prefer_stmt`）**按值传参**给 `expr_bp(min_bp, r)`，不做可变字段的存/恢复。这样做直接消掉了原设计里"进了括号忘了恢复标志"这一整类 bug——进 `(` `[`、实参、数组元素、字段值、块体时**传 `VALUE` 常量**就行，没有"恢复"这个动作可忘。代价是 `parse_expr_bp` 多一个参数。细节见 [`spec-mapping.md`](spec-mapping.md) §2.9.1 之（3）。
-
-- **为什么 `src` 还要单独存一份**：`TokenKind` 无载荷（见 §1.2.2），要文本只能 `&src[span]` 现切。⚠ 到 2026-09-22 为止 parser 里还没有任何一处真的读过它——若写完全部 `parse_*` 仍然如此，说明这个字段该删（编译器会一直报 `field is never read`，留意它）。
-- **为什么 `toks` 必须自有且可变**：切分要**原地改写** `toks[pos]`（§1.5.1），流式 token 源做不到。
-- **为什么 arena 装在一个 `ast: Ast` 字段里**而不是 6 个平铺字段：结束时一句 `Ok(self.ast)` 就移出（平铺要 6 次 `mem::take`），也让「AST 是独立于 parser 的值」在类型上看得见。`toks` 自有的理由见 §1.3.2。
-- **不变式**：`toks` 末尾恰好一个 `Eof` ⇒ 游标永不越界；`pos` **单调不减**（切分时不动它）⇒ 前端对 token 流是**单向扫描，永不回头**。parser 侧对应的半条规则：`bump` **停在哨兵 `Eof` 上不再前进**（和 lexer 的「`Eof` 不推进 `pos`」是同一条规则的两半），代价是每个循环都得自己拿 `at(Eof)` / `expect` 收口。
-
-#### 1.2.2 部件之间传的值
-
-> 本节出现的 `§2.x` / `§3` 一律指 [`spec-mapping.md`](spec-mapping.md) 的小节（本文件自己的 §2 / §3 是阶段编号，别混）。
-
-**词法层**（无载荷，已实现）：
-
-```rust
-pub enum TokenKind { /* 关键字 / Ident / LifeTime / IntLiteral / 标点 / Reserved / Eof */ }
-pub struct Span { pub start: u32, pub end: u32 }   // 字节偏移；u32 够用（源码远小于 4 GiB）
-pub struct Token { pub kind: TokenKind, pub span: Span }
-```
-
-`TokenKind` 是**纯标签，不带值**：`flag` 这个名字和 `1` 这个数字**不存**，只存位置，需要文本时用 `&src[span.start..span.end]` 现切。
-
-`Eof` 是**本实现加的哨兵**，规范的 `@root Token`（`tokens.md`）里没有它，它的 span 为空（`start == end`）。加它是因为 parser 需要一个「流结束」的**普通值**来收尾与前瞻，而不是 `Option`。
-
-**语法层**（arena）：
-
-```rust
-pub struct Ast {
-    pub items:  Vec<Item>,      // 池子：顶层项 + 所有 impl 的关联项（见下）
-    pub root:   Vec<ItemId>,    // 顶层列表。遍历程序入口要读这个，不是 items
-    pub blocks: Vec<Block>,
-    pub exprs:  Vec<Expr>,
-    pub types:  Vec<Type>,
-    pub paths:  Vec<Path>,
-    pub consts: Vec<ConstValue>,  // 常量语法：只在 3 处出现，从不出现在表达式里
-    pub entry_root: Option<EntryRoot>,  // 碎片入口的根；parse_crate 下是 None（§1.5.5 决策四）
-}
-```
-
-// 六个 id 各是一个独立的 newtype：形状相同，但互不相通
-// （没有 StmtId —— Stmt 不进 arena，`Block.stmts` 直接是 `Vec<Stmt>`，理由见 §1.2.2.1）
-#[derive(Copy, Clone)] pub struct ExprId(pub usize);
-#[derive(Copy, Clone)] pub struct BlockId(pub usize);   // ItemId / TypeId / PathId / ConstValueId 同
-```
-
-**为什么 `items` 和 `root` 是两个字段**：`impl` 的关联项也是 `Item`，和顶层项进同一个池子（理由见 §1.2.2.1 末尾）。所以「池子」和「顶层列表」不再是同一个东西，必须分开记。两者真的会不一样：
-
-```rust
-fn a() {}
-impl S { fn m() {} }
-fn b() {}
-// items = [a(0), m(1), b(2)]   ← 池子，跨深度，顺序 = 解析顺序
-// root  = [0, 2]               ← 顶层只剩 a 和 b
-```
-
-⇒ 光看 `items` 分不出谁是顶层，`root` 不是能省掉的缓存。
-
-**`root` 的成员资格（2026-09-23 定）**：规范书 `crates-and-source-files.md` 的
-`@root Crate -> Item*` 加 `items.md` 的
-`Item -> UseDeclaration | Function | Struct | ConstantItem | Implementation`
-⇒ **顶层只有 5 个备选，`root` 是它的一比一映射**：每条顶层 `Function` / `Struct` /
-`ConstantItem` / `Implementation` 各推一个 `ItemId`，按源码顺序。**两类不进 `root`，理由不同**：
-
-- **impl 的关联项**：**占** `items` 的槽位（`ItemKind::Impl { items }` 指着它们），
-  但可达性走 `Impl` 节点 ⇒ 不进顶层列表。
-- **`use` 声明**：解析完整条丢弃，**连槽位都不占** ⇒ 两个列表里都没有它。
-
-⇒ 落到代码是**三段分工**（`parse_items` 是唯一写 `root` 的地方）：
-
-| 层 | 谁 | 干什么 |
-|---|---|---|
-| 子产生式 | `parse_function` / `parse_struct` / `parse_const` / `parse_impl` | 返回 `ItemKind`，不碰 `items` / `root` |
-| 造节点 | `parse_item`（顶层）/ `parse_associated_item`（impl 内） | 各自 `mark()` + `push_item` ⇒ 拿到 `ItemId` |
-| 定成员 | `parse_items`（调 `push_root`）/ `parse_impl`（收进 `Impl.items`） | **只有这里决定 `root`** |
-
-**为什么造节点这层要自己 `mark()`、而不是让调用者算 span**（与 `parse_function` 的形状不同）：
-`#[derive(...)]` 是 item 的一部分，struct 的 span 要从 `#` 起算 ⇒ `mark()` 只能由 `parse_item`
-自己提（必须在读属性之前）。mark 归它、span 就归它、`push_item` 跟着归它，三件事拆不开。
-副产物是 **item 的各支自己吃开头关键字**（否则 `Pound` 那一支没法「先吃属性再进 `parse_struct`」），
-所以 `parse_function` 开头有一句 `expect(Fn)`。
-
-**为什么每个 arena 一个 id 类型、而不是全用 `usize`**：光 `ExprKind` 一张表里，每个变体的直接字段（含 `Vec<_>` / `Option<_>` 里的）加起来就有 **33 处** id 类型。裸 `usize` 时「把 `BlockId` 传给要 `ExprId` 的地方」能编译通过，然后从错误的 arena 取节点；typed id 把它变成编译错误（`expected ExprId, found BlockId`），顺带让字段自己说出指向哪个 arena。它防的是**手滑**，不防「两个不同 `Ast` 的 id 混用」。
-
-**为什么是 6 个具体 newtype、而不是一个泛型 `Id<T>` + 6 个别名**：泛型参数**一次都没被用到**——全项目没有一处泛型地处理 id 的代码，所以那套机器（`PhantomData` + 手写 `Copy`/`Clone` impl）是白付的。具体 newtype 反而更短，`#[derive(Copy, Clone)]` 直接可用（泛型版**不行**：derive 会生成 `impl<T: Copy> Copy`，而 `Expr` 含 `Vec` 不是 `Copy` ⇒ `Id<Expr>` 就不是 `Copy`），`id.0` 也能直接当索引、省掉访问器。代价是失去了「泛型地处理 id」的能力——目前没有任何地方需要它。
-
-用 `usize` 而不是 `u32`：省掉每处访问的 `as usize`。`u32` 能省一半内存，但在这个规模的项目里不值得。
-
-**节点定义**。动手前先记住：**规范和 AST 变体不是一一对应的**。表达式那块规范有 **37 个具名产生式**（`Expression` … `StructExprField`），`ExprKind` 只有 **25 个变体**。差额有三个去向：
-
-| 产生式的去向 | 例 | 判别标准 |
-|---|---|---|
-| **成为变体** | `CallExpression` / `IfExpression` / `IndexExpression` | 载荷**形状不同**（字段名、字段个数不一样），或语义上必须区分 |
-| **压成一个字段** | 第 5–13 组的中缀运算符 → 一个 `Binary { op: BinOp, .. }`；`LiteralExpression` 的各支 → `Lit(Lit)` | 形状相同、只是**标签**不同 ⇒ 标签做成 `enum` 字段，不铺成变体 |
-| **消失** | `Expression`/`ExpressionWithoutBlock`/`ExpressionWithBlock` 只是入口分组；`CallParams`/`ArrayElements`/`Conditions` 只是子列表 | 纯粹是语法分层，不构成节点 |
-
-这笔压缩是**有回报的**：10 个运算符产生式压成**一个**爬升函数（§1.5.2），语义阶段 `match` 的是 **25** 个变体而不是 37 个产生式。
-
-压缩**不适用于两类东西**，理由都是上表第一行的后半句「**语义上必须区分**」：
-
-- **`GroupedExpression`（括号）**：按上表该「消失」，但**必须留成 `Paren`**，理由见 §1.5.2 末尾。
-- **前缀运算符**：第 3 组的 `-` `!` `*` `&` `&mut` **不折成一个带 `op` 字段的变体**，而是 `Neg` / `Not` / `Deref` / `Ref` 四个变体（节点定义见下面 `Expr` 那一节）。压缩的回报来自「N 个产生式**共用一张表**」——中缀 19 个运算符共用一张绑定力表（§1.5.2），前缀 5 个只有一个绑定力常数（组 3 的 24，见 [`spec-mapping.md`](spec-mapping.md) §3）、没有表可共用；而它们的语义签名三种都不一样：`-` / `!` 是值→值、`*` 的结果是 **place**、`&` / `&mut` 吃 place（`&mut` 还要求它可变，是负例测试项，见 §1.2.3 的 `expr_cat`）。⇒ 全 AST **没有 `UnOp` 这个类型**：五个运算符直接对应四个变体，`&` / `&mut` 合成一个 `Ref { mutable }`。
-
-（`as`（第 4 组）和 `=` / `+=` …（第 14 组）虽然也在这 15 层里，但走的是上表**第一行**——载荷形状与中缀算术不同（各多带一个 `TypeId` / `AssignOp`），所以各有变体 `Cast` / `Assign`。它们不算例外，本来就是「成为变体」。）
-
-下面是逐节点定义（施工图是 [`spec-mapping.md`](spec-mapping.md) §2 的产生式映射）。三条模板，每个节点照这个写——**这段只是示意**，完整的 `ExprKind` 在下面 `Expr` 那一节：
-
-```rust
-pub struct Expr { pub kind: ExprKind, pub span: Span }
-
-pub enum ExprKind {
-    // ① 子节点一律 Id：递归全部由 id 打断，节点定义里不出现 Box
-    Call  { callee: ExprId, args: Vec<ExprId> },
-    // ② 名字/字面量一律不存 String，要文本时切 src
-    //    名字包一层 `Name`（故意不能按位置比较），字面量仍是裸 Span
-    Field { recv: ExprId, name: Name },
-    // ③ span 不塞进每个变体，而是外层 struct 的一个字段（下面「为什么用包装 struct」）
-}
-```
-
-自查信号：**某处被迫写 `Box` ⇒ 那里漏了一个 id**（§5.1）。
-
-`Item`（§2.1–2.6）：
-
-```rust
-pub struct Item { pub kind: ItemKind, pub span: Span }
-
-pub enum ItemKind {
-    Fn {
-        name: Name,
-        recv: Option<Receiver>,       // 有 self 时，params 里不再重复它
-        params: Vec<Param>,
-        ret: Option<TypeId>,          // None ⇒ 返回 ()
-        body: BlockId,
-    },
-    Struct { derives: Vec<Derive>, name: Name, fields: Vec<FieldDef> },
-    Const  { name: Name, ty: TypeId, value: ConstValueId },  // 类型与初始化器都必需
-    Impl   { target: TypeId, items: Vec<ItemId> },           // 关联项也是 Item，进同一个池子
-    // 没有 Use —— 见下面「解析完就丢的两类」
-}
-
-pub struct Receiver { pub by_ref: bool, pub mutable: bool }   // &self / &mut self / self / mut self
-pub struct Param    { pub binding: Name, pub mutable: bool, pub ty: TypeId }
-pub struct FieldDef { pub name: Name, pub ty: TypeId }
-```
-
-**为什么变体载荷内联、列表元素具名**：判据是「**有没有标签可借**」。`ItemKind` 的变体标签（`Fn`/`Struct`/…）**已经**是这个载荷的名字，再包一个 `FnDef` 就是同义反复；而 `Vec<Param>` 里的元素没有任何标签，不给它名字就没法在别处指代。这条规则下全 AST 只有一种写法：`ExprKind::Call { callee, args }` / `TypeKind::Ref { mutable, inner }` / `ConstValueKind::Neg { operand }` 与本处完全同构，`Lit` / `FieldInit` / `PathExprSegment` 也都落在「列表元素」那侧。
-
-代价：后面章节要说「某个函数」时不能再说 `FnDef`，得说「`ItemId` 指向的那个 `Item`」——但语义层本来就全程持有 `ItemId`（§1.2.3 的 `item_sig` 按 id 索引），所以这个代价不存在。
-
-`Stmt`（§2.9）——只有三个变体。**它不进 arena**（理由见 §1.2.2.1），所以没有 `StmtId`，直接内联在 `Block.stmts` 里：
-
-```rust
-pub struct Stmt { pub kind: StmtKind, pub span: Span }
-
-pub enum StmtKind {
-    Empty,                                                          // 单独的 ;
-    Let  { binding: Name, mutable: bool, ty: Option<TypeId>, init: ExprId },
-    Expr { expr: ExprId, semi: bool },                              // semi 必须如实记，见 §2.9
-}
-```
-
-`Block`（§2.9）——**没有 `tail` 字段**，它是从 `stmts` 派生的；**`stmts` 的元素是值而不是 id**：
-
-```rust
-pub struct Block { pub stmts: Vec<Stmt>, pub span: Span }
-// Block::tail() = 最后一个 StmtKind::Expr{semi:false}，现算不存
-```
-
-**为什么 `Block` 自己进 arena、里面的 `Stmt` 却内联**（判据见 §1.2.2.1，两条分工不同）：
-
-- `Stmt` 内联，因为**判据 B 不成立**：它只有 `Block` 一个爹。`Vec` 已提供间接层（A 不成立），没有任何表按语句索引（C 不成立），而 D 的前提是「内联进**枚举变体**」——`Block.stmts` 是 `Vec`，元素多大都不影响宿主 ⇒ 也不成立。**四条都不成立**，没有理由给它一个全局编号。
-- `Block` 进 arena，因为**判据 C 成立**：§1.2.3 的 `block_scope` 与 `ast.blocks` 同序，块必须有全局编号。另外 B 成立（5 个不同的爹），D 也成立（本体 32 字节，且 `ExprKind::Block` / `If{then_block}` 都是枚举变体）；而块自己的 span 得有个家——空块 `{}` 的 `stmts` 为空，span 推不出来，所以 `Block` 必须是个**具名类型**。
-
-`Expr`（§2.10）——最大的一张，按原子 / 后缀 / 运算符分三组：
-
-```rust
-pub struct Expr { pub kind: ExprKind, pub span: Span }
-
-pub enum ExprKind {
-    // ── 原子
-    Lit(Lit),                                                  // 整数 / true / false
-    Path(PathId),
-    Paren(ExprId),                                             // (e)
-    Unit,                                                      // ()
-    Array(Vec<ExprId>),                                        // [a, b, c]
-    ArrayRepeat { elem: ExprId, len: ConstValueId },           // [0; N]
-    Struct { path: PathId, fields: Vec<FieldInit>, base: Option<ExprId> },  // S{x: 1} / S::<'a>{…} / S{}
-    Block(BlockId),                                            // { ... }
-    If   { cond: ExprId, then_block: BlockId, else_branch: Option<ExprId> },
-    Loop(BlockId),
-    While { cond: ExprId, body: BlockId },
-    Break(Option<ExprId>),
-    Continue,
-    Return(Option<ExprId>),
-    // ── 后缀（解析循环产出）
-    Call   { callee: ExprId, args: Vec<ExprId> },
-    Method { recv: ExprId, name: PathIdentSegment, args: Vec<ExprId> },  // 只存段里的名字，理由见 §5.2
-    Field  { recv: ExprId, name: Name },                                 // 语法只给 IDENTIFIER
-    Index  { recv: ExprId, index: ExprId },
-    // ── 运算符（表见 §3）
-    Neg(ExprId),                           // -e
-    Not(ExprId),                           // !e
-    Deref(ExprId),                         // *e             值 → place
-    Ref { mutable: bool, inner: ExprId },  // &e / &mut e    place → 值
-    Binary { op: BinOp, lhs: ExprId, rhs: ExprId },
-    Cast   { expr: ExprId, ty: TypeId },                       // as
-    Assign { op: AssignOp, lhs: ExprId, rhs: ExprId },         // = += -= …
-}
-
-pub enum Lit { Int { digits: Span, suffix: Option<Span> }, Bool(bool) }
-pub struct FieldInit { pub name: Name, pub value: ExprId }
-```
-
-**`Struct` 的字面量语法只有一种形状**（`struct-expr.md`）：`StructExpression -> PathInExpression '{' StructExprFields? '}'`，`StructExprField -> IDENTIFIER ':' Expression`。⇒ **没有 `S { x }` 简写**（`x` 后必须有 `:`），**没有 `..base` 功能更新语法**，`S {}` 合法（零字段 struct）。于是 `base` 是个**死字段**：`parse_struct_expr` 永远写 `None`，sema 直接忽略它。留着的唯一理由是它已写进已定的节点定义；**删它要趁 sema 开工前一次做掉**（`parse` 阶段零成本——反正解析时只写 `None`），否则半路删会牵动 sema 的 match 臂。
-
-`else_branch` 存 `ExprId` 而不是 `BlockId`——理由见 §1.5.4。`Lit::Int` 的 `digits` 只是个 `Span`，**整数不在前端解析成数值**，范围检查推迟到语义阶段（下面那条）。
-
-`Type`（§2.7）——规范说「只有这几支」，就 5 个：
-
-```rust
-pub struct Type { pub kind: TypeKind, pub span: Span }
-
-pub enum TypeKind {
-    Paren(TypeId),                                  // (T)
-    Unit,                                           // ()
-    Path(PathId),                                   // i32 / S / Vec<T>
-    Ref { mutable: bool, inner: TypeId },           // &T / &mut T（生命周期已丢）
-    Array { elem: TypeId, len: ConstValueId },      // [T; N]
-}
-```
-
-`Path`（§2.8）：
-
-```rust
-pub struct Path { pub segments: Vec<PathExprSegment>, pub span: Span }
-
-// 规范 PathExprSegment -> PathIdentSegment (`::` GenericArgs)?：整段 = 名字 + 可选的 ::<…>
-pub struct PathExprSegment { pub name: PathIdentSegment, pub args: Option<GenericArgs>, pub span: Span }
-
-// 规范 PathIdentSegment -> IDENTIFIER | self | Self。三支必须可区分（spec-mapping §2.8）
-pub enum PathIdentSegment { Ident(Name), SelfValue, SelfType }
-
-pub struct GenericArgs { pub types: Vec<TypeId>, pub span: Span }   // 生命周期实参已丢
-
-// 名字的统一载体，见下面「名字为什么不直接是 Span」
-pub struct Name { pub span: Span }
-```
-
-**名字为什么不直接是 `Span`**（2026-09-21 定，完整复核见 §5.2）：`Span` 派生了 `PartialEq`，所以 `a.name == b.name` **能编译**、比的却是**源码位置**——两个 `foo` 写在不同行就判为不相等。那不是慢，是**静默错误**。`Name` 包一层、**故意不派生 `PartialEq`/`Eq`/`Hash`**，把「按位置比名字」变成编译错误；真正的比较走 sema 的 `Names`（它持有 `src`）。`Name` 8 字节，与它替换掉的 `Span` 同大。字面量（`Lit::Int.digits` / `ConstValueKind::Int.digits`）仍是裸 `Span`——它们从不参与相等判断，只被切出来解析成数值。
-
-**`Method` 为什么只存 `PathIdentSegment`、不存整个 `PathExprSegment`**（也不是 `PathId`）：
-
-| 候选 | 否掉的理由 |
-|---|---|
-| 裸 `Span` | 丢掉 `IDENTIFIER`/`self`/`Self` 的区分，名字解析只能切文本比 `"Self"`（§1.3.3 禁）；`x.foo::<i32>()` 会被静默接受 |
-| `PathExprSegment` 内联 | 本体 **56** 字节，而 `Method` 是**枚举变体** ⇒ 按判据 D 撑大 `ExprKind`：56 → 104 |
-| `PathId` | `Path.segments` 是 `Vec`，语法却保证**恰好 1 段**（`MethodCallExpression -> Expression . PathExprSegment …`）⇒ 多一处「类型层面看不出违规」，与 §1.2.2 反对 `const` 存 `ExprId` 同一条；且 sema 取个名字要写 `segments[0]` + 长度断言 |
-| **`PathIdentSegment`** | 12 字节，内联后 `Method` 仍是 48（与 `Struct` 并列）⇒ `ExprKind` 不涨；段上那个 `GenericArgs` 在方法位置**每个取值都塌成空/丢弃/一个 bit**（生命周期实参丢、类型实参只记 `has_type_args: bool` 给语义阶段，见 §5.2.1 决定 3），本来就不该整份存下来 |
-
-`ExprKind` 的 56 字节由 `ast.rs` 的尺寸断言测试守着（`exprkind_stays_56`）——判据 D 的全部论证都建立在它上面。
-
-`ConstValue`（§2.11）——常量上下文是**另一套受限语法**，不是普通表达式：
-
-```grammar
-ConstValue -> INTEGER_LITERAL | `true` | `false` | ConstantPath | `-` Magnitude | `(` ConstValue `)`
-Magnitude  -> INTEGER_LITERAL | ConstantPath | `(` Magnitude `)`
-```
-
-```rust
-pub struct ConstValue { pub kind: ConstValueKind, pub span: Span }
-
-pub enum ConstValueKind {
-    Int  { digits: Span, suffix: Option<Span> },   // INTEGER_LITERAL
-    Bool(bool),                                     // true / false
-    Path(PathId),                                   // ConstantPath
-    Neg  { operand: ConstValueId },                 // `-` Magnitude
-    Paren{ inner:   ConstValueId },                 // `(` ConstValue `)`
-}
-```
-
-**为什么常量不复用 `Expr`**（存 `ExprId` 就能少一个 arena）：6 种允许形式在 `ExprKind` 里都有对应形状，所以**结构上可行**。不这么做是**「不变式写在类型里」**——`const A: i32 = 1 + 2;` 必须报错，存 `ExprId` 时它的 AST 是个**合法的 `Binary` 节点**，类型层面看不出违规，防线只剩 parser 一个函数；存 `ConstValue` 则 `1 + 2` **根本无法表达**。另外四个前缀节点 `Neg` / `Not` / `Deref` / `Ref` 比规范宽：它们都接受**任意表达式**作操作数，而规范在常量位置只允许 `-`、且操作数必须是 `Magnitude`。
-
-⇒ 于是 **`Magnitude` 不单独建类型**（它等于「`ConstValue` 去掉 `Neg`」，建了要把 `Int`/`Path`/`Paren` 抄一遍）。**代价记在这里**：`ConstValueKind::Neg.operand` 按规范不能又是 `ConstValueKind::Neg`（`--1` 非法），**这条靠 `parse_const_value()` 保证、不是类型保证**，加 `debug_assert` 守着。
-
-**为什么用包装 struct（`struct Expr { kind, span }`）而不是把 `span` 平铺进每个变体**：`ExprKind` 有 25 个变体，平铺就是写 25 遍 `span: Span`，漏一个就是不变式破洞；包装成 struct 之后「每个表达式都有 span」变成**类型事实**，不用靠记性。这和 §1.3.4 让 `ReservedKeyword` 无载荷、§5.1 让 `walk_stmt` 编译不过是同一个手法——**把不变式写进类型，而不是写进注释**。代价是 `match` 要写 `match e.kind`。
-
-（不单独进 arena 的小结构体按需带 `span`：`PathExprSegment` / `GenericArgs` 带了，因为 `Vec<Vec<i32>>` 的报错要指到具体那一段；`Param` / `FieldDef` 暂时没带，写到那一步发现要指再补。`Name` 自己带 `span`——它是名字在报错里被点名时的唯一坐标。）
-
-**同一个「不存文本、存位置」的手法贯穿三层**：
-
-| 层 | 要记住什么 | 怎么做 |
-|---|---|---|
-| token | `flag` 是哪个名字 | 不存，`span` 指回源码 |
-| AST | `flag` 是哪个名字 | 不存，`Name { span }` 指回源码；`Lit::Int { digits: Span, suffix }` |
-| sema | 两个 `flag` 是不是同一个名字 | 把 `src` 与两个 `Name` 一起交给 `Names`，现切现比（§5.2） |
-
-⇒ 整数字面量也**不在词法阶段解析成整数**（规范明确「不要求量级能装进宿主整数」），范围检查推迟到语义阶段。
-
-**span 契约**：每个节点的 span 必须落在源码内、且**子节点的 span 含于父节点**（报错时能顺着树往上找上下文）；包装节点（`ExprKind::Block(b)`、`StmtKind::Expr{e}`）**抄内层 span，不自己编**。非 `Eof` 的 token `end > start` 是 lexer 的对外保证（§1.4），也是上面那条的来源。
-
-##### 1.2.2.1 为什么是这六个
-
-**判据 B 是必要条件（但它推不出 arena）；判据 A / C / D 各自都能构成进 arena 的理由**：
-
-- **判据 B（不止一个爹）**：两个以上**不同种类**的父节点要用到它 ⇒ 不能内联进某一个爹，**必须给它起个名字**。⚠ 推论到此为止——「具名结构体内联在爹的字段里」同样满足 B，所以 **B 推不出 arena**。
-- **判据 A（直接字段不能是自己）**：递归必须有间接层打断。⚠ 关键在**「直接字段」**：`Vec<Stmt>` / `Vec<ItemId>` 本身就是一层堆间接，隔着它们回到自己**不算**。所以 A 只在 `ExprKind::Deref(ExprId)` / `ExprKind::Ref { inner: ExprId }` 这种**字段直接就是自己**的地方成立，它的推论是「只能 id 或 `Box`，选 id」。
-- **判据 C（侧表要按它索引）**：有侧表与它「同序同长」（§1.2.3）⇒ 必须有全局编号。arena 独有的东西是「全局编号 + 稠密索引」。
-- **判据 D（别把本体塞进枚举）**：本体可观（≥24 字节）且它出现在**枚举变体**里 ⇒ 内联会让那个枚举按 max-of-variants 膨胀（Rust 枚举大小 = 最大变体的载荷 + 标签，对齐后取整），而 arena 把本体换成 8 字节的 id。⚠ 前提是**枚举变体**：内联进 `Vec` 不算——`Vec` 头固定 24 字节，元素多大都不影响宿主的大小。
-
-三者分工：A 管「必须用句柄」（id 或 `Box`，选 id 就进了池子），C 管「必须有全局编号」，D 管「本体不该住在枚举里」。
-
-| 类目 | B 多个爹 | 进 arena 的理由 | 谁指向它 |
-|---|---|---|---|
-| `Expr` | ✓ | **A** —— `Deref(e)` / `Ref{inner}` / `Binary{lhs,rhs}` 这类直接字段 | `Stmt`、块尾、`if`/`while` 条件、`return`/`break`、调用实参、数组元素、`ItemKind::Const`、它自己 |
-| `Type` | ✓ | **A** —— `Ref{inner}` | `let` 注解、参数、返回类型、`ItemKind::Struct` 的字段、`ItemKind::Const`、`&T`/`[T; N]` 的元素、它自己 |
-| `ConstValue` | ✓ | **A** —— `Paren{inner}` | `ItemKind::Const`、`ExprKind::ArrayRepeat`、`TypeKind::Array` |
-| `Item` | ✓ | **C** —— `item_sig` | crate 根（`root`）；impl 体（`ItemKind::Impl` 的 `items`） |
-| `Block` | ✓（5 处） | **C + D** —— `block_scope`（侧表）；且本体 32 字节，内联会让 `If{then_block}` 的载荷 32→56（`ExprKind` 56→64） | `ExprKind::Block`、`ItemKind::Fn` 的 `body`、`if`/`else`、`while`/`loop` 体 |
-| `Path` | ✓ | **D** —— 本体 32 字节（`Vec<PathExprSegment>` 24 + `span` 8）、无侧表；内联把 `ExprKind` 56→80、`TypeKind` 24→40、`ConstValueKind` 32→40 | 表达式路径、类型路径、常量路径、`impl` 目标 |
-
-⚠ **`Block`→`Stmt`→`Expr`→`Block` 这个环不使 A 在 `Block` 上成立**——打断它的是 `StmtKind::Expr` 里的 `ExprId`，不是 `BlockId`。同理 `Item` 的环被 `Vec<ItemId>` 打断。文档早先的版本把这两个环记成「A ✓」并据此推出 arena，那是把「整张类型图不能无限大」（全局性质，判据 A 真正管的事）读成了「这个类目需要自己的 id」（局部性质）——后者只有 C / D 能给。
-
-**`Item` 那条要解释一下**：`Item` 进 arena 靠 C，而 C 成立**完全取决于 `impl` 的关联项怎么存**。关联项存成 `ItemId`（本实现的选择）时，`item_sig` 一套 id 空间就能同时覆盖顶层项与全部 impl 的关联项；若内联成 `Vec<AssocItem>`（另一个类型），`item_sig` 就被切成两半、环也断了，`ItemId` 与 `item_sig` 侧表一起消失。选择后者就要重写这一行。
-
-**为什么关联项存 `ItemId`**：规范要求一个 struct 的**所有** inherent impl 共享一个关联值命名空间（跨 impl 块重名也是 compile error），方法解析要遍历「所有名字匹配 + receiver 类型精确相等」的候选。⇒ 语义阶段需要一张覆盖**全部 impl 块全部关联项**的表，值是「指向那个 `Item` 的引用」；而 §1.2.3 的 `item_sig: Vec<ItemSig>` 按「与对应 arena 同序同长」索引，必须同时覆盖顶层项。**统一 `ItemId` 让这三件事共用一套 id 空间**，代价只是 `Ast` 多一个 `root` 字段。
-
-⚠ 同一个「type vs parser」的取舍在这里出现第二次：`parse_associated_item()` 只产出 `Fn`/`Const` 两种 `ItemKind`（规范只允许这两种），这是 **parser 保证、不是类型保证**。与 `ConstValue` 不建 `Magnitude` 类型是同一类取舍。
-
-三处要标明是**设计选择**而非推导结果：
-
-1. **`Stmt` 不进 arena**（`Block.stmts: Vec<Stmt>`，没有 `StmtId`）。它是唯一不满足判据 B 的候选——只有 `Block` 一个爹；而 `Vec<Stmt>` 已提供间接层（A 不成立），没有侧表索引它（C 不成立），内联目标又是 `Vec` 而非枚举变体（D 不成立，见 §1.2.2 的 `Block` 段）。
-   - 决定性的区分：**侧表编号是给「随机访问 + 稠密存储」用的，而语句永远是从 `Block.stmts` 顺序遍历过去的**——需要访问语句 ≠ 需要给语句编号。
-   - 退路（真出现 per-stmt 信息时）：**挂在该语句携带的那个 `ExprId` 上**。每个 `StmtKind` 变体恰好携带一个（`Let.init` / `Expr.expr`；`Empty` 永远不需要信息），而树结构保证每个 `ExprId` 只有一个爹 ⇒ 这个映射是**单射**，信息挂在 expr 上不会串。代价是语义上别扭：「这条语句的绑定」挂在「它的初始化器」上。
-   - **回归信号**：若语义阶段发现这条退路累积出别扭，那就是加回 `StmtId` 的信号（成本 = 改 `Block.stmts` 的类型 + parser 里 push/pop）。
-2. **`Block` 和 `Expr` 分家也是选择。** Rust 里 `BlockExpression` 本身就是表达式，合并成 5 个 arena 也说得通。分出来是因为函数体、`if`、`while`、`loop` 都要块，走 `ExprId` 就得每次包一层 `ExprKind::Block`。
-3. **`Path` 进 arena 靠判据 D，不是「和 `Stmt` 一样顺手留着」**（表格里那一行）。B 它满足（4 个不同的爹：表达式路径、类型路径、常量路径、`impl` 目标）但 B 推不出 arena；A 由 `Vec<TypeId>`（`GenericArgs.types`）满足；没有任何侧表索引它 ⇒ **三条老判据一条理由都不给它**。给理由的是 D：本体 32 字节，而它的三个宿主全是**枚举变体**（`ExprKind::Struct{path}`、`TypeKind::Path`、`ConstValueKind::Path`），内联就按 max-of-variants 撑大整个枚举——`ExprKind` 56→80（+43%，而它是最热的节点）、`TypeKind` 24→40、`ConstValueKind` 32→40。
-   - **它和 `Stmt` 差的那个量**：判据 D 看的是**内联目标是 `Vec` 还是枚举变体**。`Stmt` 内联进 `Block.stmts: Vec<Stmt>`，而 `Vec` 的元素大小不影响宿主大小（头固定 24 字节）⇒ **零代价**，所以砍它划算；`Path` 无处可躲，只能进枚举变体 ⇒ **有代价**，所以不砍。（尺寸按 Rust 布局手算；结论的方向不依赖具体数字。）
-   - 真正过度表达的是 `Vec<PathExprSegment>`——语义上只用得到 ≤2 段（见 `spec-mapping.md` §2.8）。但**固定形状更糟**：`PathExprSegment` 本体 56 字节（`PathIdentSegment` 12 + `Option<GenericArgs>` 32 + `span` 8），固定两段就是 ≈112 字节，而 `Vec` 头只有 24。⇒ 照抄语法的 `Vec` 反而更省。
-
-**没进 arena 的**：
-
-| 类别 | 例子 | 为什么 |
-|---|---|---|
-| 叶子 | `Name`、整数字面量、运算符 | 没有结构可展开，当字段存（`Name` / `Span` / 枚举标签） |
-| 只有一个爹的固定小包 | `Param`、`FieldDef`、`PathExprSegment`、`Lit`、`FieldInit`、**`Stmt`** | 内联在爹的字段里，给全局下标没有收益 |
-| 递归但整棵丢弃 | `UseTree` / `UsePath` | 见下 |
-
-**`PathIdentSegment` 为什么不单开第 7 个 arena**（`Path` 那条路的岔口）：它确实满足判据 B（`PathExprSegment.name` 与 `Method.name` 两个爹），但 §1.2.2.1 开头已经说清 **B 推不出 arena**——「具名结构体内联在爹的字段里」同样满足 B。判据 A 由 `GenericArgs.types: Vec<TypeId>` 打断、没有侧表索引它（C 不成立），而 D 的前提是「内联进**枚举变体**」：它 12 字节，作为 `PathExprSegment` 的字段和 `ExprKind::Method` 的载荷分别内联，两种情形都不构成「把本体塞进枚举」的代价。⇒ 四条判据一条都不给它，**内联**是对的。
-
-⚠ 反过来，`PathExprSegment` 本体 56 字节**不能**内联进 `ExprKind::Method`（那会让 `ExprKind` 56→104）。所以「方法名存什么」这个问题上，**能内联的只有内层那一级**——这正是选 `PathIdentSegment` 而不是 `PathExprSegment`/`PathId` 的量化依据（见 §1.2.2 的对照表）。
-
-##### 1.2.2.2 解析完就丢的两类（第三类其实是拒掉）
-
-**「不建节点」和「不解析」是两回事**。规范明确允许**解析完就丢**的只有**两类**（`grammar.md` 的 "Syntax that may be discarded after parsing"）：`use` 和生命周期。这两类语法必须完整走一遍，否则负例测试里的畸形写法会被接受；但走完之后不留任何**可达**节点。
-
-⚠ **「可达」这个词是必要的**（2026-09-22 补）：`parse_type_root` 之类会顺手写 arena（`push_type`），所以丢掉返回值之后，arena 里会留下**从根不可达**的孤儿节点。`WhereClauseItem -> Type ':' TypeParamBounds?` 里那个 `Type` 就是第一处：它必须**真解析**（`Foo::Bar` 里的 `::` 会骗过「扫到 `:` 为止」的土办法），但结果不回填 AST ⇒ `ast.types` 里多一个孤儿。**这是设计允许的**——AST 由「从 `ast.root` / `entry_root` 可达」定义，arena 只是池子；不做回滚（要同时截 `types`/`paths`/`consts`，多一个不变量要守，只省几个字节）。⇒ 将来建 `Tables` 的 `types` 侧表时**按可达性填**，孤儿槽留空，**别写 `assert!(全填满)`**。真需要回滚的场合是前瞻试解析（try A，失败回退试 B），那天再建。
-
-| 丢什么 | 依据 | 落了什么 |
-|---|---|---|
-| **`use` 整条声明** | §2.2 | `ItemKind` 没有 `Use` 变体；`parse_use()` 返回 `Result<(), FrontendError>`；`parse_item()` 返回 `Result<Option<ItemId>, _>`（`Ok(None)` 只在 use 那一支） |
-| **生命周期**（泛型参数、`WhereClause`、`&'a T`、`&'a self` 里的 `'a`） | §2.4 | `ItemKind::Fn` 没有 generics / where 字段；`TypeKind::Ref` 与 `Receiver` 都没有 lifetime 字段 |
-
-**为什么生命周期可以就这么丢**：规范的原话是「Lifetime syntax is supported, but its **validity is guaranteed rather than checked**」，并且明说非法生命周期「is undefined behavior and appears in **no positive, negative, or performance test**」。⇒ 丢掉不是偷懒，是**完整**的处理——留着字段反而要求你写一个永远不会被考的检查器。
-
-判据是**「这个信息会不会影响一个必须报的错误、或必须产生的行为」**。对照着看 `Param`：`mut` 留了、lifetime 没留，因为 place 可变性错误**在**负例测试里（`spec-mapping.md` §4）。
-
-⚠ **注意一个不对称**：泛型**实参**保留类型、丢掉生命周期——`Vec<i32>` → `GenericArgs { types: Vec<TypeId> }`，`Vec<'a>` 里的 `'a` 丢。因为 `i32` 影响类型推导和 IR，`'a` 不影响。
-
-**第三类：属性——这一类是拒掉，不是丢弃**（`grammar.md` 只列了两类）。规范支持的属性语法**只有一个**：`#[derive(...)]`，且只允许出现在顶层具名 struct 之前；`#![...]`、其他属性名、其他位置上的属性都是**子集外语法**，属于必须报错的负例。所以 `parse_item()` 在这里返回 `Err` 而不是 `Ok(None)`，AST 里只留 `ItemKind::Struct` 的 `derives`。
-
-省下的是**下游的死分支**：`ItemKind` 里没有 `Use`，lowering 的 `match` 就不需要为「永远不产出 IR 的变体」写一支。这和 §5.1「让 `walk_stmt(ast, expr_id)` 直接编译不过」是同一个思路——让类型携带不变式。代价是将来真要支持导入得把变体加回来，而 Rx 是单文件编译，这个「将来」不会来。
-
-#### 1.2.3 语义层的 side table（阶段二，形状先定）
-
-```rust
-pub struct Tables {
-    pub expr_ty:    Vec<Option<TyId>>,     // 与 ast.exprs 同序同长
-    pub expr_cat:   Vec<Category>,         // Place | Value
-    pub resolutions:Vec<Option<Res>>,      // 名字解析结果
-    pub coercions:  Vec<Option<Coercion>>, // ★ 不进 AST
-    pub block_scope:Vec<ScopeId>,          // 与 ast.blocks 同序
-    pub item_sig:   Vec<ItemSig>,
-}
-```
-
-**AST 建完就定长**（parser 一返回就不再增删节点）⇒ 侧表与对应 arena 同序同长，按 id 稠密索引。给 `Vec` 实现 `Index<ExprId>` 后侧表读起来像数组（`tables.expr_ty[e]`）。`TyId` 也是 arena（`types: Vec<TyKind>`），与 AST 同一套习惯。
-
-### 1.3 组件之间怎么交互
-
-#### 1.3.1 调用链
+**调用链**：
 
 ```
 main()
  └ frontend::parser::parse_crate(src: &[u8]) -> Result<Ast, FrontendError>
      ├ lexer::lex_all(src) -> Result<Vec<Token>, LexError>     ← 词法错误在这里就可能终止
-     └ Parser::parse_items()                                   ← 内部：parse_item* + expect(Eof)
+     └ Parser::parse_items()                                   ← parse_item* 循环 + expect(Eof) 收尾
 ```
 
-```rust
-pub fn parse_crate(src: &[u8]) -> Result<Ast, FrontendError> {
-    let mut p = Parser::new(src, lexer::lex_all(src)?);  // LexError 经 From 折成 FrontendError
-    p.parse_items()?;                                    // Item*
-    p.expect(TokenKind::Eof)?;                           // ★ 强制消费完整个 token 流
-    Ok(p.into_ast())
-}
-```
+**`parse_crate` 必须吃掉 `Eof`**（`Crate -> Item*` 本身不含 EOF）——文件尾部的垃圾 token 否则会被静默忽略，而负例测试会考。
 
-**为什么必须吃掉 `Eof`**：`Crate -> Item*` 本身不含 EOF（`crates-and-source-files.md`），少了这一步，文件尾部的垃圾 token 会被静默忽略——而负例测试会考。
-
-#### 1.3.2 所有权与可变性
+**所有权与可变性**：
 
 | 数据 | 谁创建 | 谁拥有 | 可变性 | 活到什么时候 |
 |---|---|---|---|---|
@@ -651,173 +233,198 @@ pub fn parse_crate(src: &[u8]) -> Result<Ast, FrontendError> {
 | `Ast` + 各 arena | `Parser.ast` | `Parser` → 移交给 sema | parse 期写，之后只读 | 阶段二、三 |
 | `LexError` / `FrontendError` | lexer / parser | 按值传递 | — | `main` 打印完 `exit(1)` |
 
-**为什么 `Parser` 要自己拥有 `Vec<Token>`**（而不是 driver 持有、parser 借 `&mut Vec<Token>`）：切分是**唯一**会改写 token 的地方，所有权应该跟着改写者走。若 driver 也持有一份可变引用，driver 手里就会留下一份**被切过的 token 流**——之后任何 dump 都会看到 `Gt(19..20)` 这种「缺了头一个字节」的假 token，而它根本不是词法器的输出。
-
-**为什么 `Ast` 不持有 `src`**：`parse_crate` 的返回类型是 `Ast`、**没有生命周期参数**，这就是「AST 只记位置、不记文本」这条约定的类型化表达。谁要文本，谁把 `(&Ast, &[u8])` 一起带上——AST 打印器、sema 诊断都照此。
-
-**为什么输入是 `&[u8]` 而不是 `&str`**：规范保证 7-bit ASCII（`input-format.md`），span 就是字节偏移，`pos` 直接当 `src` 的下标用，不需要 `Vec<char>`，也不需要任何 UTF-8 解码。
-
-#### 1.3.3 分层规则（一句话）
+**分层规则**（一句话；三个反例见 [`arch-phase1.md`](arch-phase1.md) §1.1.1）：
 
 > **任何解析判定只许看 `TokenKind` 与 `Span`（是否相等、谁前谁后）；需要词素文本时用 `&src[span.start..span.end]` 现切，且只许流向报错与打印，绝不回流成判定。**
+**这条只约束 parser**：它从不比较名字（`Name` 是产出的值，不是读的值）⇒ **名字比较的唯一场所是 sema**（§2.2.1 的 `Sema::text`）。
 
-三个例子：❌ 判「这是不是 `i32` 类型」不能切文本比字符串——内置名的保护是**命名空间规则**（`identifiers.md`：`i32` / `Vec` / `Clone` 在词法上就是普通标识符），必须留给名字解析；❌ 整数范围不能在前端判——`TokenKind::IntLiteral` 无载荷，规范明说不要求装进宿主整数，范围检查是 UB、归语义阶段；✅ 报错里点名「期望 `,`，实际是保留字 `box`」——`box` 这三个字节只能从 span 现切，因为 13 个 reserved 关键字塌成了一个无载荷的 `TokenKind::Reserved`。
-
-**这条只约束 parser**，而它恰好有一个干净的推论：**parser 从不比较名字**——它的判定全在 `TokenKind` / `Span` 这一层（`Name` 是它**产出**的值，不是它**读**的值）。⇒ **名字比较的唯一场所是 sema 的 `Names`**（§5.2.1），切文本这件事因此被关在一个模块里，不会渗回前端。
-
-#### 1.3.4 错误流
+**错误流**：
 
 | 阶段 | 错误类型 | 定义在 | 从哪冒出来 | 谁渲染 | 退出码 |
 |---|---|---|---|---|---|
 | 词法 | `LexError { kind: LexErrorKind, span }` | `frontend/error.rs` | `next_token` → `lex_all` | `main`：`locate()` + `Display` | 1 |
 | 前端出口 | `FrontendError { kind: FrontendErrorKind, span }` | `frontend/error.rs` | `parse_crate` 里用 `?` 折进 | 同上 | 1 |
-| 语义 | `SemaError`（同形状） | `sema/` | 阶段二 | 同上 | 1 |
+| 语义 | `SemError { kind: SemErrorKind, span }` | `sema/error.rs` | `sema::check` | 同上（走 `die()`） | 1 |
+
+`FrontendError { kind: FrontendErrorKind, span }`，`FrontendErrorKind` 只有 `Lex` / `Syntax` 两支，`From<LexError>` 一行搬 kind 与 span。
+
+**`SyntaxErrorKind` 八个变体**（规范没有语法错误清单，分类自定）：拆变体的标准是「**消息形状不同**」而非「语法位置不同」；定义在 `frontend/error.rs`，各变体的触发点见 [`arch-phase1.md`](arch-phase1.md) §1.3.4。
+
+**形状是扁平的 `{kind, span}`**（不是嵌套的 `enum { Lex(LexError), Syntax(SyntaxError) }`）：driver 一处 `match` 出消息，阶段二加 `Sema` 分支不用改 driver；**`SemError` 照此定义**。**渲染入口是 `message(&self, src: &[u8]) -> String`，不是 `Display`**——「实际是 `X`」要切 `src[span]`，`Display` 拿不到源码；空 span（`Eof`）特判成「文件结束」。
+
+**首个语法错误立即返回**（不做恢复）⇒ `Parser` 不需要 `errors` 字段，测试能直接断言错误值。渲染只在 `main.rs`：`{path}:{line}:{col}: {消息}` + `exit(1)`。
+
+### 1.2 维护的数据结构
+
+分三层看：**每个部件自己的状态**（§1.2.1）、**部件之间传的值**（§1.2.2）、**语义层的侧表**（§1.2.3，属阶段二，形状先定）。
+
+#### 1.2.1 每个部件持有什么
+
+**Lexer**（`src/frontend/lexer.rs`）全部状态就两个字段：`src: &'a [u8]`（唯一的字节来源）与 `pos: usize`（下一个待扫描字节）。注释嵌套深度、整数进制、各 `lex_*` 里的 `start` 都是**局部变量**，每个 token 的扫描自包含。
+
+⚠ 两条下游踩得到的不变式：① `pos <= src.len()` **并不严格成立**（未终止块注释那一支会把 `pos` 推过末尾）⇒ **错误 span 必须 `min(src.len())` clamp**，否则渲染时切 `src[start..end]` 会 panic；② **`Eof` 不推进 `pos`** ⇒「什么时候停」是 `lex_all` 循环里一个显式的 `if eof`（§1.3.1）。
+
+**Parser**（`src/frontend/parser.rs`）四个字段：`src`（只给诊断取词，判定一律不看它，§1.1 分层规则）、`toks: Vec<Token>`（全量 token + 尾部 `Eof`，**必须自有且可变**——切分要原地改写 `toks[pos]`，§1.3.3）、`pos`（游标 = 下一个待消费的 token 下标，单调不减 ⇒ 对 token 流单向扫描、永不回头）、`ast`（边解析边填的 arena，结束时一句 `Ok(self.ast)` 整体移出）。
+
+`toks` 末尾恰好一个 `Eof` ⇒ 游标永不越界；`bump` **停在哨兵 `Eof` 上不再前进**（与 lexer「`Eof` 不推进」是同一条规则的两半）⇒ 每个循环都得自己拿 `at(Eof)` / `expect` 收口。
+
+#### 1.2.2 词法层与语法层的值
+
+**词法层**（无载荷）：`Token { kind: TokenKind, span }`、`Span { start: u32, end: u32 }`（字节偏移；源码远小于 4 GiB，u32 够用）。`TokenKind` 是**纯标签、不带值**：`flag` 这个名字和 `1` 这个数字**不存**，只存位置，需要文本时 `&src[span]` 现切。`Eof` 是**本实现加的哨兵**（规范的 `@root Token` 里没有），span 为空，作为「流结束」的**普通值**（而不是 `Option`）。
+
+**语法层**（arena）：
 
 ```rust
-pub enum FrontendErrorKind { Lex(LexErrorKind), Syntax(SyntaxErrorKind) }
-pub struct FrontendError { pub kind: FrontendErrorKind, pub span: Span }
-impl From<LexError> for FrontendError { /* 一行：搬 kind 与 span */ }
-```
-
-**`SyntaxErrorKind` 的全部变体**（规范里没有语法错误清单——搜遍全文只有 `undefined-behavior.md` 说「子集外的形式不受支持」，所以这份分类是我们自己定的）：
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyntaxErrorKind {
-    Expected(TokenKind),   // expect(k) 失败。span 指向**实际那个 token**
-    ExpectedExpression,    // 这个位置要表达式，当前 token 起不了任何表达式
-    ExpectedType,          // 要一个类型
-    ExpectedItem,          // 要一条 item（use / fn / struct / const / impl）
-    ChainedComparison,     // a < b < c：规范要求加括号消歧
-    ReservedKeyword,       // match / enum / trait / pub …（子集外，无载荷）
+pub struct Ast {
+    pub items:  Vec<Item>,       // 池子：顶层项 + 所有 impl 的关联项（见下）
+    pub root:   Vec<ItemId>,     // 顶层列表：遍历程序入口读这个，不是 items
+    pub blocks: Vec<Block>,
+    pub stmts:  Vec<Stmt>,
+    pub exprs:  Vec<Expr>,
+    pub types:  Vec<Type>,
+    pub paths:  Vec<Path>,
+    pub consts: Vec<ConstValue>, // 常量语法：只在 3 处出现，从不出现在表达式里
+    pub entry_root: Option<EntryRoot>,  // 碎片入口的根；parse_crate 下是 None（§1.3.6）
 }
 ```
 
-各变体的触发点：`Expected(Semi)` 由 `expect` 报（`let x = 1 }`）；`Expected(Eof)` 由五个入口共用的收尾 `finish` 报（`fn main() {} x`）；`ExpectedExpression` / `ExpectedType` / `ExpectedItem` 分别由 `parse_atom` / `parse_type_root` / `parse_item` 的分派失败报（`let x = ;` / `let x: = 1;` / 顶层裸 `42`）——⚠ `parse_type_root` 那格 2026-09-23 才兑现：原先兜底无条件委托给 `parse_path`，`let x: = 1;` 报的是 `Expected(Ident)`，这个变体根本构造不出来。现在 `Ident`/`self`/`Self` 三支单列，兜底才真的是"起不了类型"；`ChainedComparison` 由爬升循环报（§1.5.2）；`ReservedKeyword` 由原子或 item 分派看到 `Reserved` 时报（`match x {}`）。
+**七个 id 各是一个独立 newtype**（`ExprId` / `BlockId` / `StmtId` / `ItemId` / `TypeId` / `PathId` / `ConstValueId`）：形状相同、互不相通 ⇒「把 `BlockId` 传给要 `ExprId` 的地方」是**编译错误**（防手滑，不防两个 `Ast` 之间混用）。
 
-> ⚠ **`TypeArgsOnMethodSegment` 这个变体 2026-09-23 删掉了**（原文列在表里，是错的）。理由：它根本不是**语法**错误。判分口径看的是**编译**是否成功，而 `v.len::<i32>();` 这条负例住在
-> `semantic/invalid-impls-and-generics/`——parser 必须**放行**；同时 `parser/accept/method_call_expr-ae960be064.rx`
-> = `y.bar::<T>(1, 2,)` 是 **parse 正例**。⇒ 它归**语义**阶段的错误类型管，而那个枚举还不存在。
-> 语法层在这里只做一件事：`ExprKind::Method.has_type_args: bool` **照收记下来**；带实参却不跟 `(`
-> 时报 `Expected(LParen)`（两个分支都要求 `(`）。详见 [`spec-mapping.md`](spec-mapping.md) §2.10 的 ⚠。
+**`items` 和 `root` 是两个字段**：`impl` 的关联项也是 `Item`、和顶层项进同一个池子 ⇒「池子」和「顶层列表」不再是同一个东西（`fn a(){} impl S{fn m(){}} fn b(){}` ⇒ `items = [a, m, b]` 而 `root = [a, b]`）。**两类不进 `root`**：impl 的关联项**占** `items` 的槽位但可达性走 `Impl` 节点，`use` 声明解析完整条丢弃、**连槽位都不占**。
 
-三条设计依据：
+**下游遍历程序入口必须读 `root`，不是 `items`**——`items` 里混着 impl 的关联项。
 
-1. **拆变体的标准是「消息形状不同」**，不是「语法位置不同」。`Expected(TokenKind)` 能点名具体要哪个 token，另外几个只能说出一**类**——形状不同，所以必须分开。反过来，93 条产生式里所有「缺个具体符号」的错都塌进 `Expected` 一个变体，不按产生式拆。
-2. **负例测试只判「拒没拒」**（`plan.md` §3.1 Q2 待课程确认），所以这份分类的用途是**给人看**，不是给测试分辨——够用就好，别按产生式铺开。
-3. **`ReservedKeyword` 无载荷，渲染时切 span 点名**——13 个 reserved 关键字在词法层塌成一个 `TokenKind::Reserved`，parser 分不出是哪个，只能靠 `&src[span]` 现切。这与 §1.3.3 那条「报错里点名 `box` 只能靠 span 现切」是同一个手法。
+**节点定义三条模板**（施工图是 [`spec-mapping.md`](spec-mapping.md) §2 的产生式映射）：
 
-**为什么没有单独的 `TrailingTokens`**：`Expected(Eof)` 就是它（`parse_crate` 收尾那个 `expect(Eof)`，§1.3.1）。**为什么是扁平的 `{kind, span}`，而不是嵌套的 `enum { Lex(LexError), Syntax(SyntaxError) }`**：driver 一处 `match` 就能出消息；「`kind + span` 形状照搬」这条约定字面成立；阶段二加 `Sema` 分支时 driver 一个字都不用改（嵌套 enum 则要两层 match 才拿得到 span）。`span` 直接是 `pub` 字段，不另给 `fn span()`——那只是同一个东西的第二种写法。
+1. **子节点一律 `Id`**——递归全部由 id 打断，节点定义里**不出现 `Box`**。自查信号：某处被迫写 `Box` ⇒ 那里漏了一个 id。
+2. **名字/字面量一律不存 `String`**，要文本时切 `src`；名字包一层 `Name`，字面量是裸 `Span`。
+3. **`span` 不塞进每个变体**，是外层包装 struct 的一个字段。
 
-**渲染入口是 `FrontendError::message(&self, src: &[u8]) -> String`，不是 `Display`**：消息里那半句「实际是 `X`」得切 `src[span]` 才知道，而 `Display` 拿不到源码。所以 `Display` 只实现在两个 **kind** 上（说静态那半句），完整句子在 `message` 里拼；`FrontendError` 本身不实现 `Display`。空 span（`Eof`）由内部 `snippet()` 特判成「文件结束」，否则会渲染成「实际是 ``」。**首个语法错误立即返回**（不做错误恢复），三条收益：
+**规范产生式与 AST 变体不是一一对应**：表达式的 37 个具名产生式压成 `ExprKind` 的 **25 个变体**（载荷形状不同的成为变体；19 个中缀运算符压成一个 `Binary { op }`；纯语法分层消失）。两处**不压缩**：括号必须留成 `Paren`；前缀 5 个运算符是 `Neg` / `Not` / `Deref` / `Ref` 四个变体——它们的语义签名三种都不一样（`-`/`!` 是值→值、`*` 的结果是 **place**、`&`/`&mut` 吃 place）。`ExprKind` 的 **48** 字节由 `ast.rs` 的尺寸断言测试守着。
 
-1. `Parser` 不需要 `errors: Vec<...>` 字段——§1.2.1 的字段表才这么短。
-2. 类型上是 `Result` + 库代码不打印 ⇒ **测试能直接断言错误值**，不必去抓 stderr。
-3. 类型里不存在「恢复用的假节点」，AST 不会混进凭空造出来的节点。
+**各种节点的形状**（完整定义在 [`src/frontend/ast.rs`](../src/frontend/ast.rs)，这里只记要点）：
 
-⇒ 代价是一次只报一个错。规范没要求多报，负例测试只看「是否被拒 + 非 0 退出」。渲染只在 `main.rs`：`{path}:{line}:{col}: {消息}` + `exit(1)`。
+| 节点 | 形状要点 |
+|---|---|
+| `Item` | `Fn { name, has_generic_params, recv: Option<Receiver>, params, ret: Option<TypeId>, body }`、`Struct { derives, name, fields }`、`Const { name, ty, const_value_id }`、`Impl { target, items: Vec<ItemId> }`；**没有 `Use`** |
+| `Stmt` | `Empty` / `Let { binding, mutable, ty: Option<TypeId>, init }` / `Expr { expr, semi: bool }`——`semi` 必须如实记（§1.3.5） |
+| `Block` | `{ stmts: Vec<StmtId>, span }`，**没有 `tail` 字段**；`Block::tail()` 从 `stmts` 现算 |
+| `Expr` | 25 个变体；`else_branch: Option<ExprId>`（`else if` 链要求 `else` 后跟表达式），而 `then_block` 是 `BlockId`——这个不对称是忠实于规范 |
+| `Type` | 只有 5 支：`Paren` / `Unit` / `Path` / `Ref { mutable, inner }` / `Array { elem, len }` |
+| `Path` | `segments: Vec<PathExprSegment>`；`PathIdentSegment` 三支 `Ident(Name)` / `SelfValue` / `SelfType` 必须可区分；`GenericArgs` 只留类型实参（生命周期实参已丢） |
+| `ConstValue` | **另一套受限语法**（`Int` / `Bool` / `Path` / `Neg` / `Paren`），不复用 `Expr`——`const A: i32 = 1 + 2;` 必须报错，而 `ConstValue` 里 `1 + 2` **根本无法表达**：**不变式写在类型里** |
+| `Name` | 名字的统一载体，**故意不派生 `PartialEq`/`Eq`/`Hash`** ⇒「按位置比名字」（两个 `foo` 写在不同行就判不相等）是**编译错误**，真正的比较走 sema（§2.2.1） |
 
-### 1.4 运行机制 · Lexer
+**两条是 parser 保证、不是类型保证**（sema 可以依赖但要知情）：① `ConstValueKind::Neg` 的操作数不会是 `Neg`（`--1` 非法，`parse_const_value()` 挡的，有 `debug_assert`）；② **`Magnitude` 没有自己的类型**，所以「常量位置只允许 `-`」也是 parser 挡的。
 
-对外只有 `lex_all(src) -> Result<Vec<Token>, LexError>` 一个函数：循环调私有的 `next_token` 直到收到 `Eof`，收成 `Vec` 返回。
+**span 契约**：每个节点的 span **落在源码内**、且**子节点 span 含于父节点**；**包装节点**（`ExprKind::Block`、`StmtKind::Expr`）抄内层 span，不自己编；`span_from(mark) = [toks[mark].span.start, toks[pos-1].span.end)`（覆盖**已消费的 token**，不是 token 之间的空白；一个都没吃时 `end = start`）；**`mark()` 在吃第一个 token 之前取、`span_from(m)` 在吃完最后一个之后取**；**单 token 的节点不用 `mark`/`span_from`**，直接用 `expect`/`bump` 返回的 `Token`。`parse_item` 的 `mark()` 要提到**属性之前**（`#[derive(...)]` 是 item 的一部分）。
 
-`next_token() -> Result<Token, LexError>` 是循环体里的那一步，每轮三步：**跳 trivia → 看首字节分派 → 最长匹配**；走到缓冲区末尾发 `Eof`（本实现加的哨兵，§1.2.2）。每轮的扫描自包含，跨轮状态只有 `pos` 一个（§1.2.1）。
+**没进 arena 的**：叶子（`Name`、整数字面量、运算符）与只有一个爹的固定小包（`Param`、`FieldDef`、`PathExprSegment`、`Lit`、`FieldInit`、`Receiver`）内联在爹的字段里——给全局下标没有收益；`UseTree` / `UsePath` 整棵丢弃。
 
-**终止靠 `lex_all` 里一个显式的 `if eof`，不靠 lexer 自己停**——`Eof` 不推进 `pos`，再调还是 `Eof`（§1.2.1）。这个 `if` 早先被抄了三份（driver、测试助手、以及没抽出来的 `lex_all`），现在只剩一份。
+**解析完就丢的两类**（规范 `grammar.md` 明许，但语法必须完整走一遍，否则负例里的畸形写法会被接受）：`use` 整条声明（`ItemKind` 没有 `Use` 变体，`parse_item()` 返回 `Ok(None)`）与**生命周期**（泛型参数、`WhereClause`、`&'a T`、`&'a self`）。判据是**「这个信息会不会影响一个必须报的错误、或必须产生的行为」**——`Param.mut` 留了（place 可变性错误**在**负例测试里）、lifetime 没留（规范说非法生命周期不出现在任何正/负/性能测试里）。
 
-规则细节（空白、嵌套注释、整数字面量后缀、44 标点、38+13 关键字）见[规范](https://acmclasscourse-2025.github.io/rx-compiler-specification/)与 `lexer.rs`，**本文不重复**。
+**一个例外**：`ItemKind::Fn.has_generic_params: bool`——`rej-main-cannot-have-generic-parameters.rx` 考「`main` 不许带泛型参数」，而生命周期参数被丢弃后 sema **看不见**那个 `<`。这不是「生命周期合法性」，是 **`main` 的形状**，落在必须报错的一侧 ⇒ 解析时记一个 bit，只给 entry 检查用。
 
-两条与上下游咬合的约定：
+**`ast.types` 里会有从根不可达的孤儿**（`WhereClauseItem -> Type ':' TypeParamBounds?` 里那个 `Type` 必须真解析，丢掉返回值后节点仍留在池子里）⇒ **AST 由「从 `ast.root` / `entry_root` 可达」定义，arena 只是池子**；建侧表时**按可达性填**，孤儿槽留空，**别写「全填满」断言**。
 
-- **非 `Eof` 的 token 必须推进**（`span.end > span.start`）——这是 lexer 对外的唯一保证。失效模式是**挂死**而不是报错：`lex_all` 的收集循环与 parser 的 `bump` 都靠它才不空转（`lex_all` 里有 `debug_assert!` 守着）。⇒ 上下文切分（§1.5.1）必须保证切完的那一格仍是非空 token。
-- **输入是已归一化的字节缓冲区**：CRLF→LF 的单遍归一在 lexer 启动**之前**由 driver 做完（§5.2）。规范列 4 个分隔符（`whitespace.md`，其中 CRLF 是两字节），归一后扫描器只需认 3 个单字节空白；**裸 CR / VT / FF 不是空白，是非法字符**。
+**第三类：属性——这一类是拒掉，不是丢弃**。规范支持的属性语法**只有一个**：`#[derive(...)]`，且只允许出现在顶层具名 struct 之前；`#![...]`、其他属性名、其他位置都是**子集外语法**，属于必须报错的负例 ⇒ `parse_item()` 在这里返回 `Err`。`Derive` 是四变体的**闭集枚举**（不是 `Name`；派生 `PartialEq`/`Eq` ⇒ 相等就是「同一个 trait」），`derive` 是**上下文关键字**（不做成 `TokenKind`）。三种「非法 derive」分两处报：名字不在闭集归 parser，重复与能力不满足归语义阶段。
 
-**关键取舍**：lexer **一次性**把全部 token 收进 `Vec<Token>`，而不是流式喂给 parser。唯一必需的理由是 §1.5.1 的 token 切分（要能回头改写已产出的 token）；顺带好处是词法错误在 parser 启动前一次报完。
+#### 1.2.3 语义层的侧表（阶段二）
 
-### 1.5 运行机制 · Parser
+```rust
+pub struct Checked {              // sema::check 的返回值：结论 + 类型布局，一起交给后端
+    pub tables: Tables,
+    pub tys: TyArena,
+}
 
-**核心是一个游标**（`pos` 指向 `Vec<Token>`）+ **约 60 个互相递归的 `parse_*` 函数**：从左到右单向走、不回头——这就是「递归下降」；每个语法产生式对应一个函数，清单见 [`spec-mapping.md`](spec-mapping.md) §2。
+pub struct Tables {
+    pub exprs: Vec<ExprInfo>,     // 与 ast.exprs 同序同长：一个表达式一行结论
+    pub let_tys: Vec<Option<TyId>>, // 与 ast.stmts 同序同长：每个 let 槽的类型（lowering 开槽用；M1.2 落）
+    pub const_values: HashMap<ItemId, (ConstVal, TyId)>, // 常量项的值与类型
+}
+
+pub struct ExprInfo {
+    pub res: Option<ValueSym>,      // 名字解析结果（解析到哪个绑定 / 函数 / 常量 / 内置）
+    pub ty_id: Option<TyId>,        // 定型结论；None 只表示「还没写」
+    pub coercion: Option<Coercion>, // 该处插入的隐式转换（随 M1 各 coercion 位点加）
+    pub cat: Category,              // Place | Value（M1.5 各臂顺手填）
+}
+```
+
+**当前代码里只有前两个字段**（`res` / `ty_id`）：`cat` / `coercion` 是 M1 的目标形状，随各自的臂落地时再加（见 [`plan.md`](plan.md) §0.1）。
+
+**粒度是一行结论**：名字解析、类型、转换、place 判定**都在同一行**，按表达式 id 读一次就拿到全部（`resolutions` / `expr_cat` / `coercions` 这类分表不再单列）。`ValueSym` 是名字解析的四种归宿：局部绑定（`Local`）、函数（`Fn`）、常量项（`Const`）、编译器内置（`Builtin`——`println_i32` 这类没有源码 `ItemId` 的函数，以及 `Box` / `Vec` 的关联函数）。**结构体成员也是这四种之一**：`assoc[sid]` 里装的就是 `ValueSym`，但**只装源码 `impl` 项**（方法落 `Fn`、关联常量落 `Const`）；`Box` / `Vec` 的内建成员与 derive 出来的 `clone` **不进 `assoc`**，走方法查找候选链上并列的那张内建表。
+
+**`item_sig`（`ItemId → FnSig { recv, params, ret }`）留在 `Sema` 内部**，不进 `Tables`：读它的只有 sema 自己（调用检查、`self`、参数类型）；后端靠 `ExprInfo.res` 知道"调的是谁"，靠每行 `ty_id` 知道类型。
+
+**没有块表**：`ast.blocks` 与 `ast.exprs` 是两个独立的 arena（块 id 与表达式 id 数值上会撞车），块类型用 `check_block` 的返回值向上传、不落表；lowering 若真要按 `BlockId` 查类型，再加一行 `blocks: Vec<Option<TyId>>` 即可。
+
+**AST 建完就定长**（parser 一返回就不再增删节点）⇒ 侧表与对应 arena 同序同长，按 id 稠密索引（给 `Vec` 实现 `Index<ExprId>` 后读起来像数组）。⚠ **侧表必须按 id 写下标，不能 push**：parser 建节点是**后序**（子节点先于父节点进 arena），sema 走 AST 是**前序**——push 会让表**静默错位**（不 panic，只是错）。`Tables::sized_like(ast)` 先按各 arena 的长度分配好，遍历时按下标写。
+
+### 1.3 运行机制
+
+#### 1.3.1 Lexer
+
+对外只有 `lex_all(src) -> Result<Vec<Token>, LexError>`：循环调私有的 `next_token` 直到收到 `Eof`——**终止靠循环里一个显式的 `if eof`**（`Eof` 不推进 `pos`，再调还是 `Eof`）。每轮三步：**跳 trivia → 看首字节分派 → 最长匹配**；跨轮状态只有 `pos`。
+
+**一次性返回 `Vec<Token>`**（不是流式喂给 parser）：切分要能回头改写已产出的 token（§1.3.3）；词法错误也在 parser 启动前一次报完。
+
+两条与上下游咬合的约定：**非 `Eof` 的 token 必须推进**（`span.end > span.start`）——失效模式是**挂死**而不是报错，`lex_all` 的收集循环与 parser 的 `bump` 都靠它才不空转；**输入是已归一化的字节缓冲区**（CRLF→LF 的单遍归一在 lexer 启动**之前**由 driver 做完；归一后只需认 3 个单字节空白，**裸 CR / VT / FF 不是空白，是非法字符**）。规则细节（空白、嵌套注释、字面量后缀、标点、关键字）见规范与 `lexer.rs`，本文不重复。
+
+#### 1.3.2 Parser 总览
+
+**核心是一个游标**（`pos` 指向 `Vec<Token>`）+ **49 个互相递归的 `parse_*` 函数**（46 个不同名字）：从左到右单向走、不回头——这就是「递归下降」；每个语法产生式对应一个函数，清单见 [`spec-mapping.md`](spec-mapping.md) §2。
 
 ```
 parse_function                 解析 fn main() { ... }
  └ parse_block                 解析 { ... }
     └ parse_stmt              解析一条语句
        └ parse_if              发现是 if，解析整个 if 表达式
-          ├ 条件                 parse_expr_bp(0, CONDITION)，无独立函数（§1.5.3）
+          ├ 条件                 parse_expr_bp(0, CONDITION)，无独立函数（§1.3.5）
           ├ parse_block        解析 { ... }     ← 又回到 parse_block
           └ parse_block                          ← 语法的嵌套 = 调用栈的嵌套
 ```
 
-纯递归下降只处理「一个产生式读一个 token」的部分。Rx 的语法里有四处会把朴素写法撑破——**下面四节就是这四个问题**：
+纯递归下降只处理「一个产生式读一个 token」的部分。Rx 的语法里有四处会把朴素写法撑破：
 
-| 现象 | 朴素写法为什么不够 | 机制 |
-|---|---|---|
-| **重复** | 参数列表、块内多条语句的长度不定 | 不需要额外机制，在 `parse_*` 里直接写 `while` 循环 |
-| **运算符优先级** | 15 个优先级逐层写函数 = 15 层调用链，且和优先级表一起膨胀 | **优先级爬升**（§1.5.2） |
-| **词法上的合并标点** | `>>` 被最长匹配成**一个** token，但 `Vec<Vec<i32>>` 要两个 `>` | **上下文标点切分**（§1.5.1） |
-| **表达式出现的位置** | 同一个 `if`，在语句位置 / 值位置 / 条件里 / struct 字面量里，边界各不相同 | **三条边界规则**（§1.5.3） |
-
-#### 1.5.1 上下文标点切分
-
-`>>` 是**一个** token，`Vec<Vec<i32>>` 里却要当成两个 `>` 一个一个吃。做法：token 已经全在 `Vec` 里，**直接改写那一格、游标不动**——
-
-```
-改写前  toks[8] = { kind: Shr, span: 18..20 }     // 文本 ">>"
-                       ↓ 消耗掉第一个 '>'
-改写后  toks[8] = { kind: Gt,  span: 19..20 }     // 文本 ">"
-```
-
-下次读 token 时自然看到 `Gt`。**这就是 lexer 必须一次性把 token 收进 `Vec<Token>`、不能流式喂给 parser 的唯一必需理由**（§1.4）；完整轨迹见 §1.6.2。
-
-分界是「**类型上下文 + 表达式前缀位置** vs **表达式中缀位置**」：类型里（`Vec<Vec<i32>>` 的闭合、`&&i32`、`as` 之后的 `<`）和表达式**前缀**位置的 `&&x`（借用，得到 `Ref{false}(Ref{false}(x))`）都切；表达式中缀位置的 `1 >> 2`、`a && b` 一律照普通 token 吃。正/负清单与 `Shl` 那处规范自相矛盾见 [`spec-mapping.md`](spec-mapping.md) §1.2 与 [`plan.md`](plan.md) §3.1 Q10。
-
-#### 1.5.2 优先级爬升
-
-逐层给 15 个优先级各写一个函数（`parse_add` 调 `parse_mul` 调 `parse_unary`…）能用，但函数数量和嵌套深度都跟着优先级表一起膨胀。**优先级爬升**把它压成**一个**函数：给每个中缀运算符一个**绑定力**（binding power），`parse_expr_bp(min_bp)` 读作「解析一个表达式，只吃掉绑定力 ≥ `min_bp` 的运算符」。
-
-**本实现给的数**：`bp = (15 − 组号) × 2` ⇒ `*` `/` `%`（第 5 组）是 **20**，`+` `-`（第 6 组）是 18，赋值（第 14 组）是 2。左结合者右边用 `bp + 1`，右结合者（赋值）右边用同一个 `bp`。分组表见 [`spec-mapping.md`](spec-mapping.md) §3（15 级，直接照抄规范，不用重新推导）。
-
-走 `1 + 2 * 3`（`+` 是 18，`*` 是 20）：
-
-| 步骤 | 发生什么 |
+| 现象 | 机制 |
 |---|---|
-| `parse_expr_bp(0)` | 读原子 `1`，看到 `+`（18 ≥ 0）→ 吃掉；右边用 `parse_expr_bp(19)`。**门槛 +1 = 让同级运算符不被右边吃掉 ⇒ 左结合** |
-| `parse_expr_bp(19)` | 读原子 `2`，看到 `*`（20 ≥ 19）→ 吃掉；右边用 `parse_expr_bp(21)` |
-| `parse_expr_bp(21)` | 读原子 `3`，后面没了 → 返回；回溯造出 `1 + (2 * 3)` ✅ |
+| 列表长度不定（参数、语句） | 不需要额外机制，在 `parse_*` 里直接写 `while` 循环 |
+| 运算符优先级（15 级） | **优先级爬升**（§1.3.4） |
+| 词法上的合并标点（`>>` 要当两个 `>`） | **上下文标点切分**（§1.3.3） |
+| 表达式出现的位置（语句 / 值 / 条件 / struct 字面量） | **三条边界规则**（§1.3.5） |
 
-四个容易写错的点与「不可链式比较」的实现见 [`spec-mapping.md`](spec-mapping.md) §3。**不可链式比较的实现 2026-09-23 订正过**：原文说"检查左边已建好的节点是不是比较表达式"（看 AST），实际用的是**爬升循环里的循环局部标志 `lhs_is_cmp`**（判据是 `bp == BP_CMP`，比较集合因此只有 `peek_infix` 一份）。括号之所以仍能解歧义，是因为 `(` 递归进一个**全新的** `expr_bp`、标志随栈帧丢掉——**不是**因为 `Paren` 节点挡住了检查。⇒ `Paren` 保留与否**不是这条规则要求的**（保留的真正理由见 [`spec-mapping.md`](spec-mapping.md) §3）。⚠ 这个标志**必须是循环局部**：做成 `Parser` 字段的话 `{ 1 < 2; 3 < 4; }` 里第二条语句会读到第一条留下的 `true`，合法程序被误拒。
+#### 1.3.3 上下文标点切分
 
-#### 1.5.3 三条边界规则
+`>>` 是**一个** token，`Vec<Vec<i32>>` 里却要当成两个 `>` 一个一个吃。做法：token 已经全在 `Vec` 里，**直接改写那一格、游标不动**——`toks[8] = { Shr, 18..20 }` 消耗掉第一个 `>` 后就地变成 `{ Gt, 19..20 }`，下次读 token 时自然看到 `Gt`。⇒ **切分把合并标点还原成了普通 token，`=` 这类位置不需要任何特殊处理**（`>>=` 会连切两次，随后 `expect(Eq)` 直接吃掉）。
+
+分界是「**类型上下文 + 表达式前缀位置** vs **表达式中缀位置**」：类型里（`Vec<Vec<i32>>` 的闭合、`&&i32`、`as` 之后的 `<`）和表达式**前缀**位置的 `&&x`（借用）都切；中缀位置的 `1 >> 2`、`a && b` 一律照普通 token 吃。正/负清单与 `Shl` 那处规范自相矛盾见 [`spec-mapping.md`](spec-mapping.md) §1.2 与 [`plan.md`](plan.md) §3.1 Q10。
+
+#### 1.3.4 优先级爬升
+
+**优先级爬升**把 15 个优先级压成**一个**函数：每个中缀运算符有一个**绑定力**（binding power），`parse_expr_bp(min_bp)` 读作「解析一个表达式，只吃掉绑定力 ≥ `min_bp` 的运算符」。本实现 `bp = (15 − 组号) × 2`（`*` `/` `%` 是 20，`+` `-` 是 18，赋值是 2）；左结合者右边用 `bp + 1`，右结合者（赋值）右边用同一个 `bp`。15 组表见 [`spec-mapping.md`](spec-mapping.md) §3（直接照抄规范，不用重新推导）。
+
+⚠ **不可链式比较**（`a < b < c` 必须报错）靠**爬升循环里的循环局部标志**实现，不是靠检查已建好的 AST 节点；这个标志**必须是循环局部**（做成字段会误拒合法程序——括号里递归进一个**全新的** `expr_bp`，标志随栈帧丢掉，`(a<b)<c` 该放行）。
+
+#### 1.3.5 三条边界规则
 
 同一个表达式出现在不同位置时，「到哪里为止」的规则不同。三条边界各解决一个歧义：
 
 | 规则 | 问题 | 解法 |
 |---|---|---|
-| **语句边界** | `if c {} -1;` 该读成 `(if c {}) - 1`，还是「语句 `if c {}`，然后 `-1`」？ | 同一段表达式代码**两个入口**：值位置无脑爬升；语句位置是「原子 + 后缀，**后缀跑完后若仍是块形式才不爬升**」。⚠ 判据是**后缀之后**的 lhs，不是原子——`{p}.x = 10;` 靠这条才活得下来 |
-| **块尾** | 块最后一个不带 `;` 的表达式是块的值——它算「语句」还是「值」？ | `parse_stmts` 只有一条规则：**停在 `}` 或 `Eof`**；`;` 的强制性由 `parse_expr_stmt` 事后判（三档见下）。**谁是块尾留给语义阶段派生**（见下） |
-| **条件边界** | `if flag { }` 的 `{` 是体块，还是结构体字面量 `flag {}`？ | 表达式解析的上下文限制 `forbid_structs`：`if` / `while` 的条件置它，其余位置不置。**按值传参，不做存/恢复** |
+| **语句边界** | `if c {} -1;` 该读成 `(if c {}) - 1`，还是「语句 `if c {}`，然后 `-1`」？ | 同一段表达式代码**两个入口**：值位置无脑爬升；语句位置是「原子 + 后缀，**后缀跑完后若仍是块形式才不爬升**」。判据是**后缀之后**的 lhs（`{p}.x = 10;` 靠这条才活得下来） |
+| **块尾** | 块最后一个不带 `;` 的表达式是块的值——它算「语句」还是「值」？ | `parse_stmts` 只有一条规则：**停在 `}` 或 `Eof`**；`;` 的强制性由 `parse_expr_stmt` 事后判（三档见下）。**谁是块尾留给语义阶段派生** |
+| **条件边界** | `if flag { }` 的 `{` 是体块，还是结构体字面量 `flag {}`？ | 上下文限制 `forbid_structs` / `prefer_stmt`：`if` / `while` 的条件置它，其余位置不置。**按值传参，不做存/恢复** |
 
-三条规则里只有**语句边界**改变了代码结构（同一条产生式两个入口），另两条都是**在已有代码上加一个开关或减一个字段**：
+只有**语句边界**改变了代码结构（同一条产生式两个入口），另两条都是在已有代码上加一个开关：上下文限制**按值传参**给 `parse_expr_bp(min_bp, r)`，于是「进一个普通表达式上下文」=「传 `VALUE` 常量」（`(` `[`、实参、数组元素、字段值、块体、`break`/`return` 的操作数全是这一条）；**`break` 是唯一与条件边界共用开关的**（`if break {}` 里 `{}` 留给 `if` 当体块，而 `loop { break { 9 }; }` 里 `{9}` 是 `break` 的值）；**运算符内部走 `r.sub()`**（语句性重置、条件限制继承），所以 `v = {1}&2;` 与 `&S {` 各自成立。
 
-- **条件边界**的两个限制（`forbid_structs` / `prefer_stmt`）**按值传参**给 `parse_expr_bp(min_bp, r)`，不做字段的存/恢复（2026-09-22 改，理由见 §1.2.1 那个改动说明）。于是"进一个普通表达式上下文"就等于"传 `VALUE` 常量"：`(` `[`、调用实参、数组元素、字段值、块体、`break`/`return` 的操作数全都是这一条，**没有"最容易漏的进入点"这回事了**。**运算符内部（前缀的操作数、中缀的右侧）走的是 `r.sub()`——不是"原样继承"**（2026-09-23 订正，原文写的是前者）：`.g4` 两条链的运算符右侧写的都是**普通链**——`statementUnaryExpression : unaryOperator unaryExpression`（`:583`）、`statementMultiplicativeExpression : statementCastExpression (multiplicativeOperator castExpression)*`（`:564`）——所以**「我在语句位置」这件事不往运算符里面传**（`prefer_stmt` 重置），而 `forbid_structs` 反过来**必须一路带下去**：条件的链是 `conditionUnaryExpression : unaryOperator conditionUnaryExpression`（`:384`）、`conditionCastExpression (multiplicativeOperator conditionCastExpression)*`（`:368`），于是 `if f(S{x:1}) && S { }` 里第二个 `S {` 还得是体块，`if &S { x: 1 } { }` 里 `&` 后的 `{` 也是。⇒ `sub()` = 「语句性重置、条件限制继承」，两处都是它（`v = {1}&2;` 靠 `prefer_stmt` 重置这条；`&S {` 靠 `forbid_structs` 继承这条）。
-- **两个边界规则共用同一只开关**：`break` 操作数的判据是「能起表达式 **且不是**（`forbid_structs` 且下一个是 `{`）」，用到的正是条件边界那个标志。⇒ `if break {}` 里 `{}` 留给 `if` 当体块，而语句位置的 `loop { break { 9 }; }` 里 `{9}` 是 `break` 的值。**`break` 是唯一有这个判据的**：`return` 的操作数按 `VALUE` 解、`continue` 干脆没有操作数。依据是 `.g4:626` 的 `BREAK conditionBreakExpression?`（对比 `:627` 的 `RETURN conditionExpression?`——文法故意不对称）。**规范书对这两条都没有规则**（细则与出处对照见 [`spec-mapping.md`](spec-mapping.md) §2.9.1，已列为 [`plan.md`](plan.md) §3.1 Q17 待问助教）⇒ 答复前按 `.g4` + 语料实现。`return` 侧剩下的差异只有「条件里 `return S{x:1}` 算不算结构体字面量」这一处，全语料零命中。
-- **块尾**是规范自相矛盾处（两方原文见 [`plan.md`](plan.md) §3.1 Q11）：`block-expr.md` 的产生式说块尾只许 `ExpressionWithoutBlock`，同一个文件的例子却拿 `{ base + 1 }` 当块尾并 yield `i32`。**parser 对此完全中立**——`Block` 只存 `stmts`（**没有 `tail` 字段**），「谁是块尾」是语义阶段的派生访问器（读法 B 只看最后一条是否 `semi: false`）⇒ **换边成本 = 改这一个访问器**。这也是 `StmtKind::Expr` 必须如实记录 `semi` 的原因：它是唯一能区分「块尾」与「语句」的信息。
+**块尾是规范自相矛盾处**（两方原文见 [`plan.md`](plan.md) §3.1 Q11）：产生式说块尾只许 `ExpressionWithoutBlock`，同文件的例子却拿 `{ base + 1 }` 当块尾并 yield `i32`。**parser 对此完全中立**——`Block` 只存 `stmts`（没有 `tail` 字段），「谁是块尾」是**语义阶段的派生访问器**；`StmtKind::Expr` 的 `semi` 是唯一能区分「块尾」与「语句」的信息。**写语义阶段的 `block_ty` / 返回值检查时，这一条是入口**。
 
-  **`;` 的强制性只有三档**，判据都是「**后缀跑完之后** lhs 还是不是块形式」（2026-09-23 补；本节早先只写了"吃 `;` 成功 = 语句、继续循环"，那**漏了第三档**，照它实现会拒掉 `parser/accept/block-expr-statement-vs-expr-9daf5fa6c1.rx` 与 codegen 的 `acc-both-parser-representations…rx`）：
+**`;` 的强制性只有三档**，判据都是「**后缀跑完之后** lhs 还是不是块形式」：① `let` 强制（`expect(Semi)`；`StmtKind::Let` 没有 `semi` 字段就是这条的编码）；② 表达式、**非**块形式、没吃到 `;` ⇒ 只能是块尾，后面必须紧跟 `}`（`{ a }` 合法、`{ 1 2 }` 非法）；③ 表达式、**仍**块形式、没吃到 `;` ⇒ `;` 可选且后面还能再跟语句（`if true {} else {} -1;` 是两条语句）。
 
-  1. `let`：`;` 强制（`expect(Semi)`）。AST 里 `StmtKind::Let` 没有 `semi` 字段，就是这条规则的编码。
-  2. 表达式、**非**块形式、没吃到 `;`：它只能是块尾，后面必须紧跟 `}`，否则报缺 `;`（`{ a }` 合法、`{ 1 2 }` 非法）。
-  3. 表达式、**仍**块形式、没吃到 `;`：`;` 可选，且**后面还能再跟语句**⇒ 循环继续（`if true {} else {} -1;` 是两条语句；`semantic/…/rej-a-non-final-block-statement-without-semicolon-must-be-unit.rx` 里 `{ 1 }` 那条块形式语句后跟 `println_i32(2);`，parser 也必须接受它——它是**语义**负例）。
+#### 1.3.6 五个解析入口
 
-#### 1.5.4 一处数据结构的决定：`else` 存 `ExprId` 而不是 `BlockId`
-
-规范允许 `else` 后跟另一个 `if`（`else if` 链）。若字段是 `Option<BlockId>`，`else if c {1} else {2}` 只能表达成"一个块，块里有一条 `if` 语句"，两处坏掉：AST 凭空多一层块、与源码形状对不上；**更致命的是**内层 `if` 变成**语句**，按块尾规则其值必须兼容 `()` ⇒ `else if c { 1 } else { 2 }` 这个合法的 `i32` 表达式会被语义分析拒掉。
-
-用 `Option<ExprId>` 则完全同构：`else` 后调**同一个**「解析块形式原子」的函数。`then_block` 依然是 `BlockId`（规范要求 then 必须是块），这个不对称是**忠实于规范**的。
-
-#### 1.5.5 五个解析入口（2026-09-22 定，由测试点逼出）
-
-**起因**：`parser` stage 的 442 条测试点里，**只有 119 条是整份 crate**，其余 323 条是**语法碎片**——`&&&&1`、`& & & & & usize`、`S<'static>`、`&'static ()`、`f<X>()`、`let x: i32 = 92;` 这种。manifest 用 `metadata.entry` 说明每份碎片该从哪个入口解析：
+`parser` stage 的 442 条测试点里**只有 119 条是整份 crate**，其余 323 条是**语法碎片**（`&&&&1`、`S<'static>`、`let x: i32 = 92;` 这种）。manifest 用 `metadata.entry` 说明每份碎片该从哪个入口解析：
 
 | `metadata.entry` | 条数 | 入口函数 | 入口语义 |
 |---|---|---|---|
@@ -827,151 +434,17 @@ parse_function                 解析 fn main() { ... }
 | `item` | 28（全正） | `parse_item()` | 一条 item + 强制 `Eof` |
 | `letStatement` | 13（全正） | `parse_let()` | 一条 let 语句 + 强制 `Eof` |
 
-**决策一：`parse_crate` 不是唯一入口，前端对外有五个入口函数。**
-这五条路径本来就都在 `parse_*` 里存在（`parse_item` / `parse_type` / `parse_let` 都是 `parse_crate` 内部的递归环节），**只是要把它们变成 pub 的、能被 driver 直接调用的入口**。成本约等于零：加四个 `pub fn parse_xxx(src: &[u8]) -> Result<Ast, FrontendError>` 包装，内部照旧走同一个 `Parser`。
+**四件事**：① 前端对外有**五个入口函数**（加四个 wrapper）；② **入口必须由 driver 显式传入**，不能「挨个入口试一遍，有一个成功就算过」——`entry: crate` 的负例 `foo\n`，若挨个试，`expression` 入口会把 `foo` 当路径表达式正常解析 ⇒ **负例被判成通过**；入口是**语义的一部分**，试不出来；③ 五个入口**共用同一条「吃满输入」规则**（解析完必须停在 `Eof`，尾部有剩余 token 即语法错误）；④ 统一返回 `Result<Ast, FrontendError>`，碎片入口解析出的那个节点记在 `Ast::entry_root`（`Expr` / `Type` / `Item(Option<ItemId>)` / `Let(StmtId)`——四个碎片入口的产物光看 arena 认不出哪一个是根；`parse_crate` 下是 `None`，顶层项在 `root` 里）。
 
-> **不做这一步的代价是明确的**：只实现 `parse_crate` ⇒ 323 条碎片全部解析失败 ⇒ **`parser` 阶段最多拿 119 + 77 = 196 / 442**。
+**入口从哪来**：`metadata.entry` 是全语料唯一记着解析入口的地方（官方 `manifest.schema.json` 说 metadata「Not used for grading」，但 parser stage 的入口提示只在这里）⇒ 我们的 runner 照读（[`scripts/stage_test.py`](../scripts/stage_test.py)），读到不认识的 `entry` 值**直接报错退出**，不要默认成 `crate`。
 
-**决策二：入口必须由 driver 显式传入，不能用"挨个入口试一遍，有一个成功就算过"兜底。**
-这条是**安全性质、不是洁癖**——反例直接来自测试点：
+#### 1.3.7 列表的终止条件 = 宿主那个终结符（FOLLOW）
 
-```
-parser/reject/path_item_without_excl-….rx   内容: foo\n   entry: crate
-```
+`WhereClause` 和 `FunctionParameters` 是同一类麻烦的产生式：**列表整体可选 + 元素可选 + 尾逗号可选，而且列表自己没有终结符**（参数表里没有括号——那个 `)` 是 `Function` 产生式的 token；where 子句同理，`{` 是 struct/impl/fn 的）⇒ **读完最后一个元素后，没有任何属于本列表的 token 能告诉你「到此为止」**。
 
-`entry=crate` 时它是**负例**（`foo` 单独成不了 item，缺 `;` 或 `!`）。若 driver 挨个入口试：`expression` 入口会把 `foo` 当路径表达式**正常解析成功** ⇒ **负例被判成通过**。入口是**语义的一部分**，试不出来。
+**判据取宿主那个终结符**：`while !self.at(LBrace) { … }`（where）、`while !self.at(RParen) { … }`（参数表），元素后 `eat(Comma)` 失败即 `break`。两条**写出来的前提**：① **终结符就在眼前**（当前直接看得到，不需要前瞻、也不需要栈去问「我在谁肚子里」）；② **终结符 ∉ FIRST(元素)**（否则「列表结束」与「新元素开始」撞车）。**空转安全性**：元素解析 **fail-hard**（成功必消费 ≥1 token，失败必 `Err`）⇒ 构造上不可能空转，不需要 `!at(Eof)` 守卫。
 
-**决策三：五个入口共用同一条"吃满输入"规则——解析完必须停在 `Eof`，尾部有剩余 token 即为语法错误。**
-`parse_crate` 一直有这条（§2.1 的"强制 EOF"，没有它尾部垃圾不报错）；现在把它提升成**五个入口的统一约定**。这条同时也解释了上表那些负例为什么必须拒：
-
-| 负例（`entry=expression`） | 靠哪条规则拒 |
-|---|---|
-| `f<X>()` | 表达式路径的 turbofish 必需 ⇒ `f < X > ()` 是**链式比较** |
-| `false == false == false`、`false == 0 < 2` | 比较不可链式（§1.5.2） |
-| `a as usize < 4`、`a as usize << long_name` | cast 后的 `<` 进泛型实参（[`spec-mapping.md`](spec-mapping.md) §2.10）⇒ `< 4` 不是合法实参表 |
-
-⇒ **五条里没有一条是新规则**，全是已经写进 [`spec-mapping.md`](spec-mapping.md) 的既有边界——测试点只是在**逼我们把它们真的实现出来**。
-
-**决策四：五个入口统一返回 `Result<Ast, FrontendError>`，碎片入口解析出的那个节点记在 `Ast::entry_root`。**
-
-```rust
-pub enum EntryRoot {
-    Expr(ExprId),
-    Type(TypeId),
-    Item(Option<ItemId>),   // use 声明没有对应的 Item（`parse_use` 返回 Ok(None)，§2.2）
-    Let(Stmt),              // Stmt 不住在 arena 里（§1.2.2.1），所以这一支是值不是 id
-}
-```
-
-四个碎片入口的产物不是一份 crate，光看 arena 认不出哪一个是根。记一笔之后：五个入口签名一致、`parse_let` 的结果也不会"解析完就丢掉"，AST 打印器不必为碎片入口各写一条路径。`parse_crate` 下它是 `None`（顶层项在 `root` 里）。
-
-**代价与风险**：`--entry=` 的拼写是自定的（[`plan.md`](plan.md) §3.1 Q14），若官方约定不同，改动量 = driver 里一个 `match` 加四个 wrapper 的函数名，**AST 与 `Parser` 一行不动**——这是把风险关在最小面上的做法。
-**入口从哪来**（2026-09-22 查证）：`metadata.entry` 是全语料唯一记着解析入口的地方。官方 `manifest.schema.json` 明说 metadata「Not used for grading」，但 parser stage 的入口提示只在这里，所以我们的 runner 照读（`scripts/parse_test.py`）。读到不认识的 `entry` 值**直接报错退出**，不要默认成 `crate`——那会让一半碎片静默走错入口。
-
-#### 1.5.6 列表的终止条件 = 宿主那个终结符（FOLLOW）（2026-09-23 定）
-
-`WhereClause`（`Parser.g4:104-106`）和 `FunctionParameters`（`functions.md`）是同一类麻烦的产生式：**列表整体可选 + 元素可选 + 尾逗号可选，而且列表自己没有终结符**。`FunctionParameters -> SelfParam `,`? | (SelfParam `,`)? FunctionParam (`,` FunctionParam)* `,`?` 里没有括号——那个 `)` 是 `Function` 产生式的 token，不在列表手里；`WhereClause` 同理，`{` 是 struct/impl/fn 的。⇒ **读完最后一个元素之后，没有任何属于本列表的 token 能告诉你「到此为止」**，parser 必须自己判。
-
-**判据取宿主那个终结符，两处同形**：
-
-```rust
-while !self.at(TokenKind::LBrace) {                 // where 子句
-    self.parse_where_clause_item()?;
-    if !self.eat(TokenKind::Comma) { break; }
-}
-while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {   // 参数表（§2.3.1）
-    self.parse_param()?;
-    if !self.eat(TokenKind::Comma) { break; }
-}
-```
-
-**用 FOLLOW 有两个前提**——写出来，别让它变成隐藏依赖：
-
-1. **终结符就在眼前**。`{` / `)` 都是当前直接看得到的 token，不需要前瞻、也不需要栈去问「我在谁肚子里」。
-2. **终结符 ∉ FIRST(元素)**。`{` 不在 FIRST(`WhereClauseItem`)（= {`lifetime`} ∪ FIRST(`typeRef`)，见 `Parser.g4:108-119`）里；`)` 也不在 FIRST(`FunctionParam`) 里。**否则「列表结束」和「新元素开始」会撞车**，这个写法直接失效。
-
-**空转安全性是白拿的**：循环体里的元素解析 **fail-hard**（成功必消费 ≥1 token，失败必 `Err`）⇒ 每轮要么前进要么退出，**构造上不可能空转**。所以这里**不需要** `!at(Eof)` 守卫——[`spec-mapping.md`](spec-mapping.md):190 记的那个坑（`bump` 在 `Eof` 上不推进 `pos`，截断输入让循环空转，判分口径里**超时 = 失败**）不会发生。（参数表那句 `!at(Eof)` 同理是冗余的，留着无害。）
-
-**曾经选过 FIRST，为什么换回来**（这条的价值全在推理，别只记结论）：FIRST 版是「下一个 token 起不了元素 ⇒ 列表结束」，配一个 `at_type_start()` 谓词（7 个 token）+ `Result<bool>` 的融合形状。它的卖点是「**不用知道外层是谁**」——**这条被证伪了**：
-
-- 垃圾 token（`where 5 {` 的 `5`）在 FIRST 版里被判成「列表结束」，然后**指望外层报错**；而外层能报错的前提，恰恰是**外层只接受 `{`**。
-- ⇒ 「FIRST 版恰好正确」的原因，与 FOLLOW 版硬编码的是**同一个事实**。教科书说法：LL(1) 的**可选组永远是 on-FIRST 进、on-FOLLOW 出**——绕不开 FOLLOW，只能选把它写在哪。FIRST 版把 FOLLOW 摊到外层、以「外层报错」的形式表现出来，**依赖没消失，只是被藏起来了**。
-- 其余逐项：代码多 14 行；要维护 7 个 token（`typeRef` 加一支就得同步，忘了就**拒合法程序**）；与参数表不同形，得专门解释「为什么这里不一样」。
-- 错误信息**打平**，不是 FOLLOW 单赢：`where 5 {` FOLLOW 报「预期类型」更直指，`where 'a: 'b }`（漏 body 的 `{`）FIRST 报「预期 `{`」更直指。
-- FOLLOW 与参考实现一致：rust-analyzer 的 `opt_where_clause` 就是 FOLLOW（`{` / `;` / `=`）。
-
-**什么时候才**必须**用 FIRST**：终结符**不在眼前**（要跨层才知道后继），或者终结符**不唯一 / 与元素的 FIRST 交叠**。那时才值得付「算 FIRST 集」的成本；Rx 这两处都不满足，所以不付。
-
-**附带的通用规则：同一个判据集合不许有第二份。** 无论选 FIRST 还是 FOLLOW，判定所依据的那个集合（这里是 `{`、`)`，FIRST 版则是 7 个 token）在代码里**只能住在一处**。若它同时被写进「判定函数」和「消费函数 / 循环条件」，将来规范加一支而只改了其中一处 ⇒ **合法程序被静默判错**（不是崩，是判错——最难查的那种）。这条与选哪套判据无关，凡「列表可选 + 尾逗号可选」的位置都适用。
-
-**为什么不让 `parse_type_root` 自己兼任这个判定**（与上一段之争无关，仍然成立）：它内部全是 `expect`，而 `expect` 是 **fail-hard** 的——只有「对」和「炸」，**没有「没有」这个返回值**。可 `where {`、尾逗号之后需要的那个「没有」是**合法**的（`where` 整组是 `( ... )?`），不能是错误。于是「`match` 住 `Err`，把它当『这儿没类型』」这条路要成立，必须先记下 `pos`、失败后确认 **`pos` 没动**——因为 `parse_type_root` 会**吃过 token 才失败**：`where & : 'a` 是吃掉 `&`、去解析内层类型、看到 `:` 才炸的，不倒回去就谈不上「一个 token 都没消费」。**而那个 `pos == save` 守卫就是 FIRST 集本身**（「首 token 能不能起一个类型」≡「试过之后游标动没动」）。⇒ **判据必须独立于「解析有没有失败」**：要么事前问一次（FIRST 谓词），要么事后确认「一个 token 都没动」（`pos == save`，与 FIRST 等价）。本节选 FOLLOW 写法的好处正在这里——`while !at(LBrace)` 把「列表结束」判在**尝试解析之前**，压根不涉及失败。（不带 `pos` 守卫、直接把失败当「没有」并把游标倒回去，那是**回溯**，[`spec-mapping.md`](spec-mapping.md):179 已否。）
-
-### 1.6 两个走查例子
-
-#### 1.6.1 例 A：`if flag { 1 } else { 2 }` 走完前端
-
-**① token 流**：10 个扁平 token，无结构——`If` `Ident(flag)` `{` `IntLiteral(1)` `}` `Else` `{` `IntLiteral(2)` `}` `Eof`（字节偏移顺次为 0..2、3..7、8..9、10..11、12..13、14..18、19..20、21..22、23..24，`Eof` 空）。
-
-**② parser 走一遍，边走边建树**：
-
-```
-parse_stmt → parse_expr_stmt：表达式语句一律按 Restrictions::STATEMENT 解（不按首 token 分流）
- └ parse_expr_bp(0, STATEMENT)
-    ├ 原子分派：cur = If → parse_if()
-    │   ├ bump() 吃掉 If；parse_expr_bp(0, CONDITION) 解条件
-    │   │   └ 原子 Ident(flag) → Path(flag) = e0
-    │   │       后缀循环：cur = LBrace，不是 . ( [ → 一个都不吃
-    │   │       爬升循环：peek_infix(LBrace) 无 → 返回 e0   ← 条件到此为止，span 只覆盖 flag
-    │   ├ parse_block()  then：吃 LBrace，见 IntLiteral(1) → e1
-    │   │       吃 ; ？ cur = RBrace → 否 ⇒ 收工，返回 [StmtKind::Expr{e1, semi:false}]  ← 块尾是**派生**的
-    │   │       吃 RBrace ⇒ b0 = Block{ stmts:[…e1…] }
-    │   ├ cur = Else → bump()；调**同一个**"解析块形式原子"再来一次 ⇒ b1
-    │   │       包成 ExprKind::Block(b1) ⇒ e3        （`else if` 只是这里再走进 If 那一支）
-    │   └ 造 ExprKind::If{ cond:e0, then_block:b0, else_branch:Some(e3) } ⇒ e4
-    ├ 后缀循环：cur = RBrace → 一个都不吃，lhs 仍是块形式
-    └ r.prefer_stmt 且 lhs 仍是块形式 ⇒ 就地收工，**不进爬升循环**    ← 语句边界规则 ①
- ⇒ 这一支返回 (e4, true)：`;` 没吃到 + 块形式 ⇒ 合法（`semi:false`），循环继续找下一条语句
-```
-
-条件那一支没有"存/恢复 `no_struct_literal`"这一步：限制是**按值传进 `parse_expr_bp` 的参数**（§1.5.3），`CONDITION` 传下去就完事，出来自然回到调用方的 `r`，**没有"忘了恢复"这条 bug 可犯**。
-
-**③ 得到的 arena**：
-
-```
-exprs:  [ e0 = ExprKind::Path(flag)
-          e1 = ExprKind::Lit(1)   e2 = ExprKind::Lit(2)
-          e3 = ExprKind::Block(b1)          ← else 的 Expr 包装
-          e4 = ExprKind::If{ cond:e0, then_block:b0, else_branch:Some(e3) } ]
-blocks: [ b0 = Block{ stmts:[StmtKind::Expr{e1, semi:false}] }    ← then，直接是 BlockId
-          b1 = Block{ stmts:[StmtKind::Expr{e2, semi:false}] } ]  ← else 里面的块
-```
-
-**外层那条语句**（包着 `e4` 的那条）不在任何 arena 里——它是 `StmtKind::Expr{ expr:e4, semi:false }` 这个**值**，住在某个 `Block` 的 `stmts` 里（§1.2.2.1），所以这份 dump 里只有两个 arena 而不是三个。
-
-`1` 在 then、`2` 在 else 一目了然——**这就是 parser 干的事：把扁平列表变成树**。
-
-**④ span 轨迹**（`mark()` 记的是 token 下标，`span_from()` 用 `prev_end` 收尾）：
-
-| 节点 | `mark` | 收尾时的 `prev_end` | 算出的 span |
-|---|---|---|---|
-| `e0 = ExprKind::Path(flag)` | token 1 | 7 | 3..7 |
-| `b0`（then 块） | token 2 | 吃掉 `}`(12..13) 后 = 13 | 8..13 |
-| `b1`（else 里的块） | token 6 | 吃掉 `}`(23..24) 后 = 24 | 19..24 |
-| `e3 = ExprKind::Block(b1)` | — | **直接抄 `b1` 的 span** | 19..24 |
-| `e4 = ExprKind::If{…}` | token 0 | 24 | 0..24 |
-| `s0 = StmtKind::Expr{e4}` | — | 复用 `e4` | 0..24 |
-
-两条规矩：**包装节点的 span 一律抄内层，不自己编**；`span_from` 必须 `max(prev_end, start)`。
-
-⚠ **本例只演示解析形状**：它是不是合法程序取决于外层块——这一段编出来的 `semi:false` 到底算「块尾」还是「必须兼容 `()` 的语句」，见块尾的两种读法之争（§1.5.3，Q11）。
-
-#### 1.6.2 例 B：`let v: Vec<Vec<i32>>=x;` 的状态轨迹
-
-这个例子的看点**只有一处：切分时 `pos` 不动**。走完 `parse_let` 的 `v` / `:` 之后，游标停在 `Vec<Vec<i32>>` 的 `>>`（`Shr`，字节 18..20）上：关内层 `parse_generic_args` 时 `eat_gt()` 把 `toks[8]` **原地改写成 `Gt(19..20)`**，游标仍指向 8；关外层时再调 `eat_gt()`，这次看到的是单字符 `Gt` ⇒ 走普通 `bump`，游标才到 9。随后 `expect(Eq)`、`parse_expr_bp(0)`、`expect(Semi)` 依次吃掉 `=` `x` `;`——**它们完全不知道刚才发生过什么**。
-
-`>>=` 变体（`let v: Vec<Vec<i32>>=x;`）更清楚：`toks[8] = ShrEq(18..21)`，第一次切出 `Ge(19..21)`（文本 `>=`），第二次切出 `Eq(20..21)`（文本 `=`），**两次 `pos` 都不动**，然后 `expect(Eq)` 直接吃掉。
-
-⇒ 结论：**切分把合并标点还原成了普通 token，所以 `=` 这类位置不需要任何特殊处理。**
+**附带的通用规则：同一个判据集合不许有第二份。** 判定所依据的那个集合在代码里**只能住在一处**——若它同时被写进「判定函数」和「消费函数 / 循环条件」，将来规范加一支而只改一处 ⇒ **合法程序被静默判错**。凡「列表可选 + 尾逗号可选」的位置都适用。
 
 ---
 
@@ -979,60 +452,587 @@ blocks: [ b0 = Block{ stmts:[StmtKind::Expr{e1, semi:false}] }    ← then，直
 
 ### 2.1 内部架构
 
+**数据流**（四个值的接力；`passes/` 与 `backend/` 直接吃 `Module`，不经过 `.ll`）：
+
 ```
-ast.rs ──► lowering ──► ir/module.rs ──► 内存 IR ──┬──► passes/        （优化，阶段五）
-                                                   ├──► printer.rs ──► .ll 文本（Clang 验证用）
-                                                   └──► backend/       （阶段三，直接消费内存 IR）
+main ──&[u8]──► parse_crate ──► Ast ──► sema::check ──► Checked ──► lower ──► Module ─┬─► printer ──► .ll
+                （阶段一）      只读 │    （只读 AST）   tables+tys   （不可失败）      ├─► passes/   （阶段四）
+                                     └ 本阶段不再碰的前端产物                            └─► backend/  （阶段三）
 ```
 
-**IR 的形态是 LLVM 的形态**，不是一个自造 IR。这样做的收益从 W5 就能兑现：`.ll` → `clang -S` → 与 `runtime.s` 一起喂 REIMU，**在自写后端可用之前**就有一套端到端验证闭环（命令见 [`spec-mapping.md`](spec-mapping.md) §5）。
+**对外接口只有三个函数**：
 
-⚠ **后端不要"打印成 `.ll` 再解析回来"**——白白多写一个 parser，且丢失内部信息。
+| 函数 | 定义在 | 谁调 |
+|---|---|---|
+| `sema::check(ast: &Ast, src: &[u8]) -> Result<Checked, SemError>` | `sema/mod.rs` | driver。**必须同时收 `src`**：诊断要渲染「实际是 `box`」那半句，而 `TokenKind` 无载荷（§0.4） |
+| `ir::lower::program(ast: &Ast, ck: Checked) -> Module` | `ir/lower.rs` | driver。**`Checked` 按值收**：`tys` 移进 `Module`，`tables` 就此析构 |
+| `ir::printer::print(m: &Module) -> String` | `ir/printer.rs` | driver 的 `--emit-ll`（挂在 `--stage=` 之外） |
+
+```rust
+pub struct Checked { pub tables: Tables, pub tys: TyArena }   // ★ 两个都是 sema 造的，一起交出去
+```
+
+**为什么 `Checked` 是必需的一层**：`TyArena` 长在 `Sema` 身上，sema 一结束就随它析构，而 lowering 与后端都要按 `TyId` 查布局（`Layout { size, align }`）⇒ `check()` 必须把 `tables` 与 `tys` **一起**交出来。`check()` 的返回类型与 driver 的接线都已按这个形状落好。
+
+**所有权与可变性**：
+
+| 数据 | 谁创建 | 谁拥有 | 可变性 | 活到什么时候 |
+|---|---|---|---|---|
+| `Ast` + 各 arena | `Parser.ast` | `main` | parse 期写，之后**只读** | 走完 sema 与 lowering |
+| `Tables`（结论表） | `sema::check` | `main` | 造完只读 | **lowering 结束即析构** |
+| `TyArena` | `sema::check` | `main` → **移进 `Module`** | 造完只读 | 阶段三、四 |
+| `Module` | `ir::lower::program` | `main` → printer / passes / backend | passes 期可变 | 到编译结束 |
+| `SemError` | `sema::check` | 按值传递 | — | `main` 打印完 `exit(1)` |
+
+**分层规则**：
+
+> **`ir/` 不认识 AST，`sema/` 不认识 IR；lowering 读 `Ast` 只许取"结构"，一切"语义判定"只许读 `Tables`。**
+
+❌ 不许自己判断"这个表达式是不是 place"（`tables.exprs[e].cat` 已经有了）；❌ 不许重新做类型推断（`tables.exprs[e].ty_id` 已经有了）；✅ 该看 `Ast` 的是"这个 `if` 有没有 `else`""这个节点的 span 在哪"，即**形状**。
+
+**错误流**：`SemError { kind: SemErrorKind, span }` 从 `sema::check` 冒出（**唯一的出口**），driver 一个字不用改。**`lower` 的签名不含 `Result`**——一切可拒绝的东西 sema 都拒过了，失败只可能是我们自己的 bug；`expect()`/`unwrap()` 只许用于**真正的不变量**，一条正例上 panic 就是 `exit(101)`。
+
+**本阶段的形态**：IR 的形状就是 LLVM 的（`Module` / `Function` / `BasicBlock` / `Instruction` / `Value` + φ）；**从第一条指令起就是 SSA**（`alloca`/`load` 的结果本身就是 SSA 值——变量的**内容**不是 SSA 名，**变量所在的地址**才是，mem2reg 只是删指令、改操作数的普通 pass，不改任何类型）；**先降 alloca、再 mem2reg**，φ 全部由 mem2reg 造（§2.3.3），**每一个中间状态都是合法的 `.ll`**。
 
 ### 2.2 维护的数据结构
 
-```
-Module
- ├─ 全局常量 / 字符串
- └─ Function*  ←── Vec<Function>，用 FuncId 索引
-     ├─ 签名（参数类型、返回类型）
-     └─ BasicBlock*  ←── Vec<BasicBlock>，用 BlockId 索引
-         └─ Instruction*  ←── Vec<Inst>，用 InstId 索引
+分两块看：**sema 的驱动器与它造的产物**（§2.2.1）、**IR 自己的数据**（§2.2.2）。两块都照 §1.2.2 的习惯：**arena + 类型化 id 新类型**，节点定义里**不出现 `Box`**，`Span` 挂在节点上。
+
+#### 2.2.1 sema：驱动器、类型与侧表
+
+**遍历 AST 的那个东西是 `Sema`**——`check()` 的全部状态都在它身上，`check` 自己只做"建它 → 走一遍 → 交出产物"三件事（§2.3.1）：
+
+```rust
+struct Sema<'a> {
+    ast:       &'a Ast,       // 只读：按 ExprId / BlockId / ItemId 取回节点
+    src:       &'a [u8],      // 与 ast 并列的只读输入；全 sema 只有 Sema::text 一处能把它切成文本
+    tys:       TyArena,       // 边解析边 intern
+    tables:    Tables,        // 按下标填；结束时交出去
+    scopes:    Vec<Scope<'a>>,// 作用域栈：进块压、出块弹，**栈顶就是当前作用域**（`ScopeId(0)` 是 crate 根，代码里叫 `ROOT`）
+    loops:     Vec<LoopInfo>, // 循环栈（Loop / While）：`break` / `continue` 只在它非空时合法；每层记 kind、期望类型、已见的 break 值类型
+    cur_ret:   Option<TyId>,  // 当前函数的声明返回类型：函数尾与 `return` 的期望类型就是它
+    cur_self:  Option<StructId>, // `Self` 指谁：正在声明字段的那个 struct，或正在走的 impl 的目标
+    struct_items: Vec<ItemId>,   // 2a 收的 struct item，按声明顺序；下标即 StructId —— 桥，第 3 步靠它回到 AST
+    item_sig:  HashMap<ItemId, FnSig>, // 每个函数的签名：接收者 / 参数 / 返回类型（`FnSig` 三个 `TyId` 字段）
+    const_color: HashMap<ItemId, Color>, // 2c 的环检测：只装**进过**的常量项，不在表里 = 没进过（求出来的值在 `tables.const_values`）
+    assoc:     HashMap<StructId, HashMap<&'a str, ValueSym>>,  // 每个 struct 的关联项命名空间
+}
 ```
 
-- **Value 也是 arena**：`Vec<Value>` + `ValueId`，指令的结果就是一个 `ValueId`（typed SSA value）
-- **phi 回填**：基本块的后继在 lowering 时可能还没建完，所以 terminator 里的目标 `BlockId` 需要**先占位后回填**
-- **use-def 链**：`Vec<Vec<InstId>>`（每个 value 的使用者列表），活跃性分析和 DCE 都靠它
-- triple / data layout 必须与 RV32IM/ILP32 一致
+**已落地与待落地**：上表 `loops`（还是 `Vec<LoopKind>`）、`cur_ret`、`item_sig` 三处是待落形状，随 M1 各步落地；其余字段已在。
+
+**新加一张表的准入条件：留桥、留索引，不留"筛选副本"、不留"纯缓存标量"。** **桥** = 连接两个**互不认识的 id 空间**、且映射**重算不出来**的表（`struct_items`：`StructId` ↔ `ItemId`；好处是**可断言**，稠密有序）；**索引** = 把现存的东西**按另一把键**重排（`assoc`、`struct_ty`；判据是"换了一把键"，**不是**"键空间无界"）；**筛选副本** = 把现存列表按 `kind` 筛一遍得到的清单，**不收**（顶层 `impl` / `const` 本来就在 `ast.root` 里，三条子趟都直接扫它；多一张副本就多一条"必须记得 push"的**静默**失败面）；**纯缓存标量** = 能一个表达式推出来的标量，**不收、改成方法**（`cur_scope()` 恒等于 `ScopeId(scopes.len() - 1)`）。**分界线：是不是"得恢复"**——**压栈时写一次**的（`Scope.parent`）留着是廉价的显式化；**每次弹栈都要记得恢复**的（`cur_scope` 字段）是纯 bug 面。逐个字段的审计与完整推导见 [`arch-phase2.md`](arch-phase2.md) §2.2.1。
+
+**常量求值的两张平行表**，**都按 `ast::ItemId` 作键、都只装常量项**：`tables.const_values` 装求出来的 `(值, 类型)`（**不在表里** = 还没求过；它在 `Tables` 里，因为 lowering 内联常量路径时要读），`const_color` 装同一个项的环检测色（**不在表里** = 没进过；纯过程状态，走完就没用了，留在 `Sema`）。**值带着类型一起存**——`const N: i32 = 2;` 与 `const N: usize = 2;` 的值都是 `Int(2)`，差别只在那个 `TyId`，而"数组长度必须是 `usize`"这条负例正是靠比对它才拒得掉。`ConstVal` 只有两支：`Int(i64)`（★ 载荷是 i64 不是 i32：`const N: u32 = 4000000000;` 合法，i32 装不下）与 `Bool(bool)`（★ 必须与 `Int` 分家：`const N: i32 = true;` 与 `const N: bool = true;` 只差这一支）。
+
+**`Color { White, Gray, Black }` 是环检测的三态**（没进过 / 正在这条递归链上 / 算完了），两处环检测共用这三个名字（2c 与布局环），但**各自一张表、各自一把键**：`const_color` 那边**第三个状态由"不在表里"承担**（读到 `None` 就是 `White`），`Color::White` 这个值此后只有 `visiting` 在构造。为什么两态不够，见下文布局环。
+
+**规范把名字分成三个命名空间**（`names.md`），分别住在这里：
+
+| 命名空间 | 住在哪 | 谁消费它 |
+|---|---|---|
+| **Type** | `Scope::types`（沿 `Sema.scopes` 从栈顶往外找）；内建类型与 `Box` / `Vec` 在根作用域 | `resolve_type` 查 `Path` 的第一段；`Self` 由 `cur_self` 决定 |
+| **Value** | 顶层与局部在 `Scope::values`；**关联项**在 `assoc[结构体]`（同一 struct 的全部 `impl` 共享一片） | 表达式里的 `Path`、调用、方法查找、重名检查 |
+| **Field** | **不进作用域栈**：就是 `StructDef.fields`，顺序即布局，线性扫 | 字段访问 `e.f`、结构体字面量 `S { f: … }` |
+
+⇒ `Scope` 只装前两个命名空间（`{ parent: Option<ScopeId>, types: HashMap<&'a str, TypeSym>, values: HashMap<&'a str, ValueSym> }`，crate 根 `parent` 是 `None`）。**`TyId` 装不进 `types`**：`Box` 与 `Vec` 是带一个参数的**类型构造器**——名字本身不是类型，`Box<i32>` 才是 ⇒ `TypeSym` 要能区分"名字即类型"与"还要再吃一个类型实参"：`Ty(TyId) | BoxCtor | VecCtor`。
+
+**`values` 的元素 = 值命名空间里一个名字绑定了什么**：
+
+```rust
+/// 绑定的身份就是它的出生地：语句的 StmtId / 函数的第 index 个形参 / 第 item 个函数的接收者
+pub enum BindingId { Param { item: ItemId, index: usize }, Let(StmtId), Recv(ItemId) }
+
+pub enum ValueSym {
+    Local(BindingId),  // let 绑定 / 形参 / 接收者。lowering 的 vars 表（BindingId → alloca）拿它做键
+    Fn(ast::ItemId),   // 顶层函数或方法：签名与函数体都还在 ast.items 里，这里只记身份、不复制
+    Const(ast::ItemId),// 顶层常量或关联常量
+    Builtin(Builtin),  // 编译器提供、没有源码 ItemId 的函数（见下）
+}
+
+pub enum Builtin {
+    GetI32, PrintI32, PrintlnI32,
+    BoxNew(TyId), VecNew(TyId), BoxClone(TyId), VecClone(TyId),  // 载荷是元素 / 被包类型
+    VecLen(TyId), VecPush(TyId),
+}
+```
+
+**往上面两张表里插名字、撞名就报错的入口只有 `declare_type` / `declare_value` 两个**（`let` 与形参不走它们——它们的绑定在初始式走完之后才可见）。**四条由负例钉死的纪律**：① **struct 名不进 `values`** ⇒ `struct Same` 与 `fn Same` 共存，而 `S(1)` 是"未解析的值名"；② **`let` 的绑定在初始式之后才可见**（先走 `init` 再插绑定），否则 `let x = x;` 会拿到自己；③ **`self` 走普通作用域绑定**：`check_fn` 在有接收者时把 `self` 声明进作用域，值 `ValueSym::Local(BindingId::Recv(item))`（`self` 语义上就是第零个参数）；impl 常量求值 / 无接收者的关联函数 / 根函数三种情况都没有这条绑定，查不到即报错——`cur_self` 只管 `Self`；④ **保护名只填根作用域、只填各自那张表**——`i32`/`u32`/`isize`/`usize`/`bool` 进 `types`，三个内建 I/O 进 `values`，局部绑定**不查**保护名（`let Vec = …;` 合法）。四个 derive 名（`Copy`/`Clone`/`PartialEq`/`Eq`）**故意不登记**：把它们当 struct 名用是 UB，而我们选择"UB 从简"（`spec-mapping.md` §4）。
+
+**`ScopeId` 就是 `scopes` 的下标**；"块 `b` 属于哪一层"不落表——作用域嵌套在 AST 里本来就看得见，`check_block` 进出时压弹即可（§1.2.3）。
+
+**sema 里唯一一处把 `Span` 变回文本的地方是 `Sema::text(&self, span) -> &'a str`**。⚠ **返回类型必须是 `&'a str`**（不能是 `&str`、不能做成 `Index`）：作用域表的键要活过对 `Sema` 的任何借用，写成 `Index` 会以 E0502 收场。**作用域表的键就是切出来的 `&'a str`**：`&str` 按内容哈希，两个不同位置写的 `flag` 落到同一格；名字**不另造 id 空间**——`TyId` 那种 id 是为**稠密索引**服务的，名字只是在几张表里查。
+
+**命名约定**：**`Ty` 系列（`TyId` / `TyKind` / `TyArena`）是 intern 之后的语义类型，`Type` 系列（`ast::TypeId` / `ast::TypeKind`）是源码里的语法类型**；sema 里引用语法节点**一律写限定名 `ast::TypeId`、绝不 `use` 进来**（混用是编译错误，限定名让"这行在说哪种 id"一眼可见）。`Tables` 的形状见 §1.2.3。**类型的宿主是 `TyArena`，与 `Tables` 并列**——lowering、printer、backend 都要按 `TyId` 稠密查**布局**（`Layout { size, align }`：占多少字节、按几字节对齐；后端算栈帧、lowering 算 `alloca` 大小与元素跨步都靠它）。
+
+```rust
+pub struct TyId(pub usize);      // 与 ast::TypeId 是两码事：那是语法节点，这是语义类型
+pub struct StructId(pub usize);
+
+pub enum TyKind {                 // ★ 变体里只放 TyId，绝不放 TyKind 内联
+    I32, U32, Isize, Usize,       // 四个都是 4B/4，LLVM 里全是 i32 —— 差别只在运算的有符号性
+    Bool, Unit, Never,            // bool 1B/1；() 0B/1
+    Ref { mutable: bool, inner: TyId },
+    Boxed(TyId), Vec(TyId),       // Box 一个地址；Vec 12B/4
+    Array { elem: TyId, len: u32 },   // len 已求值：规范说 [i32; 4] 与 [i32; (4usize)] 是同一个类型
+    Struct(StructId),             // ★ 字段表在别处，不内联进来
+}
+
+pub struct StructDef {            // "一个 struct 的字段表"本身，TyKind::Struct 指的就是它
+    pub name:   String,               // 源码里的名字（"Point"）；诊断要点名，printer 的 %struct.Point 也要用
+    pub span:   Span,                 // 名字那一处；布局环的报错要指回 `struct Bad` 的 `Bad`
+    pub fields: Vec<(String, TyId)>,  // 声明顺序：规范要求 src 顺序 = 布局顺序
+    pub offsets: Vec<u32>,            // ★ 算出来的，不是声明的：与 fields 同长同序（layout_of 填）
+}
+
+pub struct TyArena {
+    kinds:     Vec<TyKind>,
+    interner:  HashMap<TyKind, TyId>,   // 结构共享：类型相等退化成 usize 比较
+    layouts:   Vec<Option<Layout>>,     // 与 kinds 同序同长；None = 还没算过
+    structs:   Vec<StructDef>,
+    struct_ty: Vec<TyId>,               // 与 structs 同长：该 struct 的 TyKind::Struct 那个 TyId；★ interner 的反向索引
+    visiting:  Vec<Color>,              // ★ 与 structs 同长（不是与 kinds）：三态，见下面环检测
+}
+```
+
+`StructDef.span` 与 `struct_ty` 的存在理由都是"手边只剩一个 id"：布局环要 span 才能报位置，`Self` 要换成一个 `TyId` 而 `structs` 里只有 `StructDef`。**`interner` 是类型去重的入口**：`intern(kind)` 先查表，命中返回已有的 `TyId`，没命中才 push 进 `kinds` 并记表 ⇒「两个类型相同」在整条流水线上就是「`TyId` 相等」。**自引用 struct 的顺序**：`struct A { next: Box<A> }` 解析字段时会再遇到 `A` ⇒ `TyKind::Struct(id)` 必须在字段解析**之前**就能 intern，字段表由 `finish_struct(id)` 事后填（§2.3.1「聚合先造壳、后填字段」）。**`struct_items`（`StructId → ItemId`）挂在 `Sema` 上、不在这张表里**（2a 自己 push，`new_struct` 与它必须成对出现）；**`TyArena::finish_struct` 与 `Sema::finish_structs` 只差一个 `s`**（前者装一张 struct 的字段，后者是第 3 步的驱动器）；**`ll_ty` 就是下文那张拼写表本身**，只服务 printer，别在别处另写一份。
+
+**`TyArena` 上的操作**（它不认识 AST；错误自己报，span 取自 `StructDef`）：
+
+| 名字 | 干什么 |
+|---|---|
+| `intern(kind) -> TyId` | 去重入口；未命中时推 `kinds` **并**给 `layouts` 补一个 `None`（两张表必须永远同长） |
+| `new_struct(name, span) -> (StructId, TyId)` | **造壳**：`fields` / `offsets` 先留空 ⇒ 推 `structs` ⇒ intern 出 `TyKind::Struct(id)` ⇒ 记进 `struct_ty`、给 `visiting` 推一个 `White` |
+| `finish_struct(id, fields)` | **往 `StructDef.fields` 里装东西的唯一入口**（装**一张** struct） |
+| `struct_ty(id) -> TyId` | 取 `struct_ty[id]`；`Self` 要换成 `TyId` 时用它 |
+| `layout_of(ty) -> Result<Layout, SemError>` | 下表；布局环在这里报 |
+| `is_scalar(ty) -> bool` | 规格：`size != 0 && !matches!(kind, Array \| Struct \| Vec)`；mem2reg 的 `is_promotable` 与后端的"一个字还是 N 字节"开关 |
+| `coerce(from, to) -> Option<Coercion>` | 一对类型的隐式转换判据（允许清单见 [`spec-mapping.md`](spec-mapping.md) §7.3）；`None` = 不允许。`Identity` / `MutToShared` / `RefToInner` / `Never` 四值就是 lowering 要发的动作（`Coercion` 在 `tables.rs`） |
+| `derefs_to(cur, target, mutable_path) -> bool` | `coerce` 的帮手：`cur` 沿内置解引用（`&U` / `&mut U` / `Box<U>` → `U`）能否走到 `target`；`mutable_path` ⇒ 路径上不许出现共享引用（`&mut S` → `&mut T` 的要求） |
+| `lub(tys) -> Option<TyId>` | 一组结果的公共类型（三步算法见 [`spec-mapping.md`](spec-mapping.md) §7.3）；`None` = UB，**不报错**（M1.6 接上；当前是 `todo!()`） |
+
+**布局怎么算**（`layout_of`，与规范参考表逐条一致）：
+
+| 类型 | size / align |
+|---|---|
+| `I32` `U32` `Isize` `Usize` | 4 / 4（LLVM 里全是 i32） |
+| `Bool` | 1 / 1（LLVM i1，但存储 1 字节） |
+| `Unit` `Never` | 0 / 1 |
+| `Ref` / `Boxed` | 4 / 4（一个地址） |
+| `Vec` | 12 / 4（★ 不递归进元素） |
+| `Array { elem, n }` | `elem.size * n` / `elem.align` |
+| `Struct(s)` | 按声明顺序：每字段先 `off = round_up(off, align)` 再 `off += size`；总 size 向上取整到各字段最大对齐，align = 各字段最大对齐 |
+
+**环检测就是那个三态 `visiting` 数组**（三色 DFS）：`White` = 没进过 ⇒ 标成 `Gray` 再往下递归；`Gray` = **正在这一条递归链上** ⇒ 报布局环 `SemError`（它就是"字段类型包含了自己"）；`Black` = 算完了、`layouts[ty]` 里有结果 ⇒ 直接返回缓存。**两态不够**：菱形依赖（`struct A { p: B, q: B }` 里 `B` 会被走两次）与真环必须分开，"进过/没进过"两态分不开——误拒合法程序或退化成指数重算。`visiting` 按 **`StructId`** 索引（不是 `TyId`）：要标色的只有 struct，因为 `layout_of` 的递归边只有 `Struct → fields` 与 `Array → elem` 两条，要成环必经某张 struct 字段表（数组是纯直通，它自己的"算过没有"只记在 `layouts` 里）。
+
+**`Box`/`Vec` 永不递归进自己的参数**（`layout_of` 表里那两行就是全部），这是唯二能打断布局环的东西；**内联数组不能破环**，**外层套个容器也救不了内层非法的声明**（`struct Bad { next: Bad }` 就算谁也没用到 `Bad` 也已经非法）。环报在**布局环检查**那一步，不在 lowering 报。**算一次、缓存在 `TyArena` 里**：`layouts` 与 `kinds` 同序同长，字段偏移存在 `StructDef.offsets`。**消费它的四处**：lowering 要 `alloca` 大小 / 元素跨步 / `memcpy` 长度 / `__rx_alloc` 的 size 与 align；后端要栈帧与 load-store 宽度。**`StructDef` 的两个 Vec 各有人读**：`gep %struct.S, ptr %p, i32 0, i32 k` 的 `k` 是 `fields` 的下标、`memcpy` 长度与栈帧取 `Layout.size`、printer 打 `%struct.S = type {...}` 也按 `fields` 的顺序。
+
+**LLVM 侧的拼写表**——`TyKind` 与 `.ll` 里那个类型怎么互相翻译。**两个消费者**：printer（发 `%struct.S = type {...}`、函数签名、`alloca` 的类型）与 backend（决定一个类型占几个字节、按什么宽度 load/store）。
+
+| `TyKind` | `.ll` 拼写 | 备注 |
+|---|---|---|
+| `I32` `U32` `Isize` `Usize` | `i32` | 四者同一个 LLVM 类型 ⇒ `as` 的整数那一支零指令 |
+| `Bool` | `i1` | 存储 1 字节 / align 1。**存进去的只许是 0/1**——来源只有 `icmp` 与 `zext`，天然满足 |
+| `Unit` | `{}`（聚合内）/ `void`（签名） | 0B/1；`let x: ()` **不发 alloca** |
+| `Never` | `void`（签名位置） | 值位置不出现 |
+| `Ref { .. }` | `ptr` | 可变性是源码概念，运行期不携带 |
+| `Boxed(_)` | `ptr` | |
+| `Vec(_)` | `%Vec` —— **一个共享定义** `%Vec = type { ptr, i32, i32 }` | 元素类型不进表示 ⇒ 不需要 mangle |
+| `Array { elem, len }` | `[<len> x <elem_ll_ty>]` | 不需要具名类型 |
+| `Struct(s)` | `%struct.<源码名>` | clang 自己的习惯；前缀同时避开与用户 `struct Vec` 撞名（那是 UB） |
+
+⚠ **`%struct.S` 用 LLVM 的默认布局规则**（声明顺序、第一个满足对齐的偏移、大小向上取整到对齐、`i1` 存储 1 字节）——与规范参考表逐字节相同，也与 clang 读到的那份 `type` 定义逐字节相同 ⇒ `gep %struct.S, ptr %p, i32 0, i32 k` 在 clang 路径与自写后端上含义一致。
+
+**聚合常量**（`ConstKind::Aggregate`，类型由 `Const.ty` 给）用 struct 自己的字段表、**手工不加 padding**——padding 由 LLVM 按同一张表补。这类指令里的**常量不是 `Value`**（§2.2.2），所以不受"`Value.ty` 恒标量"约束。
+#### 2.2.2 IR：Module / Function / BasicBlock / Inst / Value
+
+```rust
+// ir/ids.rs —— 每个 arena 一个具体新类型，互不相通（同 ast.rs 的做法）
+pub struct FuncId(pub usize);
+pub struct BlockId(pub usize);
+pub struct InstId(pub usize);
+pub struct ValueId(pub usize);
+pub struct ConstId(pub usize);
+pub struct GlobalId(pub usize);
+
+// ir/module.rs。triple / data_layout 是**发给 clang 的目标说明**（不参与我们的任何算法），
+// 写在 .ll 文件头上，取值必须逐字如上
+pub struct Module {
+    pub triple:      &'static str,   // "riscv32-unknown-none-elf"
+    pub data_layout: &'static str,   // "e-m:e-p:32:32-i64:64-n32-S128"
+    pub tys:         TyArena,        // ★ 从 Checked 移进来的（§2.1）：lowering 之后只读
+    pub funcs:       Vec<Function>,  // define 与 declare 同住（declare 的 blocks 为空）
+    pub globals:     Vec<Global>,    // 字符串字面量（@.fmt_int 这类）
+    pub consts:      Vec<Const>,     // 标量常量与聚合常量（zeroinitializer 等）
+}
+
+pub struct Global {                    // 有地址的东西：字符串字面量（@.fmt_int 这类）
+    pub name:    String,               // ★ 符号名，不是源码文本：谁铸的名字谁存（IR 里没有 src 可切）
+    pub ty:      TyId,                 // 指向的内容类型；数组字面量这里是 [u8; N]
+    pub init:    ConstId,              // 初值：指向 consts 里的一个聚合常量
+    pub linkage: Linkage,
+}
+
+pub struct Const {                     // 没有地址的东西：能被任意多条指令直接当操作数用
+    pub kind: ConstKind,
+    pub ty:   TyId,
+}
+
+pub enum ConstKind {
+    Int(i64),                          // 收所有整数类型与 bool，按 ty 截断/重解释（i32/u32/isize/usize 都是 4B）
+    Zero,                              // zeroinitializer：聚合（尤其大数组）的全零初值，不必逐元素展开
+    Aggregate(Vec<ConstId>),           // 逐元素的聚合常量（数组、struct）
+    Undef,                             // 规范允许"未初始化处读出任意值"（UB，从简处理）
+}
+
+pub enum Linkage {
+    External,   // 别处也能看见：我们要调 __rx_print_int / printf，自己不定义
+    Internal,   // 本模块私有，但要有正常符号名：__rx_source_main（给 C 运行时从外部起跳）
+    Private,    // 内部临时量，连符号名都不该外泄：@.fmt_int 这类字符串字面量
+}
+```
+
+⇒ `globals` 与 `consts` 的分界是**有没有地址**：`@.fmt_int` 出现在 `.ll` 的全局区、打印成一个符号名，`42` 只出现在某个操作数位置上（聚合常量还得能直接当 `store` / `memcpy` 的源——否则 `[0; 100]` 要先物化进内存，凭空多出 100 条指令）。**`Global` 有 `Linkage` 而 `Const` 没有**：链接属性是**符号**的属性。三个变体都必须区分：`Private` 表达"不许被外部看见"，否则 `@.fmt_int` 会在链接期与别人的同名符号撞车——两边都合法、都编过、链起来随机错。
+
+```rust
+pub struct Function {
+    pub name:    String,          // ★ 符号名就该是 String —— IR 没有 src 可切
+    pub linkage: Linkage,
+    pub ret:     TyId,            // 源码返回类型；() 如实记
+    pub sret:    Option<TyId>,    // Some(T) ⇒ params[0] 是调用者给的返回槽地址（聚合返回）
+    pub var_args: bool,           // 只为 declare printf / scanf
+    pub params:  Vec<ValueId>,    // ★ 形参自己就是 Value（SSA 的入口），不是槽
+    pub blocks:  Vec<BlockId>,    // blocks[0] = entry；空 ⇒ 这是 declare
+    pub insts:   Vec<Inst>,       // ★ 扁平 arena
+    pub values:  Vec<Value>,      // ★ 扁平 arena，与 use_def 同序同长
+    pub use_def: Vec<Vec<Use>>,   // ★ 派生但常驻：DCE 的不动点里要反复查
+    pub span:    Span,
+}
+
+pub struct BasicBlock {
+    pub phis:  Vec<InstId>,   // ★ 单列：phi 恒在块首 ⇒「phi 必须在最前」变成类型事实
+    pub insts: Vec<InstId>,   // 块内顺序；★ terminator 不在里面
+    pub term:  Terminator,    // ★ 恒有：建块时写 Unreachable 占位，finish_block 时覆盖
+    pub span:  Span,
+}
+
+pub enum Terminator {
+    Unreachable,                                            // 占位 + 源码意义的 unreachable
+    Ret(Option<ValueId>),                                   // None ⇒ ret void
+    Br(BlockId),
+    CondBr { cond: ValueId, then_bb: BlockId, else_bb: BlockId },
+}
+```
+
+**`Terminator` 是独立字段、不是一种 `InstKind`**：「每个块恰好一个终结指令」变成**类型事实**，`successors()` 五行写完，不用 `last()` + `unwrap()`。**块的构造协议**：「占位」指**目标块已经作为一个空壳存在**，不是 id 为 `None`——`f.new_block()` 立刻 push 一个 `term: Unreachable` 的块并返回合法 `BlockId`，`br` 可以在目标块还没内容时就点名它，写完调 `f.finish_block(b, term)` 覆盖；函数收尾 `debug_assert` 一遍没有占位漏网 ⇒ 全文见不到 `Option<BlockId>`。Rx 没有 `match` ⇒ 不需要 `switch`。**`Function.span` / `BasicBlock.span` 留着**（`Inst` 也有一个同名的）：函数与块的边界在源码里有位置——① 后端与 pass 报错能指回源码；② pass 新造的块/指令抄来源的 span（内联抄调用点、mem2reg 的 φ 抄被替换的 `store`），第①条才在优化之后依然成立。**不存更多**：变量名、语句边界一概不进 IR（那些在 `Tables` 里）。
+
+```rust
+pub struct Inst {
+    pub kind:   InstKind,
+    pub result: Option<ValueId>,   // 无结果的指令（store / memcpy / void call）是 None
+    pub span:   Span,              // 诊断与 dump；pass 新造的指令抄来源指令的 span
+}
+
+pub struct Value {
+    pub kind: ValueKind,
+    pub ty:   TyId,                // ★ 恒为标量类型（§2.3.4 不变式 3）
+}
+
+pub enum ValueKind {
+    Inst(InstId),                        // 指令结果
+    Param { func: FuncId, index: u32 },  // ★ 形参 —— 单这一支就注定 Value 必须独立成 arena
+    Const(ConstId),
+    Global(GlobalId),                    // 全局地址
+    Func(FuncId),                        // 函数地址（间接调用 / 函数作值）
+    Undef,
+}
+
+/// 使用点：use_def[v] = 所有用到 v 的位置
+pub struct Use { pub inst: InstId, pub operand: u32 }
+
+pub enum InstKind {
+    Nop,                                                    // 墓碑：删掉的指令（见下）
+    Phi   { incomings: Vec<(ValueId, BlockId)> },
+    Alloca{ ty: TyId },                                     // ★ 只在 entry 块（lowering 不变式）
+    Load  { ptr: ValueId },
+    Store { ptr: ValueId, val: ValueId },
+    Gep   { pointee: TyId, base: ValueId, steps: Vec<GepStep> },
+    Bin   { op: BinOp, lhs: ValueId, rhs: ValueId },         // add…sdiv/udiv…xor…shl/ashr
+    Un    { op: UnOp, val: ValueId },                        // Neg | Not
+    Icmp  { pred: IntPred, lhs: ValueId, rhs: ValueId },     // 10 个谓词；结果类型 = bool
+    Zext  { val: ValueId },                                  // bool → i32（`as` 唯一要发指令的一支）
+    Memcpy{ dst: ValueId, src: ValueId, len: MemLen },       // 聚合复制
+    Call  { callee: Callee, args: Vec<ValueId> },
+}
+
+pub enum Callee { Direct(FuncId), Indirect(ValueId) }
+pub enum GepIndex { Const(u32), Value(ValueId) }
+pub struct GepStep { pub ty: TyId, pub index: GepIndex }   // 与 LLVM 同构：ty 定跨步，index 定偏移
+pub enum MemLen { Const(u32), Value(ValueId) }             // 静态聚合复制与 Vec 增长的动态复制共用一支
+
+pub enum BinOp {          // 13 个：源码的 9 个二进制运算符，按"符号性"与"LLVM 认不认"拆开
+    Add, Sub, Mul,                    // 三个不分符号：i32 型本身不带符号性
+    SDiv, UDiv, SRem, URem,           // / 与 % 各拆成有符号/无符号两条 ⇒ 只看 opcode 就够
+    And, Or, Xor,                     // 位运算
+    Shl, LShr, AShr,                  // << 一条；>> 拆成逻辑右移/算术右移
+}
+
+pub enum UnOp { Neg, Not }            // 2 个：一元 - 与 !。RV32 各有一条指令，后端一对一
+pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一个不多一个不少
+    Eq, Ne,                           // 6 个源码比较运算符
+    Slt, Sle, Sgt, Sge,               // < <= > >= 的有符号解释
+    Ult, Ule, Ugt, Uge,               // 同一批运算符的无符号解释
+}
+```
+
+**`Bin` 一个变体装 13 个运算符、不铺成 13 个变体**：它们的形状完全一样（两个值操作数、一个值结果、没有别的字段），而 IR 里绝大多数代码只关心**形状**，要按 op 分支的只有 printer 与后端指令选择两处查表。**指令集里有两处刻意的缺席**：没有 `Bitcast`（LLVM 22 只认不透明指针 ⇒ `&mut T → &T` 与 `Box` 解引用**编译成零条指令**）、没有整数转换指令（四种整数类型都映射到 LLVM `i32` ⇒ `x as u32` 只是类型层面的，只有 `bool as i32` 要发一条 `zext`；`Trunc`/`SExt`/`PtrToInt`/`IntToPtr` 整个从设计里消失）。**`align` 是算出来的，不是存的**：加载类型取 `values[result].ty`、对齐取 `tys.layout(该类型).align`，少一个要同步的冗余字段。
+
+**指令住在一个扁平 arena 里**（`Function.insts: Vec<Inst>` 扁平，`BasicBlock.insts: Vec<InstId>` 只管顺序）：mem2reg 与 DCE 都要**攥住 `InstId`**（rename 阶段手里握着被替换的 `store`，DCE 的工作表是 `Vec<InstId>`），而"每块一个 `Vec<Inst>`"下一条指令只是 `(BlockId, usize)`，一次 `Vec::remove(i)` 就让该块后续指令的位置全部失效。代价：删除留墓碑（`InstKind::Nop`，`result: None`），printer 跳过它，直到最后可选的压缩 pass 回收。
+
+**`Value` 必须与 `Inst` 分开成 arena**：① 有 `Value` 压根不由指令定义——**形参**、常量、全局、函数；② pass 要按 `ValueId` 索引 `Vec<Option<T>>`（常量传播的格、寄存器分配的 `Loc`），它必须稠密、且**不能因为删一条指令而挪位**。`inst.result: Option<ValueId>` 担起"我定义谁"这个方向，`ValueKind::Inst(i)` 担起反方向，`verify()` 用 `debug_assert` 保证两边一致。
+
+**use-def 链是 `Vec<Vec<Use>>`，`Use { inst, operand }`**：`operand: u32` 是操作数槽位号——删一条指令时**必须同时把它从各操作数的使用表里摘掉**，`replace_all_uses_with` 要知道**哪一个槽位**（只存 `InstId` 就得回去重扫操作数，而且 `add %a, %a` 根本分辨不出是哪个）。⚠ **操作数编号只许有一处定义**：`Inst::operands()` / `Inst::set_operand()` 被 printer、use-def 构造器、`verify()` 三处共用（**phi 的 `BlockId` 不算值**，`Callee::Direct` 不参与，`Callee::Indirect(v)` 参与）。⚠ **`use_def` 是派生的、不是权威的**——`Function::rebuild_use_def()` 是 O(N)，**每个 pass 入口都调一次**（脏掉的 use-def 链不是崩溃，是**静默错代码**）；**只有 `use_def` 挂在 `Function` 上**，前驱/后继、支配树、支配边界、活跃性、常量格**全部是 pass 局部暂存**（`Cfg::build(&Function)`）。完整推导与候选对比见 [`arch-phase2.md`](arch-phase2.md) §2.2.2。
 
 ### 2.3 运行机制
 
-**第一步：降到 alloca 密集的 IR（显然正确）**，然后 **mem2reg**（alloca → SSA + phi）升到 SSA。这个顺序比"直接生成 SSA"好写得多，而且 mem2reg 本身就是后续所有优化的前置。
+#### 2.3.1 sema：一趟走完 AST
 
-例子——`let x = 1 + 2; if x < 3 { print_i32(x); }`：
+**sema 的产物是表，不是树**（§1.2.3）——整个 sema 就是"**走一遍 AST，把该填的格子填上，同时把不该通过的程序拒掉**"。`check(&Ast, &[u8]) -> Result<Checked, SemError>` 里那条路走五步（第 2 步自己再分三个子趟，所以一共七个入口函数），**顺序不能换**：
 
-| 步骤 | IR |
-|---|---|
-| 直接降级 | `%x = alloca i32` / `store i32 3, ptr %x` / `%t = load i32, ptr %x` / `%c = icmp slt i32 %t, 3` / `br i1 %c, label %then, label %join` |
-| **mem2reg 之后** | alloca/store/load **全部消失**，`%x` 直接变成 SSA 值 `3`；有分支合流处插 `phi` |
+| # | 入口函数 | 做什么 | 写什么 | 前置 |
+|---|---|---|---|---|
+| 1 | `declare_protected_names` | 保护名预填根作用域（各自那张表） | 根 `types` / `values` | — |
+| 2a | `declare_items` | 扫 `ast.root`：顶层 item 进根作用域 + **重名检查**；`struct` 顺手**造壳**；`impl` 什么都不做 | 根 `types` / `values`；`struct_items`；`TyArena` 里的空壳 | 第 1 步 |
+| 2b | `declare_impls` | 扫 `ast.root` 挑出 `impl`：解析目标类型，把关联项的**名字**写进 `assoc` | `assoc` | 2a **全部**走完 |
+| 2c | `check_consts` | 扫 `ast.root`：**求常量值**，每个 `const` 项（顶层 + 关联）都求一遍，再跟它声明的类型比对（`resolve_type` 会顺带 intern 新类型：`kinds` / `interner` / `layouts` 三格，**不碰 `StructDef.fields`**） | `tables.const_values` / `const_color` | 2a（顶层名字）、2b（`assoc`——`Self::N` / `Config::N` 要用） |
+| 3 | `finish_structs` | 填每张 struct 的**字段表**（顺带查字段重名） | `StructDef.fields` | 第 2 步**全部**走完 |
+| 4 | `check_layouts` | **每个** struct 都算一遍布局（环检测就在里面） | `TyArena.layouts` / `StructDef.offsets` / `visiting` | 第 3 步 |
+| 5 | `check_crate` → `check_fn` / `check_block` / `check_stmt` / `check_expr` | 走函数体（表达式、语句、块）。**`check_crate` 是这一趟的分发器**：扫 `ast.root` 把顶层的 `Fn` 与每个 `Impl` 里的 `Fn` 挑出来、判 entry 四条，再逐个交给 `check_fn` | `tables.exprs`（每行 `res` / `ty_id` / `coercion` / `cat`）、`tables.let_tys`：定型与 place 判定的结论全在这里，排期见 [`plan.md`](plan.md) §0 | 2a / 2b（名字齐）、2c（常量值齐）、3 / 4（类型与布局齐） |
 
-**交付判据**：在没有自写后端的情况下，用 clang 编译自己的 `.ll` 跑通一批测试——这等于把"前端+中端是否正确"变成一个可独立验证的问题。
+第 2 步自己**是三个子趟**——都只从 item 收集、都不看声明顺序、都必须在往下走之前走完（后面任何一步都可能用到它们定出来的东西）；三个子趟**内部**顺序无所谓，**之间**顺序定死（2a → 2b → 2c）。
 
-**本阶段要满足的测试点**（2026-09-22 加）：`semantic` **236 条 = 69 正 + 167 负**（负例占七成），外加 `codegen` 的正例集**与它是同一批源文件**（60/60 逐字节相同）⇒ **W8 把 semantic 打满，W12 就只剩"汇编生成得对不对"**。
+**2a：名字进表。** 走 `ast.root`，只做三件事：`Struct { name, .. }` → **造壳**（`new_struct` + 名字进根 `types` + item 收进 `struct_items`）；`Fn` / `Const` → 名字进根 `values`；`Impl` → **什么都不做**（`impl` 不进任何表，2b / 2c 各自扫 `ast.root` 把它挑出来）。
 
-167 个负例**高度集中在少数几条规则上**，逐条对照 [`spec-mapping.md`](spec-mapping.md) §6：
+**2b：关联项的名字进 `assoc`。** 与 2a 扫同一份 `ast.root`、只挑 `Impl`：`resolve_type(target)` 求出目标类型、**必须落在 `TyKind::Struct(sid)` 上**（数组、`Box`/`Vec`、引用、标量都是编译错误；`impl (S)` 写括号走 `Paren` 那一支、落到同一个 struct），然后 `cur_self = Some(sid)`，把每个关联项的**名字**写进 `assoc[sid]`（同一 struct 的多个 `impl` 块**共用**这一片）。**扫 `ast.root` 只拿得到 `impl` 这条记录、拿不到关联项本身**：关联项不在 `ast.root` 里（§1.2.2），必须从 `ItemKind::Impl.items` 进去。2a 全部走完才开始 2b（目标类型名是 2a 写进根 `types` 的）；2b 还必须排在 2c 与第 3 步之前（字段类型里 `[T; N]` 的 `N` 可以是一条 `S::N` 路径）。
 
-| 规则 | 条数 | 难在哪 |
+**重名检查只在三处做，`let` 不做**：顶层 item、关联项、struct 字段走 `declare_type` / `declare_value`（撞了就报，签名见 §2.2.1）；**`let` 是遮蔽**——`let x = 1; let x = 2;` 合法，直接插进当前作用域覆盖。
+
+**2c：求常量值。** 把**每一个** `const` 项求一遍值、再跟它声明的 `ty` 比对——**不管有没有人引用过它**（`const A: i32 = true;` 谁也没用也已经是非法程序）。**为什么它钉在 2b 与第 3 步之间**：① `[i32; 4]` 与 `[i32; (4usize)]` 是**同一个类型**，而"同一个类型"在 intern 之后就是"同一个 `TyId`" ⇒ **数字必须在 `intern` 之前求出来**，不能先 intern 再补；② 求值可能要走 `assoc`（`Self::N`），且 `names.md` 让前向引用合法（`const A: i32 = B; const B: i32 = 3;`）⇒ 不能在声明处就地求。完整推导见 [`arch-phase2.md`](arch-phase2.md) §2.3.0。
+
+**常量值的三个调用点**：类型里的数组长度（`TypeKind::Array`，决定 intern 出哪个 `TyKind::Array`）、表达式里的重复长度（`ExprKind::ArrayRepeat`）、`const` 项的初始化式（求值后与声明的 `ty` 比对）。
+
+**求值族的函数**（都在 `src/sema/mod.rs`）：
+
+- **`eval_const_item` 是唯一碰 `tables.const_values` / `const_color` 的地方**：不在表里（`White`）→ 标 `Gray` → 解析声明的类型 → 求初值 → 比对 → 标 `Black` 并写缓存；撞见 `Gray` 就是环、**在求初值之前**报。
+- **`check_consts`** 只做一件事：扫一遍 `ast.root`（顶层 `Const` 求掉、`Impl` 进 `Impl.items` 求关联常量），**不新收一张清单**（§2.2.1 的"留桥不留副本"）。
+- **`eval_const_value`** 走一个语法节点、**不缓存**（语法节点没有身份、且可被两个项共享）；`expected = None` 的意思是"**没有**期望类型，字面量退回 `i32`"。
+- **`eval_int_literal`** 是"整数字面量的类型怎么选"这条规则**唯一**的家：**`suffix` → 期望类型 → `i32` 兜底**；第 5 步的字面量用的也是它。
+- **`resolve_value_path`** 是**值命名空间**的路径解析，**常量上下文与第 5 步共用同一个函数**；它只回答"这条路径指向哪个 `ValueSym`"，**"够不够格当常量"是调用方的后置条件**。
+- **`array_len`** 期望类型是 `usize`、返回值收成 `u32`。⚠ **2b 也可能撞上它**（`impl [i32; N] {}`），那时 2c 还没跑 ⇒ 它必须走求值器，**不许直接读 `tables.const_values` 的缓存并假定它有值**（这类程序最终一定被 `InvalidImplTarget` 拒掉，只影响报错先后）。
+- **`lookup_value`** 是 `lookup_type` 的镜像：从栈顶沿 `parent` 往外，**不查 `assoc`**——关联常量只以 `Type::NAME` 可达，所以 `impl Config { const N: usize = 3; }` 与 `let N = 9;` 可以共存。
+
+**五种形态各一条**（`ast::ConstValueKind` 正好五个变体）：
+
+| 形态 | 怎么求 | `expected` 往下传吗 |
 |---|---|---|
-| `vec-index-mutability` | **22**（单个最大目录） | **place 可变性要逐层传上去**：`v[i].f = 1` 要 `v` 可变、`v[i]` 内的字段可变、若中间隔着一层引用还要那层引用是 `&mut`。这不是借用检查，是**"写进一个 place 需要沿途每一层都可写"**——但没有借用检查器帮你，纯靠自己走 |
-| `namespace-errors` | 16 | 名字空间规则：struct 与 fn **可以**同名；`const f` 与 `fn f` **撞**；局部变量**遮蔽函数且没有回退**（`f()` 不回去找函数）；参数重名；`let x = x;` |
-| `invalid-impls-and-generics` | 12 | `impl` 目标必须是具名 struct；`Box`/`Vec` 实参数量与种类 |
-| `copy-clone-and-equality` | 12 | derive 的能力约束互相牵连：`Copy` 要求 `Clone`、`Eq` 要求 `PartialEq`、不许重复、**`Box`/`Vec` 字段挡 `Copy`**、`&mut` 字段挡 `Clone` |
-| `constant-errors` | 10 | 常量求值**成环检测**（直接 / 间接 / 关联项）、`usize` 数组长度、前向引用 |
+| `Int { digits, suffix }` | 切 `digits` 的进制与 `_` 分隔（复用 lexer 的 `base_and_digits_at`），折成 `i64` | 叶子 |
+| `Bool(b)` | 直接就是 `b`，类型恒为 `bool` | 不用 |
+| `Paren { inner }` | 递归进去——`(4usize)` 走的就是这里 | **传** |
+| `Neg { operand }` | 递归求出 `operand` 再取负；**要求操作数的类型是有符号整数**（`-1u32` 是负例） | **不传** |
+| `Path(p)` | `resolve_value_path` 拿到符号、要求它是 `Const` ⇒ 再 `eval_const_item` 取它的**声明类型与值** | **不传** |
 
-⚠ **derive 生成的 `clone` / `==` 是编译器**造的**，不是源码里的方法**——所以它们**绕过点调用查找**（[`spec-mapping.md`](spec-mapping.md) §6 的 `trait-dispatch-and-reference-equality`）。这一步别指望"方法查找找不到就报错"能兜住。
+**期望类型是这条路上最容易做错的一处**：三个入口**都带期望**（`const` 项的初值式带**它声明的类型**，数组长度与重复长度带 **`usize`**）——`const N: usize = 3;` 之所以合法、`[i32; 4]` 之所以不用写后缀，都是这个原因。**`Neg` 不往下传**：`const N: isize = -1;` 规范定为 **UB**（*it needs the expected type to pass through unary minus*），最简单的读法就是"`-` 那一步不穿透"、里面的字面量拿 `i32` 兜底（UB 的程序不进任何测试，"多报一个错"是安全方向）。**`Path` 不往下传**：路径有它自己声明好的类型——负例的根：`const N: i32 = 2; let a = [1; N];` 里 `N` 就是 `i32`、**不等于** `usize` ⇒ 报错；若允许路径吃期望类型，这条负例会变正例。**环检测**与布局环同一套路（三色 + 一张结果缓存），只是递归边换成"常量项引用另一个常量项"，且规范要求**在求值之前**检出。
 
-✅ **好消息**：已删除的 `semantic/README.md` 明说 **"Tests do not ask for ownership, borrow, or lifetime analysis"** ⇒ **不要写借用检查器**。要写的是**place 可变性**（上面那条），它比借用检查简单一个数量级。
+**第 3 步：填每张 struct 的字段表。** 需要一条「`StructId` → 那个 struct 的 `ItemId`」的对应，本实现就是 `Sema.struct_items`（2a 按声明顺序收）：`new_struct` 对每个 struct item 恰好调一次、顺序相同 ⇒ **第 k 个结构体的 `StructId` 就是 `StructId(k)`**，下标直接对齐。逐个结构体：设 `cur_self = Some(StructId(k))` ⇒ 对每个字段 `resolve_type(f.ty)`（**会递归、可能 intern 出新类型**）⇒ 查字段重名（重名的 span 必须是**重复的那个字段名**，所以只能在手上有 AST 的这一趟查）⇒ `TyArena::finish_struct`。**循环头按下标**（`for i in 0..n`），**不许**写 `self.struct_items.iter()`——`iter()` 会把 `&self` 攥到循环结束、与循环体里的 `&mut self` 冲突（`ItemId` 是 `Copy`，按下标取出的借用在那一行之内就结束）；**这条对 `Sema` 上所有 `Vec` / `HashMap` 字段一视同仁**（2b / 2c 扫的 `ast.root` 是引用字段，不受约束）。⚠ **`struct_items` 与 `tys.structs` 的下标对齐是唯一靠人守的不变量**：`new_struct` 与 `struct_items.push(item_id)` 必须成对出现，开头加一行 `debug_assert_eq!` 就能在错位的第一时间抓住。
+
+**第 4 步：算布局。** 这是**唯一**写 `TyArena.layouts` 与 `StructDef.offsets` 的地方，规则全在 §2.2.1 的 `layout_of` 那张表里；**每个 struct 都跑一遍**，不看有没有人引用它。
+
+**第 2 步与第 5 步的分工**：顶层 `fn` / `struct` 与关联项都不看声明顺序（`names.md`）⇒ 名字在第 2 步**全部**落地，第 5 步**只查不改**；`let` 反过来顺序敏感，只能边走边加。
+
+**第 5 步：走函数体。** 入口是 `check_crate`（这一趟的分发器），它扫一遍 `ast.root`：顶层 `Fn` ⇒ 判 entry 四条、设 `cur_self = None`、`check_fn(item_id)`；`Impl { target, items }` ⇒ `resolve_type(target)` 求出 `Struct(sid)`（2b 已经拒过别的），设 `cur_self = Some(sid)`，再对 `items` 里每个 `Fn` 调 `check_fn`；`Struct` / `Const` 跳过。**不遍历 `assoc` 去找"关联的 `Fn`"**：那是 `HashMap`、迭代顺序逐进程变（报错顺序不可复现），而且里面还混着常量；`ast.root` → `Impl.items` 才是那份清单。**必须查全部函数，不是只查可达的**：签名里的错（`fn f(x: Missing) {}`）没人调用它也一样要报。
+
+**entry 四条**（只对顶层那个叫 `main` 的函数判；判据是 `self.text(name.span) == "main"`，**不能**用 `lookup_value("main")`——`const main: i32 = 1;` 会让值命名空间命中 `Const`，误判成"有 main"）：整份没有顶层 `fn main` ⇒ 报错；`has_generic_params` ⇒ 报错；`params` 非空 ⇒ 报错；`resolve_type(ret)` 不是 `Unit` ⇒ 报错（`ret` 缺省就是 `Unit`，所以 `fn main() -> ()` 要放行）。**先走签名，再走身体**（目前只落了"必须有 `main`"这一条）。
+
+**每个函数 `check_fn(&mut self, item_id: ItemId)`**（签名里**没有** `cur_self` 参数——**调用方先设 `self.cur_self` 再调**，因为"这个函数属于哪个 struct"是调用点的知识）：`recv.is_some()` 而 `cur_self` 为空 ⇒ 报错（顶层函数不能有接收者）；解析 `ret` 存进 `item_sig` 与 `cur_ret`；`push_scope()` 装形参（每个形参 `resolve_type` ⇒ `declare_value`，**查重不是遮蔽**：`fn f(x: i32, x: i32) {}` 必须报错）；`check_block(body)`（再压一层）；`pop_scope()`。**接收者不是形参**：`recv` 是 `Option<Receiver>`、不占 `params` 的位置；`check_fn` 在 `push_scope()` 之后按 `recv.is_some()` 把 `self` 声明进作用域（值 `ValueSym::Local(BindingId::Recv(item))`），由此"`self` 指谁"由作用域表回答，`cur_self` 只管 `Self`。
+
+**要维护的只有一样东西：当前作用域**——就是 `Sema.scopes` 那个栈（§2.2.1），进块压、出块弹；**当前作用域恒为栈顶**（`Sema::cur_scope()`），没有第二处要同步的状态。第 5 步里 `insert_local`（**只给 `let` 用**，遮蔽、不查重）与 `declare_value`（顶层 item / 关联项 / **形参**，撞了就报）不是一回事。`BindingId` 由**出生地**决定（§2.2.1）：`let` 用 `BindingId::Let(stmt_id)`、形参用 `BindingId::Param { item, index }`、接收者用 `BindingId::Recv(item)`——**没有计数器、没有 `new_binding`**。
+
+**哪些 AST 节点会带出一个块**——第 5 步只有这五处换作用域：函数体 `Fn.body`、`ExprKind::Block`、`ExprKind::Loop`、`ExprKind::While.body`、`ExprKind::If.then_block`。`else` 不在这张表里：`If.else_branch` 是一个 `ExprId`（`else { … }` 是块表达式、`else if` 是 `If` 表达式），两者都从 `check_expr` 那扇门进来。**`check_block` 的机制**一行：`push_scope()` ⇒ 按源码顺序 `check_stmt`（每条语句的结论按 id **写下标**、不 push——parser 建节点是后序、sema 走 AST 是前序）⇒ 取块值（最后一条 `semi: false` 的表达式语句）⇒ `pop_scope()` ⇒ 把块类型**返回**给上层（不落表）。
+
+**`check_stmt` 只有三个变体**：`Empty` 什么也不做；`Expr { expr, .. }` ⇒ `check_expr`（`semi` 在这条路上用不上）；`Let { binding, ty, init, .. }` ⇒ **先 `check_expr(init)`、再 `resolve_type(ty)`（有标注时）、最后发绑定并插入当前作用域**（顺序是规范钉的：*a local binding is visible only after its initializer*——先走 `init` 再插绑定，`let x = x;` 里的 `x` 就不是正在声明的那个）。`semi` 留给后面的块定型——它是"谁是块尾"的**唯一**依据（§1.3.5）。
+
+**`check_expr` 是定型的主场**（签名 `check_expr(e, expected: Option<TyId>) -> Result<TyId, SemError>`）：① 递归进子表达式（`ast::ExprKind` 25 个变体全覆盖，`Cast` 另加 `resolve_type`、`ArrayRepeat.len` 走常量求值）；② `Path` 做名字解析，`Field` / `Index` / `Deref` / `Method` 查 `TyArena` 拿类型；③ 带块的变体压弹作用域；④ `break` / `continue` 查循环栈、`return` 与函数尾查 `cur_ret`；⑤ 按每个变体自己的规则算出类型，末尾**写一次** `tables.exprs[e]` 并把类型**返回**给父节点——**父节点用返回值、不读表**。`expected` 是上下文往下传的"这里应该是什么类型"（`let x: u8 = 1;` 里的 `u8`），字面量靠它决定自己的类型；块类型用 `check_block` 的返回值传（`ast.blocks` 与 `ast.exprs` 是两个独立 arena）。判据表见 [`spec-mapping.md`](spec-mapping.md) §7「定型规则表」。
+
+
+**循环栈**：`break` / `continue` 要一个 `Vec<LoopInfo>`，每层记三样：`kind`（`loop` 还是 `while`——判「`break` 值只在 `loop` 里合法」要看栈顶）、`expected`（`loop` 自己的类型当期望类型下传给 break 值）、`break_tys`（这一层已见的 break 值类型；收齐后算 `loop` 的类型，一个都没有就是 `!`）。进循环压、出循环弹。⚠ **`while` 的条件在压这一层之前走，且走条件前把外层整摞暂时取走**（`mem::take`，走完放回）——`loop-expr.md:21` 要求条件里的跳转 "must target a loop nested inside that condition"，指向该 `while` 自己或任何外层循环都是错。跳转的判据因此只有一条：**栈空即非法**（`InvalidJumpTarget`）。⚠ 这张栈只回答"合不合法"；lowering 的 `LowerCtx.loops` 那张表回答"跳到哪个块"（那张表的元素类型叫 `LoopCtx`，见 [`arch-phase2.md`](arch-phase2.md) §2.3.1），**两张不是一回事，名字也故意分开**。
+
+**`resolve_type` 把语法类型换成 `TyId`，五种语法形态各一条**（`ast::TypeKind` 正好五个变体）：`Paren(t)` 递归进去（`Box<(i32)>` 走的就是这里）；`Path(p)` 交给 `resolve_type_path`；`Unit` 直接 `TyKind::Unit`；`Ref { mutable, inner }` 递归后包一层；`Array { elem, len }` **先递归 `elem`、再 `array_len(len)` 求出数、最后一起 intern**——**数的存在必须先于那次 `intern`**（理由见前文 2c）。
+
+**`resolve_type_path`：只看 `segments[0]`，多段一律错。** 一个类型路径能解析成什么，规范里是封闭的五项（`paths.md`：内置标量、已声明 struct、`Self`、`Box<T>`、`Vec<T>`）；而类型命名空间里没有任何"装着类型的容器"——没有模块、没有类型别名、`use` 不引入名字、关联项只有常量与函数（没有关联类型）⇒ 第二个 `::` 后面无处可查，`a::B`、`S::Item`、`Self::LIMIT`、`std::vec::Vec<i32>` 全都报错，**跟后面写的是什么无关**。整个函数两步：`segments.len() != 1` ⇒ 报错；否则看唯一的 `segments[0].name`：
+
+| `segments[0].name` | 要几个类型实参 | 产出 |
+|---|---|---|
+| `Ident` 查到 `TypeSym::BoxCtor` / `VecCtor` | 恰好一个 | `TyKind::Boxed` / `TyKind::Vec` |
+| `Ident` 是 `SelfType`（`Self`） | 零个 | `struct_ty(cur_self)`；`cur_self` 是 `None` ⇒ 报错（**`Self` 不是标识符，没有名字可查**） |
+| 其余 `Ident` | 零个 | 查作用域栈的 `types`：`TypeSym::Ty(t)` 直接用它；查不到 ⇒ 报错 |
+| `Ident` 是 `SelfValue`（`self`） | — | 报错：`self` 是接收者、不是类型名 |
+
+`self` 之所以会作为路径段出现在这里，是因为**接收者本身就是一条单段路径**（`self` 在 Rx 里只有"接收者"一个意思）；它在类型位置一律报错——语法收、语义拒。"要几个类型实参"数的是 `segments[0].args.types.len()`（`args` 是 `None`、或 `<>` 里空的，都算零个），三种错法因此各归其位：`Box`（漏写实参）、`Box<i32, bool>`（写多了）、`i32<bool>`（不是容器却写了实参）。**`Box<i32>` 与 `Box::<i32>` 在 AST 里是同一个东西**（两种写法都落进 `PathExprSegment.args`）；生命周期实参在 parser 就被丢掉，所以 `View<'a>` 算零个实参。`Box<i32>` 在这里**能**解析出 `TyKind::Boxed(i32)`——"这个类型能不能当 `impl` 目标"另有检查，不归这个函数管。
+
+**路径与名字怎么解析。** 规范只有**两个**命名空间（`names.md` 的 *Type and value namespaces* 表）：**Type** 与 **Value**——**常量属于 Value**（那行的原文是「Function, constant, local binding, or `self` in an expression」）。所以一条路径往哪张表里查，只看它站在哪个命名空间；"常量上下文"（`const_eval.md` 定义的那三处：`const` 初始化式、数组长度、repeat 长度）**不是第三个命名空间**，只是在一条**值**路径之上再加一条后置条件。
+
+**一条路径只可能出现在这六个槽位**（`ast::PathId` 在 AST 里只有这六个落脚点）：
+
+| # | 槽位 | 谁解析 | 段数 |
+|---|---|---|---|
+| 1 | `TypeKind::Path`（`let x: T`、形参 / 返回类型、字段类型、`impl` 目标、`as T`） | `resolve_type_path` | 只认 1 段 |
+| 2 | `ConstValueKind::Path`（`const` 初始化式、`[T; N]`、`[e; N]`） | `resolve_value_path` + 调用方后置条件 | 1 或 2 段 |
+| 3 | `ExprKind::Path`（表达式里的裸值名） | `resolve_value_path` | 同上 |
+| 4 | `ExprKind::Call.callee`，且它本身是 `ExprKind::Path` | 同上，再加段数守卫 | 同上 |
+| 5 | `ExprKind::Struct.path` | **不解析**（归定型那一趟） | — |
+| 6 | `ExprKind::Method.name`（类型是 `PathIdentSegment`，**不是** `PathId`） | **不解析**（归定型那一趟） | — |
+
+`use` 的 `UsePath` **不在表里**（parser 解析完整条就丢，不进 `ast.paths`）。**段数——先分命名空间，再看上下文限制**：Type 侧只认 1 段（2 段拒——Rx 没有关联类型，`A::B` 在类型位置没有可指的目标）；Value 侧 1 段查值命名空间（**#2 另加**结果必须是 `Const`；**#4 另加**结果必须是 `Fn` / `Builtin`）、2 段头段走 **Type** 命名空间查到那个 struct、再查 `assoc[sid]` 的成员名、≥3 段拒。**值侧的 2 段没有「未命中也放行」这一说**：头段命中 `Box` / `Vec` 构造器就按尾名查**内建表**（`new` / `clone` / `len` / `is_empty` / `push` / `remove`，不在表里就是错），命中具名 struct 就查 `assoc[sid]`，两处都没命中一律 `InvalidPath`。
+
+**泛型实参只有一条规则：`args` 只许挂在"命名类型的那一段"上。** 类型位置的段（1 段、2 段的 head）合法，按类型位置的规矩来（`Box` / `Vec` **恰好 1 个**类型实参，具名 struct 与内建标量 **0 个**）；值 / 成员位置的段（2 段的 tail、凡在值命名空间命中的段、方法段）**一律拒**——函数、常量、成员都不是类型。判据落在一个自由函数 `has_type_args(seg)` 上、两处共用：它数的是 **`args.types` 空不空，不是 `args` 是否为 `None`**（生命周期实参不进 `types`）。这一条同时管住 #2 / #3 / #4：`f::<i32>()`（值位置）、`v.len::<i32>()`（方法段）、`Config::<i32>::N`（struct 却带了实参）都被它拒掉。
+
+`resolve_value_path` 返回 `Result<ValueSym, SemError>`——**没有「解析成功、但还没定」的中间态**：1 段的 `self` 不在作用域里、`Self` 当值用、`Box` / `Vec` 没有类型实参或尾名不在内建表里、2 段的头不是具名 struct / `assoc` 未命中，**全是硬错**。内建成员（含 derive 生成的 `clone`）一律走内建表、不落 `assoc`。可达性判据因此全在**调用方**：#2（常量初值）要求结果必须是 `Const`；#4（callee）只认 `Fn` / `Builtin`，`Local` / `Const` / 解析不出具名物的一律 `NotCallable`——**函数当值是 UB ⇒ 局部量里永远装不了函数，不用去查它的类型**；`(f)()` 合法，靠 `Paren` 把 `res` 照抄下来。单段命中 `Fn` 就放行，**即使它被当值用**（`let f = helper;`）：规范把「函数当值」定为 UB 且不要诊断，不许因它拒程序。
+
+`Self` 只在 `impl` 块内或 struct 声明内有意义（*Self denotes the struct being declared or the target type of the current inherent implementation*）；三个内建 I/O 按名字直接认。
+
+**报什么错**：`SemErrorKind` 照课程给的八类清单一一对应（`semantic/README.md` 按 *name, type, mutability, capability, constant, layout, receiver, entry* 分类）：
+
+| 类 | 什么时候报（一句话） |
+|---|---|
+| **name** | 名字查不到、用错命名空间（`fn` 与 `const` 撞车，`struct` 与 `fn` 不撞）、重复定义 |
+| **type** | 类型不匹配、隐式转换不成立（引用 coercion 远没有 Rust 多）、`as` 的合法组合之外、数组长度不是 `usize` 常量 |
+| **mutability** | 写一个不可变的 place；**透过 `Vec` 下标写时，路径上任何一层共享/不可变就不行** |
+| **capability** | derive 的**互相牵连 + 逐字段**检查：`Copy` 必须同时请求 `Clone`、`Eq` 必须同时请求 `PartialEq`、`Box` 字段挡 `Copy`、`&mut` 字段挡 `Clone` |
+| **constant** | 常量初始化式类型不符、常量环（直接 / 间接 / 关联三种都要检出）、负号加在无符号常量上 |
+| **layout** | 布局环（`struct A { a: A }`）；**只有 `Box`/`Vec` 能破环**，内联数组不破环 |
+| **receiver** | `self` 出现在方法之外、可变接收者需要可变 place、显式关联调用 `S::m(x)` **不做 autoref**、关联值跨 `impl` 块共享同一命名空间 |
+| **entry** | `main` 必须存在、不能有值参数、必须返回 `()`、不能有泛型参数 |
+
+八类之外还要一类**跳转目标**（`break`/`continue` 在循环外、循环条件里的跳转不能指向该循环本身）——细则与分布见 [`spec-mapping.md`](spec-mapping.md) §6.1 的两张表。
+
+#### 2.3.2 lowering：AST → IR
+
+一个 `LowerCtx` 走遍 AST，**每条规则都只做"显然正确"的转录**，不做任何需要"想一下"的优化。
+
+```rust
+struct LowerCtx<'a> {
+    ast:    &'a Ast,        // 只读：按 ExprId / BlockId 取回节点本身
+    tables: &'a Tables,     // 只读：exprs[e] 的 ty_id / cat 是"是什么类型、是不是 place"的判据（§1.2.3）
+    m:      &'a mut Module, // ★ 唯一被写的地方：新函数、新块、新指令、新常量、新全局都往这里放
+    f:      FuncId,         // 正在降的函数（新块、新指令的归属）
+    cur:    BlockId,        // 正在写的块 —— 回答"下一条指令插哪"
+    vars:   HashMap<BindingId, ValueId>,   // 变量 → 它的住所：let 的住所是 entry 里那条 alloca
+    loops:  Vec<LoopCtx>,                  // 循环栈：break / continue 该跳去哪个块
+}
+
+struct LoopCtx {
+    cont:   BlockId,          // continue 的目标（while 是条件块、loop 是循环头）
+    exit:   BlockId,          // break 的目标：循环之后那个块
+    result: Option<ValueId>,  // 循环带结果类型时 break 的值存进的那个槽；while 恒为 None
+}
+```
+
+`ast` / `tables` 是只读的 `&`、`m` 是唯一的 `&mut`（"谁改了 IR"永远只有一个答案）；`f` 与 `cur` 分开，是因为 `new_block()` 要同时 push 新块并切换 `cur`，合成一个字段会借两次。**读变量的规则是一句话**：在 `vars` 里就 `load`，不在表里就是形参本身（不可变的标量形参根本不进这张表——它自己就是一个 SSA 值）。**`result` 是个槽而不是 SSA 值**：`loop { break 1; }` 的值要在循环之后才被读到，而那时块已经终结；用槽带值不需要任何分析就一定对，反正 mem2reg 紧接着会把它提升掉（lowering **不自己造 φ**，§2.3.3）。完整论证见 [`arch-phase2.md`](arch-phase2.md) §2.3.1。
+
+⚠ **`vars` 的键必须是 sema 给出的"绑定身份"（`BindingId`），绝不能是名字**：`let x = 1; let x = 2;` 是**两个**不同的绑定、**两条** `alloca`；而循环体里的 `let` 只有**一条** `alloca`（那句 `store` 每轮执行一次，槽是同一个）。"哪一处 `let` 是哪一个绑定"是 `tables.exprs[e].res` 的回答范围（§1.2.3）——`ValueSym::Local` 的载荷必须给得出一个绑定身份，否则 lowering 拿不到槽。
+
+**每条规则怎么降**：
+
+| AST | 降成 |
+|---|---|
+| 形参 | 直接是 `Value`（`ValueKind::Param`），**不是槽** |
+| 局部变量（`let`） | **entry 块**一条 `alloca`（大小与对齐查 §2.2.1），`let` 处一条 `store` |
+| 读变量 / 写变量 | `load` / `store`（聚合类型除外，见下） |
+| 算术 / 比较 | 一条 `Bin` / `Icmp` |
+| `if` / `while` / `loop` | `new_block` 建壳 → `CondBr`/`Br` → `finish_block` 收口 |
+| `break` / `continue` / `return` | 一条终结指令 **+ 开一个不可达的新块**继续降后面的语句（新块的终结指令留着 `Unreachable` 占位不动，§2.2.2）。**不可达代码照样要降**——语义阶段照样检查它 |
+| `println_i32` 等内建 | 一条 `declare` + 一条 `Call`（包装体见 §2.3.5） |
+
+**整套 lowering 的枢纽只有两个函数**（place/value 二象性，直接消费 §1.2.3 的 `Category`）：`lower_place(e) -> ValueId` 返回**一个 `ptr`、绝不 load**，`lower_value(e)` = 前者且标量时补一条 `load`；`tables.exprs[e].cat` 决定哪一个是合法的、`tables.exprs[e].ty_id` 决定要不要补 `load`，**lowering 绝不自己重新判断"这是不是 place"**（那是 sema 的活）。`Category::Place` 降出来的是**一个 `ptr`**、不是那个 place 的类型的值 ⇒ `&x` 就是 `lower_place(x)`、`*r` 也走 `lower_place`（引用运行期就是一个 `ptr`）、`&mut T → &T` 同样**零指令**（§2.2.2 没有 `Bitcast`）。
+
+**聚合类型只住在内存里，`Value.ty` 恒为标量**：标量（四个整数 / `bool` / `&T` / `&mut T` / **`Box<T>`**）是一个 SSA 值、mem2reg 能提升；聚合（struct / `[T;N]` / **`Vec<T>`**）**或任何被取过地址的**住一个栈槽，访问一律"地址 + `GEP` + 标量 load/store"、mem2reg 不动它。⇒ mem2reg 永远不会插一个 struct 的 φ，寄存器分配永远不见多字宽的值，后端只需要**一套**"搬字节"的概念；整块聚合的搬家是一条 `Memcpy`。**`Vec<T>` 是 `%Vec = type { ptr, i32, i32 }`**（数据指针 / 长度 / 容量，12 字节 align 4）：**长度必须存**（`len()` 可观测），容量自由（`heap.md`：*Capacity and growth are unobservable implementation choices*）；它**永远不会被提升**（每个方法都收 `&self`/`&mut self`，地址必然被取）。
+
+**聚合实参 / 返回值：一次定死**（完整论证见 [`arch-phase2.md`](arch-phase2.md) §2.3.1）。**实参用"被调方复制"**：调用方传指向实参 place 的 `ptr`，被调方 entry `alloca` + `memcpy` 进来 ⇒ `fn f(mut x: [i32;3])` 里改 `x` 碰不到调用方（规范明写要考：*mutating the parameter … must not modify the caller's value*）。**返回值用 `sret`**：调用方分配目标槽、把地址当隐藏的 `params[0]` 传进去，被调方写那儿再 `ret void`；**绝不要**"被调方在自己栈帧里分配再返回指针"（`g(f())` 时 `g` 的栈帧会覆盖 `f` 已经死掉的那块）。clang 打印成 `sret(%struct.S)` 的那个属性我们**不必打**（只是优化提示），普通前导 `ptr` 参数合法，自己的后端读 `Function.sret` 就知道。标量直接按值传；`()` 什么都不传、也不占返回寄存器。
+
+**不加 `inbounds`**：元素步进用单下标形式 `gep T, ptr %data, i32 %i`，这要求丢掉 `inbounds`（带它就被逼进 `[0 x T]` 数组类型与双下标形式）⇒ **一律发朴素 `getelementptr`**。
+
+#### 2.3.3 mem2reg
+
+**前置条件只有一个谓词 `is_promotable`**：一个 alloca 可提升 ⟺ 它的类型是标量 **且** 它的 `ptr` 值的使用**只有 `Load`/`Store`**（没进过调用、没当过 `GEP` 的基址、没被 `store` 出去）。不满足就**留在内存里**——`Vec` / 被取地址的局部自动落选。
+
+算法是教科书流程：支配树（Cooper–Harvey–Kennedy 迭代法）→ 支配边界 → 在定义块的迭代 DF 上放 φ → 沿支配树 DFS rename（每个 alloca 一个"当前定义"栈）→ 把死掉的 `Alloca`/`Load`/`Store` 打成墓碑。
+
+mem2reg 的**正确性标准**：它**必须保持**下面的不变式 6（用的定义支配用点）——内存形态下这条是白拿的，SSA 形态下要靠 φ 的放置保住。
+
+#### 2.3.4 写下来的不变式（`ir/verify.rs` 逐条查）
+
+1. 每个 `Value` **恰有一个**定义处；`inst.result` 与 `ValueKind::Inst` **互相一致**
+2. 每个块恰有一个终结指令，且它的目标 `BlockId` 指向**活着的**块（建壳-填实，§2.2.2）
+3. **每个 `Value.ty` 是标量**（§2.3.2）
+4. **每条 `Phi` 都挂在某个块的 `phis` 里**，不在 `insts` 里（"φ 恒在块首"由 §2.2.2 的单列字段保证，verifier 只需查两边没有漏挂或重挂）
+5. **所有 `Alloca` 都在 `blocks[0]`**（entry）——后端"序言里一次性算栈帧"靠这条
+6. 每个用点都被它的定义**支配**（内存形态下白拿；mem2reg 必须保住）
+7. `use_def` 与 `Inst::operands()` 一致（`debug_assert` 下查）
+
+**它抓的是"某一组输入上输出错"这类故障**（脏掉的 use-def、incoming 块已被删的 φ）——那正是 `optimization` 判据（优化不许改变行为）要防的东西。**每个 pass 入口 `debug_assert` 调一次**。
+
+#### 2.3.5 交付判据与走查例子
+
+**交付判据**：在没有自写后端的情况下，用 clang 编译我们发出的 `.ll` 跑通一批测试——"前端 + 中端是否正确"因此成为可以提前独立验证的问题：
+
+```
+make ll-run IR=<我们的 .ll>  INPUT=<.in 文件>
+```
+
+`semantic` 与 `codegen` 的正例**是同一批源文件**（逐字节相同，只是目录不同）⇒ 把语料编成 clang 接受的 `.ll`、跑出的 stdout 对得上，阶段二即交付；进阶段三就只剩"汇编生成得对不对"。
+
+**例 A：struct + 方法 + `Box`**（sema 如何走到、侧表填了哪些格，完整走查看 [`arch-phase2.md`](arch-phase2.md) §2.5）：
+
+```rust,ignore
+struct Point { x: i32, y: i32 }
+impl Point { fn sum(&self) -> i32 { self.x + self.y } }
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    let b = Box::new(5);             // 合法写法是 Box::<i32>::new(5)，从简
+    println_i32(p.sum() + *b);       // 输出 12
+}
+```
+
+降下来长什么样（`p` 是聚合 ⇒ 住内存；`b` 是标量 ⇒ 也先住内存，mem2reg 之后变成 SSA 值）：
+
+| Rx | IR（alloca 形态） |
+|---|---|
+| `let p = Point {…}` | `%p = alloca %struct.Point, align 4` + 每条字段一对 `gep`/`store` |
+| `p.sum()` | `%s = call i32 @__rx_Point_sum(ptr %p)`：`lower_place(p)` 的结果直接当实参 |
+| `Box::new(5)` | `%b = call ptr @__rx_alloc(i32 4, i32 4)` + `store i32 5, ptr %b, align 4` |
+| `*b` | `load i32, ptr %b, align 4` |
+
+```llvm
+target datalayout = "e-m:e-p:32:32-i64:64-n32-S128"
+target triple = "riscv32-unknown-none-elf"
+%struct.Point = type { i32, i32 }
+@.fmt_int_nl = private unnamed_addr constant [4 x i8] c"%d\0A\00"
+declare i32 @printf(ptr, ...)
+declare ptr @malloc(i32)
+define internal i32 @__rx_Point_sum(ptr %self) { … gep/load ×2 → add → ret … }
+define internal void @__rx_source_main()      { … alloca %p + 2×(gep,store) → __rx_alloc + store 5 → call sum → load → add → call println_i32 … }
+define i32 @main() { call void @__rx_source_main(); ret i32 0 }
+```
+
+**这份形状就是 printer 的事实规格**（逐条对照 [`tests/custom/hello.ll`](../tests/custom/hello.ll)，我们唯一跑通过的样本），四条钉死：
+
+1. **`main` 是"内部源函数 + C 入口包装"两层**：源码 `main` 可以被递归调用，规范要求那种调用"target the internal source function and use its ordinary unit-returning calling convention" ⇒ 不能把 `@main` 直接当源码函数用。
+2. **内建包装由我们自己发**（`__rx_alloc` 是 `malloc` 包一层，加三个 `print*` / `get_i32` 包装），**只发用到的**：backend 规范明确允许 call REIMU `malloc`；发出的 `.ll` 自足，一条 `clang` 命令就能跑，不需要额外的 `runtime.s`。
+3. **不透明 `ptr`**（不是 `i32*`）；`alloca` / `load` / `store` **一律带 `align`**；`triple` 与 `datalayout` 逐字如上。
+4. **全局名是 mangle 后的 `String`**（§2.2.2）：`__rx_` + 所属类型名 + `_` + 方法名；自由函数就是 `__rx_` + 名。
+
+**例 B**（`Vec` 索引的元素地址链、聚合搬家与 `Memcpy` 的打印选择）与例 A 的逐格走查见 [`arch-phase2.md`](arch-phase2.md) §2.5。
 
 ---
 
@@ -1045,7 +1045,7 @@ Module
              (LIR)        (无限个)      (物理寄存器/溢出)   (prologue/epilogue)
 ```
 
-先跑通**栈式分配**（每个虚拟寄存器一个栈槽，最笨但最不容易错），再上真正的寄存器分配——所以中间插一层 LIR（低层 IR），让分配器面对的是"虚拟寄存器"而不是原始 IR。
+分两步走：先跑通**栈式分配**（每个虚拟寄存器一个栈槽，最笨但最不容易错），再上真正的寄存器分配。中间插一层 LIR（低层 IR），让分配器面对的是"虚拟寄存器"而不是原始 IR。
 
 ### 3.2 维护的数据结构
 
@@ -1056,7 +1056,7 @@ Module
 
 ### 3.3 运行机制
 
-- **调用约定**：内部约定**可自定义**（psABI 只在外部边界必需），但**机器 `main`、C 运行时、REIMU libc 三处必须守 psABI**
+- **调用约定**：内部约定可自定义（psABI 只在外部边界必需），但**机器 `main`、C 运行时、REIMU libc 三处必须守 psABI**
 - **数据布局**（细则见 `backend.md`）：标量一律 4 字节 4 对齐；`bool` 1 字节；`()` 0 字节；`&[T; N]` 是**一个 word**（不是 slice 胖指针）
 - **内建**：`get_i32`/`print_i32`/`println_i32` 走 C 运行时；`Box`/`Vec` 走 `__rx_alloc(size, align)`
 - **汇编输出**：GNU 风格文本，Clang 集成汇编器与钉版 REIMU 都要接受
@@ -1071,17 +1071,13 @@ Module
 #                                    call print_i32
 ```
 
-**本阶段不看性能**，只要求正确；全量回归脚本 + CI 的搭建见 [`plan.md`](plan.md) §1.5。
-
-**本阶段要满足的测试点**（2026-09-22 加）：`codegen` **60 个程序 × 115 组 io**——**判据是 stdout 逐字节相符**，不是"能跑起来"。三块硬骨头：
+**本阶段不看性能，只要求正确**：`codegen` 60 个程序 × 115 组 io，**判据是 stdout 逐字节相符**，不是"能跑起来"。三块硬骨头：
 
 | 硬骨头 | 说明 |
 |---|---|
-| **`Box` / `Vec` 的布局与 `__rx_alloc`** | 两者都不是内建类型，是**名字解析认出来的库类型**（[`spec-mapping.md`](spec-mapping.md) §2.7）⇒ 布局与分配是**我们定的**，但 `__rx_alloc(size, align)` 的 C ABI 必须守。**不需要释放**（规范明文允许泄漏）——这是测试点里 `box-and-moves` / `vec-operations` / `nested-containers` 全在考的地方 |
+| **`Box` / `Vec` 的布局与 `__rx_alloc`** | 两者都不是内建类型，是**名字解析认出来的库类型**⇒ 布局与分配是**我们定的**，但 `__rx_alloc(size, align)` 的 C ABI 必须守。**不需要释放**（规范明文允许泄漏）——`box-and-moves` / `vec-operations` / `nested-containers` 全在考这里 |
 | **深递归 vs 1 MiB 栈** | `comprehensive-*` 五个（quicksort、shortest-path、owned-tree、stack-machine、large-frame）与 `calls-recursion-and-abi` 都在压栈深度。栈帧布局（§3.2 的 `Frame`）**每个字节都要算清楚** |
-| **`get_i32` / `print_i32` / `println_i32` 的名字** | 三个名字**必须与 `runtime.s` 里的 C 符号逐字符相同**（`backend.md:109-111` 给出原型），写错 = 全部 115 组 io 挂。⚠ 历史坑：规范在 `27b1875`（9/19）把它们从 `get_i32`/`print_i32`/`println_i32` 改成了下划线式，**旧笔记里可能还是驼峰**——以 `backend.md` 当前内容为准 |
-
-**数据布局按 `backend.md`**：标量 4 字节 4 对齐；`bool` 1 字节；`()` 0 字节；`&[T; N]` 是**一个 word**（§3.3 已列）。
+| **`get_i32` / `print_i32` / `println_i32` 的名字** | 三个名字**必须与 `runtime.s` 里的 C 符号逐字符相同**（`backend.md:109-111` 给出原型），写错 = 全部 115 组 io 挂。⚠ 它们改过一次拼写（从驼峰改成下划线式），**旧笔记里可能还是驼峰**——以 `backend.md` 当前内容为准 |
 
 ---
 
@@ -1089,22 +1085,22 @@ Module
 
 ### 4.1 内部架构
 
-`passes/` 下每个 pass 一个文件，统一作用于 §2 的**同一份内存 IR**（不引入第二套表示）。pass 之间只通过 IR 通信，可任意组合、任意顺序重跑。
+`passes/` 下每个 pass 一个文件，统一作用于**阶段二的那一份 IR**（"内存形态"只是它的初始状态，§2.1）。pass 之间只通过 IR 通信，可任意组合、任意顺序重跑。
 
-**前四项 pass 的顺序由依赖关系决定，不是随便排的**：常量传播 + DCE 最先做（IR 层最容易，也是必做项）→ CFG + 活跃性分析（寄存器分配的前置）→ 寄存器分配 → 内联（前置做完后收益最大，因为内联暴露的常量能被继续传播）→ 尾递归优化 → 除法/模数优化。**依赖顺序即"谁是谁的前置"**：跳过活跃性分析，寄存器分配就没有输入；把内联提到最前，它暴露出的常量没人去传播。逐项排期见 [`plan.md`](plan.md) §1.6。
+**六项必做优化**：常量传播 + DCE → CFG + 活跃性分析（寄存器分配的前置）→ 寄存器分配 → 内联 → 尾递归优化 → 除法/模数优化。顺序即依赖链：跳过活跃性分析，寄存器分配就没有输入；把内联提到最前，它暴露出的常量没人去传播。逐项排期见 [`plan.md`](plan.md) §1.6。
 
 ### 4.2 维护的数据结构
 
 | pass | 需要的数据 |
 |---|---|
-| mem2reg | 支配树 / 支配边界（算 phi 插入点） |
+| mem2reg | 支配树 / 支配边界（算 φ 插入点） |
 | 常量传播 | 常量格（`Vec<Option<ConstVal>>`，与 value arena 同序） |
 | DCE | use-def 链 |
 | 内联 | 调用图（`Vec<Vec<FuncId>>`）+ 函数体大小估计 |
 | 寄存器分配 | CFG + 活跃区间 + 冲突图 |
 | 循环优化 | 自然循环识别（回边 + 支配关系） |
 
-**优化目标是 REIMU 的 `Total cycles`**。它的权重表（`load`/`store` 各 **64**，`divide` 20，`branch` 10，`multiply` 4，`jalr` 2，`jal` 与算术各 1）给出一条明确的取舍方向：⇒ **减少内存访问和分支的收益远大于减少算术指令**。这也解释了为什么 mem2reg 与寄存器分配是收益最高的两项——它们砍的正是**访存**。
+**优化目标是 REIMU 的 `Total cycles`**。权重表（`load`/`store` 各 **64**，`divide` 20，`branch` 10，`multiply` 4，`jalr` 2，`jal` 与算术各 1）⇒ **减少内存访问和分支的收益远大于减少算术指令**；mem2reg 与寄存器分配砍的正是**访存**。
 
 ### 4.3 运行机制与例子
 
@@ -1118,126 +1114,6 @@ pass 的形态就是「遍历 IR → 改写 IR」，不需要跨 pass 的调度�
 优化后:  ret i32 12          ← 两条指令都没了
 ```
 
-**本阶段要满足的测试点**（2026-09-22 加）：`optimization` **13 个 workload × 39 组 io**（每个 workload 三组输入：`.small` / `.large` / `.large-variant`）。workload 是算法级的——`quicksort`/`merge-sort`/`prime-sieve`/`matrix-multiply`/`floyd-warshall`/`graph-bfs`/`jacobi-stencil`/`knapsack`/`recursive-heap-tree`/`integer-mixing`/`scalar-optimization`/`large-control-flow`（**6251 行**）/`live-state-calls`+`loop-state-merges`。
+**本阶段要满足的测试点**：`optimization` 13 个 workload × 39 组 io（每个 workload 三组输入：`.small` / `.large` / `.large-variant`）。workload 是算法级的——`quicksort`/`merge-sort`/`prime-sieve`/`matrix-multiply`/`floyd-warshall`/`graph-bfs`/`jacobi-stencil`/`knapsack`/`recursive-heap-tree`/`integer-mixing`/`scalar-optimization`/`large-control-flow`/`live-state-calls`+`loop-state-merges`。
 
-⚠ **这里没有性能阈值**（翻遍 98 个 manifest，唯一的硬约束是 "timeout = 失败"）。⇒ 这个阶段的真正判据是 **"优化不许改变行为"**：三组输入（小 / 大 / 大的变体）就是拿来逼出**只在某个规模或某条路径上才暴露的错误优化**的。`live-state-calls` 与 `loop-state-merges` 这两个 workload 名字已经把考点写在脸上——**跨调用的活跃状态**与**循环回边的 phi 合流**，正是 §4.2 那两张表（活跃区间、支配树）出错时最先崩的地方。
-
-**六项必做优化的依据是 [`plan.md`](plan.md) 引的 `tasks.md`，不是测试点**——测试点只保证"你做错了会被抓到"。
-
----
-
-## 5. 贯穿各阶段的约定
-
-### 5.1 arena + index
-
-- **按节点种类分 `Vec<T>`，各配自己的 newtype id**（`ExprId`/`BlockId`/`ItemId`/`TypeId`/`PathId`/`ConstValueId`），**不用统一的 `NodeId`**；用 `usize` 而不是 `u32`，理由见 §1.2.2。**没有 `StmtId`**——`Stmt` 不进 arena（`Block.stmts: Vec<Stmt>`），理由与回归信号见 §1.2.2.1
-- 多套 id 让 `walk_stmt(ast, expr_id)` **直接编译不过**——这个安全是白送的。统一节点池反而要在每个 `match` 里写 `_ => unreachable!()`，等于把 C++ visitor 的静默失败请回来
-- 递归全部由 id 打断，**节点定义里不出现 `Box`**。自查信号：如果被迫加了 `Box`，说明某个位置漏了 id
-
-- **IR 阶段必须要 arena**（基本块互指、phi 回填、use-def 链、活跃性）。AST 本身"构造一次、之后只读"，`Box` 够用——**要如实承认这一点**：选 arena 是为了先在简单的树上练一遍，不是 AST 阶段技术上必须
-
-### 5.2 Span 与源码文本
-
-- `TokenKind` **无载荷**，靠 `Span` 切源码取词素 ⇒ **切出来的 span 必须与 driver 归一化后的那份字节缓冲区对齐**。措辞要准：不是「lexer 和 parser 各持一份字符串」，而是**同一份缓冲区在接力**——`parse_crate` 内部 lex 完 `Lexer` 就死了，`Vec<Token>` 移交给 `Parser`（§1.3.2），全程只有一个持有者。
-- ⇒ **CRLF→LF 归一化必须在 lexer 启动之前**（driver 里）完成，否则 span 累积错位
-- ⇒ 输入一律在 `&[u8]` 上扫描（规范保证 7-bit ASCII），`pos` 天然就是字节偏移，不需要 `Vec<char>`
-- ⇒ `Ast` 不带 `src`（返回类型上没有生命周期参数）⇒ **谁要文本，谁把 `(&Ast, &[u8])` 一起带上**
-
-**节点 Span 的约定（2026-09-22 定）**：一个节点的 `span` = **它在源码里占的完整字节范围**，没有例外。理由不是整齐，是 `Span` 唯一的用途就是报错时指出哪段代码有问题（`error.rs` 拿它算行列）。
-
-- ⇒ `ItemKind::Fn` 的 span 覆盖整个 `fn 名(参数) -> 返回类型 where … { 体 }`，**含 body**；`ItemKind::Struct` 的 span 从 `#[derive(...)]` 的 `#` 开始（属性是 item 的一部分，`traits-and-attributes.md:15`）。
-- **两条调用纪律**：`mark()` 在吃掉**第一个** token **之前**取；`span_from(m)` 在吃完**最后一个** token **之后**取。中间隔多少层递归都无所谓——`span_from` 只看 `mark` 和当时的 `pos`，不关心是谁吃的 token。这正是 `parse_fn` 敢让 body 下沉三四层（`parse_block → parse_stmt → parse_expr_bp → parse_if`）再一个 `span_from(m)` 圈住整段的原因。
-- ⇒ 因此 `parse_item` 的 `mark()` 必须提到**属性之前**。属性在 struct 前面，而 §2.6 那条"属性只能出现在顶层具名 struct 之前"是**分派之后**才校验的；在 `parse_struct` 内部才 `mark()` 会丢掉 `#[derive(...)]`。
-- **单 token 的节点不要用 `mark`/`span_from`**，直接用 `expect`/`bump` 返回的 `Token`：`let tok = self.expect(TokenKind::Ident)?; Name { span: tok.span }`。`Token.span` 恰好是该 token 自己的字节范围（`lexer.rs` 的 `let start = self.pos;` 在跳过空白/注释之后、`end: self.pos` 在消费完之后），天然就对，且没有 off-by-one 的机会。
-
-**`mark` / `span_from` 到底算什么**（容易被误读，所以写死）：`pos` 指向**下一个还没消费的** token，所以"最后一个已消费的"是 `pos - 1`。
-
-```
-span_from(mark) = [toks[mark].span.start, toks[pos-1].span.end)    // pos > mark
-                = [toks[mark].span.start, toks[mark].span.start)   // 一个都没消费 ⇒ 零宽
-```
-
-⇒ 它**不是**「上一个 token 结束到这一个 token 开始」——那是 `[toks[pos-1].end, toks[pos].start)`，即两个 token 之间的**空白/注释**。用 §1.6.1 的数走一遍：`if flag { 1 } else { 2 }` 的 token span 依次是 `if`=0..2、`flag`=3..7、`{`=8..9、`1`=10..11、`}`=12..13、`else`=14..18、`{`=19..20、`2`=21..22、`}`=23..24 ⇒ then 块 `mark=2, pos=5` → `[8,13)` ✓；整个 if `mark=0, pos=9` → `[0,24)` ✓；空块 `{}` `mark=2, pos=3` → `[8,9)` ✓。
-
-`pos == mark`（一个 token 都没吃）时 `end = start`。**这把 `end` 钉死在 ≥ `start`**，所以不会出现 `end < start` 的 u32 回绕。
-
-#### 5.2.1 名字的表示（2026-09-21 定）
-
-**起因**：问「`Method.name: Span` 是否有『比较慢 / 查表要 interning / 不能表达泛型与 `Self`』三个缺点」。逐条复核的结果是**两条诊断错了、第三条要拆开，而真正的洞比这三条都严重**：
-
-| 说法 | 复核 |
-|---|---|
-| 比较慢 | ❌ 诊断错了。`Span` 8 字节，比较就是两次 `u32` 比较。**真正的毛病是比错了还编译得过**——`Span` 派生了 `PartialEq`，于是 `a.name == b.name` 合法、比的却是**源码位置**：两个 `foo` 写在不同行就判为不相等。静默错误，比慢严重 |
-| 查表要 interning | ❌ 在当前设计下不成立。规范把方法查找定死成**线性扫描**（`method-call-expr.md`：Find all methods with the requested name…），方法名全集只有 6 个（`new`/`len`/`is_empty`/`push`/`remove`/`clone`）加用户 `impl` 里的方法。代价只是每次比较切一次文本，而 `src` 反正要进 sema 做诊断 |
-| 不能表达泛型 | ⚠️ 成立，性质是「**把语义阶段要用的信息丢了**」。规范规定方法段上的**类型**实参是 compile error（`x.foo::<i32>()`）、**生命周期**实参合法且丢弃（`method-call-expr.md`）。⚠ 2026-09-23 订正：那是**语义**阶段的错，parser 必须**放过**（`parser/accept/method_call_expr-ae960be064.rx` = `y.bar::<T>(1, 2,)` 是 parse 正例），所以要求不是"在 parser 报错"而是"**如实记一笔**"。`Span` 连这一笔都存不下 ⇒ 得换成一个 `has_type_args: bool`（见下条） |
-| 不能表达 `Self` | ✅ **真缺口，而且是文档自己已经点出来的**。`spec-mapping.md` §2.8 第 2 点警告「把 `PathIdentSegment` 三支合成一支，名字解析就会漏掉 receiver」——而 `Segment.name: Span` 恰恰合成了一支。下游判「这段是不是 `Self`」只能切文本比 `"Self"`，正是 §1.3.3 禁止的判定 |
-
-顺带核实掉的：**用户泛型根本不存在**（`GenericParam -> LifetimeParam` 只有一支，`impl<T>` 不可导出，泛型只有内置的 `Box<T>` / `Vec<T>`）⇒ 「不能表达泛型」这条与方法泛型无关，只与方法段上那个**非法**的 `::<T>` 有关。
-
-**决定五条**：
-
-1. **名字统一用 `Name`**（全 AST 名字字段，不留第二种表示），它**故意不派生 `PartialEq`/`Eq`/`Hash`**。比较只能走 sema 的 `Names`（持有 `src`）⇒「按位置比名字」从**静默错误**变成**编译错误**。`Name` 8 字节，与它替换掉的 `Span` 同大；`ast.rs` 的尺寸断言测试守着这一点。
-2. **`PathIdentSegment` 表达 `IDENTIFIER | self | Self`**；`Segment` 改名 `PathExprSegment` 与规范对齐；`Method` 只存内层，`Field` 只收 `Name`（`FieldExpression -> Expression . IDENTIFIER`）。理由与对照表见 §1.2.2。
-3. **方法段上的类型实参：parser 只记录，不报错**（2026-09-23 订正，原文说"在 parser 报错"）。位置是 `ExprKind::Method.has_type_args: bool`——**一个 bit**，非法性的判定留给语义阶段（那里才有 `method-call-expr.md` 的方法查找上下文）。语法层在这里只剩一条自己的活：带实参却不跟 `(` 时报 `Expected(LParen)`（`f.x::<isize>;` 那条 parse 负例）。⚠ 与「`#[derive]` 放错位置」「`parse_associated_item` 只产出两种 `ItemKind`」**不再同类**——那两条是 parser 真的拦下来的。
-4. **不上 interner**。理由见上表第 2 行——这个语言的名字工作量极小，为不存在的性能问题上机器不划算。**但 `Name` 把将来的成本压成了局部替换**：要 interning 时只改三处——`Name` 的定义（`{ sym: Symbol, span }`）、`Names::eq` 的实现（`a.sym == b.sym`）、parser 里每个标识符一次 intern 调用；**所有比较点一行都不用动**。届时要如实修正上面「AST 不存文本」这条——interner 会存一份**去重后**的名字字节，不是每个出现位置。
-5. **`Span` 的 `PartialEq` 保留**（lexer/parser 要用「是否相等、谁前谁后」），`TokenKind` 保持无载荷——interner 没有加在词法层，§1.3.3 的分层规则不受影响。
-
-#### 5.2.2 derive 名的表示（2026-09-24 定）
-
-规范的三条产生式是**全部**（`traits-and-attributes.md:7-17`）：
-
-```
-OuterAttribute  -> `#` `[` DeriveAttribute `]`
-DeriveAttribute -> `derive` `(` (DeriveName (`,` DeriveName)* `,`?)? `)`
-DeriveName      -> `Copy` | `Clone` | `PartialEq` | `Eq`
-```
-
-**决定一：`DeriveName` 是闭集，用 `enum Derive`，不是 `Name`。**
-`DeriveName` 的右部是**四个字面终结符**，不是 `IDENTIFIER`。所以 AST 里 `derives: Vec<Derive>`（四变体枚举），而不是 `Vec<Name>` + 留给下游切文本比字符串。这与 §5.2.1 决定 1「名字统一用 `Name`」**不矛盾**：`Name` 是"标识符"的表示，而 `DeriveName` 根本不是标识符位置。`Derive` **派生 `PartialEq`/`Eq`**（`Name` 故意不派生）——变体无载荷，相等就是"同一个 trait"，不存在"按位置比名字"那种静默错误。
-
-**决定二：`derive` 不做成 `TokenKind`，是上下文关键字。**
-`keywords.md` 的 strict 38 + reserved 13 两张表**都没有** `derive`，而 `identifiers.md:12` 把非关键字标识符定义成 `IDENTIFIER_OR_KEYWORD` 去掉 `_` 和这两张表 ⇒ **`derive` 是合法标识符**。做成 `TokenKind` 等于在类型层面断言相反的结论，代价是 6 处误拒（`struct derive {}`、`fn derive() {}`、`let derive = 1;`、`x.derive`、`S { derive: 1 }`、路径段）。所以 parser 在 `#[` 后那一处按文本比 `b"derive"`（`expect_derive()`）。`.g4` 是同一结论的另一种写法：`DERIVE` 做成 token 之后又补进 `identifier` 规则，补的正是那 6 处。代价是两个新 `SyntaxErrorKind`（`ExpectedDerive` / `ExpectedDeriveName`）——`derive` 词法上是 `Ident`，借不到现成的 `Expected(TokenKind)`。
-
-**决定三：三种"非法 derive"分两处报。**
-
-| 形状 | 报在哪 | 依据 |
-|---|---|---|
-| 名字不在那四个里（`#[derive(Foo)]`） | **parser**（`parse_derive_name`） | 闭集产生式直接否定它 ⇒ 不在文法里（`undefined-behavior.md:13,39`）。且 `Derive` 枚举一落下，这种输入就**不可表示**，下游无处再补 |
-| 重复（`#[derive(Clone, Clone)]`、跨属性） | **语义阶段** | 规范措辞是 "a compile-time error"（非 syntax error），框在 *the same **set** of requested traits* 上；语料 `rej-repeated-*` 两条 `manifest.json` 明写 `"stage": "semantic"` |
-| 能力不满足（`Copy` 缺 `Clone`、`Box` 挡 `Copy`…） | **语义阶段** | `builtin-traits.md` 四段 Requirements 全要看字段类型 |
-
-属性**拍平**进一个 `Vec`（多属性叠加也只有一个集合），于是一次覆盖"同一属性内 / 跨属性"两种读法。
-
-**⚠ 两条语料事实，别记反**：
-
-1. **parse 阶段的 442 条里一条属性都没有**（`#` 只出现在 4 个 `reject/crate` 文件的注释里）⇒ 这一层**没有官方用例兜底**，只能靠 `parser.rs` 的单元测试钉住。
-2. `rej-repeated-derive-across-attributes.rx` 与 `rej-repeated-derive-entry.rx` **逐字节相同**（都只有一条属性内重复）⇒ "跨属性重复"**实际没被考到**。另外 `scripts/parse_test.py` 只跑 `stage == "parse"` 的用例，官方 `scripts/test.py` 又硬编码跳过 `parse` ⇒ 重复 derive 这条负例**永远不会**经 parser 判分，放 parser 里既错位又白写。
-
-### 5.3 语义信息不进 AST
-
-- 表达式类型、名称解析结果、coercion 插入点 → **side table**，按 id 稠密索引，与对应 arena 同序
-- **coercion 特别重要**：侧表里有值就表示"这个位置要插转换"，lowering 时再发。这样 **AST 永远是纯源码结构**，打印/验收看到的就是源码写的东西，不被编译器偷偷插的转换污染
-- **不建独立 HIR**：desugar 在 AST→IR lowering 里顺手做
-
-### 5.4 错误处理
-
-- 词法/语法错误：`Result<_, FrontendError>`，形状统一为 `{ kind, span }`，能换算成行列号（`locate()`）；语义错误照搬同一形状（§1.3.4）
-- **compile error 必须真正报错**（负例测试会考），UB 从简处理——分界见 [`spec-mapping.md`](spec-mapping.md) §4
-
-### 5.5 负例契约（2026-09-22 按测试点核实并定型）
-
-全库 **804 条**里有 **267 条负例**（`lexer` 23 + `parser` 77 + `semantic` 167）。它们的判定口径**已经确定**，直接决定了错误处理的形状：
-
-| 要求 | 原文依据 | 对我们的影响 |
-|---|---|---|
-| **正常拒绝即可** | `manifest.schema.json`：`False requires normal rejection, not a crash or timeout.` | 非 0 退出就够，**不需要精确的错误码、不需要错误恢复** |
-| **崩 / 被信号打死 / 超时 = 失败** | 同上 + `README-ZH.md` | ⚠ **`panic!` / `unwrap()` / 死循环都是实打实的扣分**。前端最容易踩的是 §1.4 那条"非 `Eof` 的 token 必须推进"——违反它**不是报错而是挂死** |
-| **不要求诊断措辞** | `README-ZH.md`：`No AST serialization or diagnostic wording is required.` | 我们的 `{ kind, span }` + `locate()` 已经超标，**不要在这上面加码** |
-| **不要求 AST 序列化** | 同上 | [`plan.md`](plan.md) §1.3 里的"AST 打印/导出"是**自查手段**，不是评分项。别为它做 CLI 开关（`--stage=` 的枚举里没有它） |
-| **不要求所有权 / 借用 / 生命周期分析** | 已删除的 `semantic/README.md`（从 git 恢复） | **不写借用检查器**。要写的只有 **place 可变性**（§2） |
-
-⇒ **三条设计结论**（都是"按已核实的契约"推出来的，不是猜的）：
-
-1. **"首个错误立即返回"是正确的架构，不要改成错误恢复。** 既然不要求措辞、不要求多处报错，恢复逻辑就是纯粹的成本。同理，`Parser` 里**没有**任何"当前上下文标志"字段需要存/恢复——上下文限制是按值传进 `parse_expr_bp` 的参数（§1.5.3），少了整整一类"忘了恢复"的 bug。
-2. **"宽松"是最危险的失败模式。** 负例判分是二值的：一个**没被检查出来**的错误 = 一条挂掉的测试点。所以每条规则都要问"**不做会怎样**"——`spec-mapping.md` §4 那张"必须报错"清单是逐条对着测试点核过的。
-3. **UB 仍然从简。** `undefined-behavior.md` 的 Test guarantees 表明确把一批情况排除在测试之外（整数字面量越界、需要穿过运算符的期望类型传播、`==` 两侧源类型不同…）⇒ 这些**可以随便处理**，但**不能 panic**（panic 是 crash，算失败）。**"随便"不等于"崩"**。
+**这里没有性能阈值**（唯一的硬约束是 "timeout = 失败"）⇒ 判据是 **"优化不许改变行为"**：三组输入（小 / 大 / 大的变体）逼出**只在某个规模或某条路径上才暴露的错误优化**。`live-state-calls` 与 `loop-state-merges` 这两个 workload 名字已经把考点写在脸上——**跨调用的活跃状态**与**循环回边的 φ 合流**，正是 §4.2 那两张表（活跃区间、支配树）出错时最先崩的地方。

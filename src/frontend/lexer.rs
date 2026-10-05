@@ -15,8 +15,9 @@ fn is_word_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-#[derive(Clone, Copy)]
-enum Base {
+/// `pub(crate)`：sema 求常量值时要复用这套进制判定，别重写第二份。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Base {
     Dec,
     Bin,
     Oct,
@@ -24,12 +25,22 @@ enum Base {
 }
 
 impl Base {
-    fn is_digit(self, b: u8) -> bool {
+    pub(crate) fn is_digit(self, b: u8) -> bool {
         match self {
             Base::Dec => b.is_ascii_digit(),
             Base::Bin => matches!(b, b'0' | b'1'),
             Base::Oct => matches!(b, b'0'..=b'7'),
             Base::Hex => b.is_ascii_hexdigit(),
+        }
+    }
+
+    /// 折数字体要的进制值（sema 求常量值时用；别在那边再写一份 `0x = 16`）。
+    pub(crate) fn radix(self) -> u32 {
+        match self {
+            Base::Dec => 10,
+            Base::Bin => 2,
+            Base::Oct => 8,
+            Base::Hex => 16,
         }
     }
 }
@@ -38,7 +49,8 @@ fn is_digit_run(s: &[u8], base: Base) -> bool {
     s.iter().all(|b| base.is_digit(*b) || *b == b'_') && s.iter().any(|b| base.is_digit(*b))
 }
 
-fn base_and_digits_at(run: &[u8]) -> (Base, usize) {
+/// 识别 `0b`/`0o`/`0x` 前缀，返回（进制，数字体起始下标）。
+pub(crate) fn base_and_digits_at(run: &[u8]) -> (Base, usize) {
     match run {
         [b'0', b'b', ..] => (Base::Bin, 2),
         [b'0', b'o', ..] => (Base::Oct, 2),
@@ -666,7 +678,7 @@ mod tests {
     }
 
     // ── E. 非法字节
-    // 归一化后只有 0x20 0x09 0x0A 是空白；VT/FF/裸 CR 都是非法字符（arch.md §1.3）。
+    // 归一化后只有 0x20 0x09 0x0A 是空白；VT/FF/裸 CR 都是非法字符（arch.md §1.3.1）。
 
     #[test]
     fn stray_bytes_are_errors() {
@@ -689,7 +701,7 @@ mod tests {
 
     #[test]
     fn crlf_is_normalized_before_lexing() {
-        // normalize 在 Lexer::new 之前跑（arch.md §5.2），否则 span 会累积错位
+        // normalize 在 Lexer::new 之前跑（arch.md §0.4），否则 span 会累积错位
         let raw = b"a\r\nb";
         let src = String::from_utf8(normalize(raw)).unwrap();
         assert_eq!(src, "a\nb");

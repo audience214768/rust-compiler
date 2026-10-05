@@ -1,14 +1,18 @@
 # Fill in these four commands. See README.md for how to fill in this.
 
 # Optional: build your compiler once before testing. Leave empty if prebuilt.
-BUILD = CARGO_PROFILE_RELEASE_LTO=true cargo build --quiet --locked --release \
+# 两半都要：前半建**我们的**编译器（SEMANTIC 用），后半建参考实现
+# （CODEGEN 还没换掉，而 librx.rlib 只有这条会产出）。少了后半条，
+# `make test` 只是在 target/reference 恰好还在时继续绿。
+BUILD = cargo build --quiet \
+    && CARGO_PROFILE_RELEASE_LTO=true cargo build --quiet --locked --release \
     --manifest-path crates/rx/Cargo.toml \
     --target-dir target/reference \
     --target riscv32im-unknown-none-elf
 
 # Required for semantic tests: exit 0 to accept {source}, 1 to reject it.
-SEMANTIC = RX_SOURCE={source} $(REFERENCE_RUSTC) --cfg rx_semantic \
-    --emit=metadata crates/rx/src/entry.rs -o {output}
+# 只判退出码，不产出 {output}（官方 test.py 对非 RUNTIME_STAGES 提前 return）。
+SEMANTIC = target/debug/my-compiler --stage=semantic {source}
 
 # Required for codegen/optimization tests: compile {source} into {output}.
 # To test LLVM IR, write RV32-compatible IR to {output}.ir and append:

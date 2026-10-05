@@ -7,13 +7,16 @@ pub struct ExprId(pub usize);
 #[derive(Copy, Clone, Debug)]
 pub struct BlockId(pub usize);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StmtId(pub usize);
+
 #[derive(Copy, Clone, Debug)]
 pub struct TypeId(pub usize);
 
 #[derive(Copy, Clone, Debug)]
 pub struct PathId(pub usize);
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ItemId(pub usize);
 
 #[derive(Copy, Clone, Debug)]
@@ -97,6 +100,8 @@ pub enum Derive {
 pub enum ItemKind {
     Fn {
         name: Name,
+        /// 泛型参数被整体丢弃（只有生命周期），但 `main` 不许带——`rej-main-cannot-have-generic-parameters`。
+        has_generic_params: bool,
         recv: Option<Receiver>,
         params: Vec<Param>,
         ret: Option<TypeId>,
@@ -110,7 +115,7 @@ pub enum ItemKind {
     Const {
         name: Name,
         ty: TypeId,
-        value: ConstValueId,
+        const_value_id: ConstValueId,
     },
     Impl {
         target: TypeId,
@@ -148,7 +153,7 @@ pub struct Stmt {
 
 #[derive(Debug)]
 pub struct Block {
-    pub stmts: Vec<Stmt>,
+    pub stmts: Vec<StmtId>,
     pub span: Span,
 }
 
@@ -208,8 +213,8 @@ pub enum ExprKind {
         rhs: ExprId,
     },
     Cast {
-        expr: ExprId,
-        ty: TypeId,
+        expr_id: ExprId,
+        type_id: TypeId,
     },
     Assign {
         op: AssignOp,
@@ -233,7 +238,6 @@ pub enum ExprKind {
     Struct {
         path: PathId,
         fields: Vec<FieldInit>,
-        base: Option<ExprId>,
     },
     Call {
         callee: ExprId,
@@ -271,7 +275,7 @@ pub struct Expr {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum TypeKind {
     Paren(TypeId),
     Path(PathId),
@@ -303,7 +307,7 @@ pub enum EntryRoot {
     Expr(ExprId),
     Type(TypeId),
     Item(Option<ItemId>),
-    Let(Stmt),
+    Let(StmtId),
 }
 
 #[derive(Debug, Default)]
@@ -311,6 +315,7 @@ pub struct Ast {
     pub items: Vec<Item>,
     pub root: Vec<ItemId>,
     pub blocks: Vec<Block>,
+    pub stmts: Vec<Stmt>,
     pub exprs: Vec<Expr>,
     pub types: Vec<Type>,
     pub paths: Vec<Path>,
@@ -322,22 +327,22 @@ mod tests {
     use super::*;
     use std::mem::size_of;
 
-    /// `arch.md` §1.2.2.1 的判据 D 全靠「枚举大小 = 最大变体载荷 + 标签」这条推理，
-    /// 而它给的数字是 `ExprKind` 56 字节。数字错了整条论证就崩，所以机械化守住。
+    /// `arch.md` §1.2.2 的判据 D 全靠「枚举大小 = 最大变体载荷 + 标签」这条推理，
+    /// 而它给的数字是 `ExprKind` **48** 字节。数字错了整条论证就崩，所以机械化守住。
     #[test]
-    fn exprkind_stays_56() {
-        assert_eq!(size_of::<ExprKind>(), 56);
+    fn exprkind_stays_48() {
+        assert_eq!(size_of::<ExprKind>(), 48);
     }
 
-    /// 上一条的前提：`Name` 8 字节、`PathIdentSegment` 12 字节，
-    /// 所以 `Method` 内联它之后仍是 48，与 `Struct` 并列、不抬高 `ExprKind`。
+    /// 上一条的前提：`Name` 8 字节、`PathIdentSegment` 12 字节。
+    /// 删掉 `Struct.base` 之后，**撑住 `ExprKind` 的是 `Method`**（8+12+24+1 → 48）。
     #[test]
     fn name_and_ident_segment_are_small() {
         assert_eq!(size_of::<Name>(), 8);
         assert_eq!(size_of::<PathIdentSegment>(), 12);
     }
 
-    /// `PathExprSegment` 56 字节 ⇒ 内联进 `ExprKind` 会把枚举撑到 104（判据 D）。
+    /// `PathExprSegment` 56 字节 ⇒ 内联进 `ExprKind::Method` 会把枚举撑到 96（判据 D）。
     /// 它是「方法名只存内层 `PathIdentSegment`」这条决定的量化依据。
     /// 它只住在 `Path.segments: Vec<_>` 里，`Vec` 元素多大都不影响宿主。
     #[test]

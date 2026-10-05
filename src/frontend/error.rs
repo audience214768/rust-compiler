@@ -55,12 +55,12 @@ pub enum SyntaxErrorKind {
     ExpectedType,
     /// 这个位置要一条 item：`use` / `fn` / `struct` / `const` / `impl`
     ExpectedItem,
-    /// 链式比较 `a < b < c`：规范要求加括号消歧（§1.5.3）
+    /// 链式比较 `a < b < c`：规范要求加括号消歧（§1.3.5）
     ChainedComparison,
     /// 子集外的保留字（`match` / `enum` / `trait` / `pub` …）。
     ///
     /// 无载荷：13 个 reserved 关键字在词法层已塌成一个 `TokenKind::Reserved`，
-    /// parser 分不出是哪个，点名只能靠渲染层切 `&src[span]`（§1.3.3）。
+    /// parser 分不出是哪个，点名只能靠渲染层切 `&src[span]`（§1.1 分层规则）。
     ReservedKeyword,
     /// `#[` 后面不是 `derive`。`derive` 不是关键字，借不到 `Expected(TokenKind)`。
     ExpectedDerive,
@@ -131,7 +131,9 @@ impl FrontendError {
 ///
 /// 空区间（`Eof` 的 span 是空的）返回不带引号的「文件结束」——
 /// 否则会渲染成「实际是 ``」。
-fn snippet(src: &[u8], span: Span) -> String {
+///
+/// `pub(crate)`：sema 的诊断要复用同一份实现，不复制第二份。
+pub(crate) fn snippet(src: &[u8], span: Span) -> String {
     let a = (span.start as usize).min(src.len());
     let b = (span.end as usize).min(src.len());
     if a >= b {

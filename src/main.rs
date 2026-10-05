@@ -1,8 +1,10 @@
 mod frontend;
+mod sema;
 
 use frontend::error::{locate, FrontendError};
 use frontend::lexer::{lex_all, normalize};
 use frontend::parser;
+use frontend::Span;
 use std::env;
 use std::fs;
 use std::process;
@@ -95,16 +97,17 @@ fn compile(path: &str, stage: &str, entry: &str) -> ! {
         process::exit(1);
     }
 
-    // CRLF→LF 的单遍归一，必须在 lexer 启动之前（`arch.md` §1.4）。
+    // CRLF→LF 的单遍归一，必须在 lexer 启动之前（`arch.md` §1.3.1）。
     let src = normalize(&raw);
 
     match stage {
         "lex" => dump_tokens(path, &src),
         "parse" => run_parse(path, &src, entry),
+        "semantic" => run_semantic(path, &src),
         _ => {
-            // semantic / codegen / optimization 还没接上。诚实地拒，不要拿
-            // "只跑词法然后 exit(0)"冒充——那会让整批用例假过。
-            eprintln!("{path}: --stage={stage} 尚未实现（当前只有 lex 与 parse）");
+            // codegen / optimization 还没接上。诚实地拒，不要拿"只跑词法然后
+            // exit(0)"冒充——那会让整批用例假过。
+            eprintln!("{path}: --stage={stage} 尚未实现（当前到 semantic）");
             process::exit(1);
         }
     }
@@ -146,13 +149,33 @@ fn run_parse(path: &str, src: &[u8], entry: &str) -> ! {
     }
 }
 
-/// 统一的诊断出口：`{path}:{line}:{col}: {消息}` + `exit(1)`。
+/// `--stage=semantic`：前端吃完整份 crate，再走语义。
 ///
-/// 渲染只在这里发生——`FrontendError` 自己不带 `src`，「实际是 `X`」那半句
-/// 得切 `src[span]` 才知道（`arch.md` §1.3.4）。
-fn report(path: &str, src: &[u8], e: &FrontendError) -> ! {
+/// 语义**不带 `--entry=`**：它是 crate 级的，碎片入口只服务 parser（`arch.md` §0.5.1）。
+fn run_semantic(path: &str, src: &[u8]) -> ! {
+    let ast = match parser::parse_crate(src) {
+        Ok(ast) => ast,
+        Err(e) => report(path, src, &e),
+    };
+    match sema::check(&ast, src) {
+        // 产物在这里没用上——codegen 接上之后才有人消费它。
+        Ok(_checked) => process::exit(0),
+        Err(e) => die(path, src, e.span, e.message(src)),
+    }
+}
+
+/// 诊断的最终出口：`{path}:{line}:{col}: {消息}` + `exit(1)`。
+///
+/// 渲染只在这里发生——错误类型自己不带 `src`，「实际是 `X`」那半句
+/// 得切 `src[span]` 才知道（`arch.md` §1.1）。各阶段的错误类型都折成
+/// `(span, message)` 两样再进来，免得每加一个阶段就复制一份渲染逻辑。
+fn die(path: &str, src: &[u8], span: Span, message: String) -> ! {
     // 词法错误的 span 可能被推到文件末尾之外，`locate` 内部会 clamp。
-    let (line, col) = locate(src, e.span.start as usize);
-    eprintln!("{path}:{line}:{col}: {}", e.message(src));
+    let (line, col) = locate(src, span.start as usize);
+    eprintln!("{path}:{line}:{col}: {message}");
     process::exit(1);
+}
+
+fn report(path: &str, src: &[u8], e: &FrontendError) -> ! {
+    die(path, src, e.span, e.message(src))
 }

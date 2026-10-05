@@ -12,24 +12,14 @@ pub struct Parser<'a> {
     ast: Ast,
 }
 
-/// 表达式解析的两个上下文限制。
-///
-/// 这是 rust-analyzer 的做法（它的 parser 就是本语料里 accept/reject 那份期望树的
-/// 来源），我们照搬：**限制按值传参，不做存/恢复**。好处是"进入一个普通表达式
-/// 上下文"就等于"调普通入口传 `VALUE`"，没有"忘了恢复旧值"这条 bug 可犯。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Restrictions {
-    /// 为真时路径后**不**进结构体字面量。只有 `if` / `while` 的条件置它
-    /// （`arch.md` §1.5.3 的条件边界）。
     forbid_structs: bool,
-    /// 为真表示"我在语句位置"。它只改一件事：**后缀跑完后**若**还是块形式**，
-    /// 就地收工不爬升（`arch.md` §1.5.3 的语句边界）。
     prefer_stmt: bool,
 }
 
 impl Restrictions {
     /// 值位置：初始化器、实参、数组元素、字段值、块尾、括号内、`break`/`return`
-    /// 的操作数……普通写法就是它。
     pub const VALUE: Restrictions = Restrictions {
         forbid_structs: false,
         prefer_stmt: false,
@@ -52,9 +42,6 @@ impl Restrictions {
     /// `castExpression` 而不是 `statementCastExpression`；前缀同理
     /// （`statementUnaryExpression : unaryOperator unaryExpression`）。所以"我在语句位置"
     /// 这件事不往运算符里面传。
-    ///
-    /// `forbid_structs` 反过来必须一路带下去：它是条件边界的开关，
-    /// `if f(S{x:1}) && S { }` 里第二个 `S {` 还得是体块。
     const fn sub(self) -> Restrictions {
         Restrictions {
             forbid_structs: self.forbid_structs,
@@ -63,17 +50,12 @@ impl Restrictions {
     }
 }
 
-// ── 优先级 ────────────────────────────────────────────────────────────────
-// 编码是 `bp = (15 − 组号) × 2`（`spec-mapping.md` §3）。组号只在 `peek_infix` 那张表里
-// 出现，这里只给**被多处引用**的几个名字。左结合者 rhs 用 `bp + 1`，赋值（右结合）用 `bp`。
 
 /// 组 3：一元 `-` `!` `*` `&` `&mut`。操作数按组 3 自己的 bp 解，
-/// 所以 `-x as u32` 是 `(-x) as u32`（写成 21 会得到错的 `-(x as u32)`）。
 const BP_PREFIX: usize = 24;
 /// 组 4：`as`。比 `*` 强，右操作数是**类型**不是表达式。
 const BP_CAST: usize = 22;
 /// 组 11：`==` `!=` `<` `<=` `>` `>=`。**这个常量就是"比较运算符集合"本身**——
-/// 不可链式的判定读它，不另立一张 `BinOp::Lt | Le | …` 的表，否则比较集合有第二份。
 const BP_CMP: usize = 8;
 /// 组 14：赋值族（右结合）。
 const BP_ASSIGN: usize = 2;
@@ -84,7 +66,7 @@ enum Infix {
     Binary(BinOp, usize),
     /// 赋值族 + bp（右结合）。
     Assign(AssignOp, usize),
-    /// `as`：吃掉之后解的是**类型**，不是有右操作数的普通中缀。
+    /// as
     Cast,
 }
 
@@ -173,12 +155,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ── 标点切分（`arch.md` §1.5.1）────────────────────────────────────────
-    // 把当前 token 拆出一个单字符来用：**原地改写那一格，游标不动**。
-    // 于是「`>` 的剩余部分」还留在原地，下一次 `eat_gt` 接着拆。
-    //
-    // ⚠ 单字符的 `Gt` / `Lt` / `And` **绝不能**进这里：那会造出 `start == end` 的空
-    // token，`bump` 不推进 ⇒ 死循环。可切分的只有下面这五个（`spec-mapping.md` §1.2）。
     fn split_cur(&mut self, kind: TokenKind) {
         let t = &mut self.toks[self.pos];
         debug_assert!(t.span.end > t.span.start, "只拆多字符 token");
@@ -233,7 +209,6 @@ impl<'a> Parser<'a> {
         true
     }
 
-    /// 吃掉一个 `&`。`&&` 拆成 `&`+`&`——所以 `&&mut x` 是 `&(&mut x)`，不是 `(&mut &x)`。
     fn eat_and(&mut self) -> bool {
         match self.cur() {
             TokenKind::And => {
@@ -248,7 +223,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `span` 那一段源码字节。名字不带载荷，比文本只能这样切。
     fn text(&self, span: Span) -> &[u8] {
         &self.src[span.start as usize..span.end as usize]
     }
@@ -282,9 +256,14 @@ impl Parser<'_> {
         ExprId(self.ast.exprs.len() - 1)
     }
 
-    fn push_block(&mut self, stmts: Vec<Stmt>, span: Span) -> BlockId {
+    fn push_block(&mut self, stmts: Vec<StmtId>, span: Span) -> BlockId {
         self.ast.blocks.push(Block { stmts, span });
         BlockId(self.ast.blocks.len() - 1)
+    }
+
+    fn push_stmt(&mut self, kind: StmtKind, span: Span) -> StmtId {
+        self.ast.stmts.push(Stmt { kind, span });
+        StmtId(self.ast.stmts.len() - 1)
     }
 
     fn push_type(&mut self, kind: TypeKind, span: Span) -> TypeId {
@@ -394,20 +373,21 @@ impl Parser<'_> {
         }
         Ok(())
     }
-    //parse generic param in function
-    fn parse_generic_params(&mut self) -> Result<(), FrontendError> {
-        if self.eat(TokenKind::Lt) {
-            while self.eat(TokenKind::LifeTime) {
-                if self.eat(TokenKind::Colon) {
-                    self.parse_lifetime_bounds()?;
-                }
-                if !self.eat(TokenKind::Comma) {
-                    break;
-                }
-            }
-            self.expect(TokenKind::Gt)?;
+    /// 返回是否出现过 `<...>`；参数本身被丢弃（只允许生命周期）。
+    fn parse_generic_params(&mut self) -> Result<bool, FrontendError> {
+        if !self.eat(TokenKind::Lt) {
+            return Ok(false);
         }
-        Ok(())
+        while self.eat(TokenKind::LifeTime) {
+            if self.eat(TokenKind::Colon) {
+                self.parse_lifetime_bounds()?;
+            }
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::Gt)?;
+        Ok(true)
     }
     fn parse_param(&mut self) -> Result<Param, FrontendError> {
         let mutable;
@@ -452,7 +432,7 @@ impl Parser<'_> {
         }
         Ok(())
     }
-    fn parse_let(&mut self) -> Result<Stmt, FrontendError> {
+    fn parse_let(&mut self) -> Result<StmtId, FrontendError> {
         let start = self.mark();
         self.expect(TokenKind::Let)?;
         let mutable = self.eat(TokenKind::Mut);
@@ -470,15 +450,15 @@ impl Parser<'_> {
         let init = self.parse_expr_bp(0, Restrictions::VALUE)?.0;
         self.expect(TokenKind::Semi)?;
         let span = self.span_from(start);
-        Ok(Stmt {
-            kind: StmtKind::Let {
+        Ok(self.push_stmt(
+            StmtKind::Let {
                 binding,
                 mutable,
                 ty,
                 init,
             },
             span,
-        })
+        ))
     }
 
     fn parse_if(&mut self) -> Result<ExprId, FrontendError> {
@@ -612,11 +592,7 @@ impl Parser<'_> {
             }
         }
         self.expect(TokenKind::RBrace)?;
-        Ok(ExprKind::Struct {
-            path,
-            fields,
-            base: None,
-        })
+        Ok(ExprKind::Struct { path, fields })
     }
 
     fn parse_atom(&mut self, r: Restrictions) -> Result<Option<(ExprId, bool)>, FrontendError> {
@@ -856,9 +832,9 @@ impl Parser<'_> {
             let start = self.ast.exprs[lhs.0].span.start;
             lhs = match infix {
                 Infix::Cast => {
-                    let ty = self.parse_type()?;
-                    let end = self.ast.types[ty.0].span.end;
-                    self.push_expr(ExprKind::Cast { expr: lhs, ty }, Span { start, end })
+                    let type_id = self.parse_type()?;
+                    let end = self.ast.types[type_id.0].span.end;
+                    self.push_expr(ExprKind::Cast { expr_id: lhs, type_id }, Span { start, end })
                 }
                 Infix::Binary(op, _) => {
                     let rhs = self.parse_expr_bp(rhs_min, r.sub())?.0;
@@ -885,7 +861,7 @@ impl Parser<'_> {
             .ok_or_else(|| self.err(SyntaxErrorKind::ExpectedExpression))
     }
 
-    fn parse_expr_stmt(&mut self) -> Result<Stmt, FrontendError> {
+    fn parse_expr_stmt(&mut self) -> Result<StmtId, FrontendError> {
         let start = self.mark();
         let (expr, block_like) = self.parse_expr_bp(0, Restrictions::STATEMENT)?;
         let semi = self.eat(TokenKind::Semi);
@@ -893,26 +869,20 @@ impl Parser<'_> {
             return Err(self.err(SyntaxErrorKind::Expected(TokenKind::Semi)));
         }
         let span = self.span_from(start);
-        Ok(Stmt {
-            kind: StmtKind::Expr { expr, semi },
-            span,
-        })
+        Ok(self.push_stmt(StmtKind::Expr { expr, semi }, span))
     }
-    fn parse_stmt(&mut self) -> Result<Stmt, FrontendError> {
+    fn parse_stmt(&mut self) -> Result<StmtId, FrontendError> {
         if self.at(TokenKind::Semi) {
             let start = self.mark();
             self.bump();
-            Ok(Stmt {
-                kind: StmtKind::Empty,
-                span: self.span_from(start),
-            })
+            Ok(self.push_stmt(StmtKind::Empty, self.span_from(start)))
         } else if self.at(TokenKind::Let) {
             self.parse_let()
         } else {
             self.parse_expr_stmt()
         }
     }
-    fn parse_stmts(&mut self) -> Result<Vec<Stmt>, FrontendError> {
+    fn parse_stmts(&mut self) -> Result<Vec<StmtId>, FrontendError> {
         let mut stmts = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             stmts.push(self.parse_stmt()?);
@@ -934,7 +904,7 @@ impl Parser<'_> {
         let name = Name {
             span: self.span_from(ident_start),
         };
-        self.parse_generic_params()?;
+        let has_generic_params = self.parse_generic_params()?;
         self.expect(TokenKind::LParen)?;
 
         let recv = self.parse_self()?;
@@ -962,6 +932,7 @@ impl Parser<'_> {
 
         Ok(ItemKind::Fn {
             name,
+            has_generic_params,
             recv,
             params,
             ret,
@@ -1275,12 +1246,12 @@ impl Parser<'_> {
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type()?;
         self.expect(TokenKind::Eq)?;
-        let value = self.parse_const_value()?;
+        let const_value_id = self.parse_const_value()?;
         self.expect(TokenKind::Semi)?;
         Ok(ItemKind::Const {
             name: Name { span: name_span },
             ty,
-            value,
+            const_value_id,
         })
     }
 
@@ -1400,6 +1371,29 @@ mod tests {
         ] {
             assert!(item(src).is_err(), "应当拒绝: {src}");
         }
+    }
+
+    /// `semantic/entry/rej-main-cannot-have-generic-parameters.rx` 整份就是
+    /// `fn main<'a>() {}`：生命周期参数照旧丢，但"出现过 `<...>`"这一笔
+    /// 要在 AST 里留得下，否则 sema 看不见它、无从拒起（`arch.md` §1.2.2）。
+    #[test]
+    fn fn_records_whether_generic_params_appeared() {
+        // `parse_item` 把根存在 `entry_root` 里（不是 `root`——那是 crate 入口用的）。
+        let has = |src: &str| match item(src) {
+            Ok(ast) => match ast.entry_root {
+                Some(EntryRoot::Item(Some(id))) => match &ast.items[id.0].kind {
+                    ItemKind::Fn { has_generic_params, .. } => *has_generic_params,
+                    other => panic!("不是 fn: {other:?}"),
+                },
+                other => panic!("entry_root 不是 Item: {other:?}"),
+            },
+            Err(e) => panic!("解析失败: {e:?}"),
+        };
+        assert!(has("fn main<'a>() {}"));
+        assert!(has("fn main<'a, 'b: 'a>() {}"));
+        assert!(!has("fn main() {}"));
+        // 类型参数本来就过不了 `parse_generic_params`，与这个 bit 无关
+        assert!(item("fn main<T>() {}").is_err());
     }
 
     /// 语料 reject/ 里零个 impl 用例，「块没关上」这个形状只能靠这里兜住。
