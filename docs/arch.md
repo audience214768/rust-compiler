@@ -377,7 +377,7 @@ pub struct ExprInfo {
 
 ⇒ `let p = &mut x`（`p` 是 `Immutable`）接一个 `*`：走 `&mut` 层、基座不是 `Shared` ⇒ `Mutable`，`*p = 3` 合法。`let q = &p`（`q` 是 `Immutable`）接一个 `*`：走 `&` 层 ⇒ `Shared`；再接一个 `*`：基座已是 `Shared` ⇒ 还是 `Shared`，`**q = 2` 报错。**`Box<T> ⇒ 不变` 这一格与 Rust 不同**：规范 `heap.md` 里"不可变的拥有者"挡住的只是**替换内容**，里面存的 `&mut U` 照样给得出可变访问——所以 `Box` 自己不降级，降级只由它里面那个 `&` 带来。于是 `let b = Box::<i32>::new(1); *b = 2;` 是**编译错误**（不可变的 `b` ⇒ `*b` 也 `Immutable`），而 `let b = Box::<&mut i32>::new(&mut x); **b = 2;` 合法（`*b` 走 `Box` 不变、`**b` 走 `&mut` ⇒ `Mutable`）。
 
-**`Vec` 下标是这条规则之外的一步**：数组下标与 `Box` 解引用一样**不插借用**，`Vec` 下标则**隐含借用向量本身**（`heap.md` §Indexing and mutable access）——那一刻向量不是 `Mutable` 的话，元素状态直接降成 `Shared`，元素里存再多 `&mut` 也拿不回可变访问（`fn f(values: Vec<&mut i32>) { *values[0] = 2; }` 因为少了 `mut` 而报错）。这正是"不可变向量不因元素是 `&mut` 就变可变"，与上面 `Box` 那格是同一个意思在两种容器上的两种落法：**`Box` 不插借用，`Vec` 插**。
+**`Vec` 下标是这条规则之外的一步**：数组下标与 `Box` 解引用一样**不插借用**，`Vec` 下标则**隐含借用向量本身**（`heap.md` §Indexing and mutable access）——那一刻向量不是 `Mutable` 的话，元素状态直接降成 `Shared`，元素里存再多 `&mut` 也拿不回可变访问（`fn f(values: Vec<&mut i32>) { *values[0] = 2; }` 因为少了 `mut` 而报错）。这正是"不可变向量不因元素是 `&mut` 就变可变"，与上面 `Box` 那格是同一个意思在两种容器上的两种落法：**`Box` 不插借用，`Vec` 插**。**降成 `Shared` 的元素交出去时还要再拦一次**（可变再借用）：`heap.md` 同一段把四类操作并列——赋值、复合赋值、**可变借用或再借用**、`&mut self` 接收者——都要求"向量在下标那一步可变"；前三类各自有落点，第四类**没有节点可挂**（`let r: &mut i32 = values[0];` 里既没有 `&mut` 表达式、也没有赋值，元素 place 是直接交给 `let` 初值的），所以落成 `check_expr` 出口的一道兜底：place 态是 `Shared`、表达式类型是 `&mut _`、且 `expected` 也是 `&mut _` ⇒ `NotMutablePlace`。`&mut T → &T` 那一档只要求共享访问，所以目标类型是 `&_` 时放行（`let r: &i32 = values[0];` 合法）。
 
 **粒度是一行结论**：名字解析、类型、转换、place 判定**都在同一行**，按表达式 id 读一次就拿到全部（`resolutions` / `expr_cat` / `coercions` 这类分表不再单列）。`ValueSym` 是名字解析的四种归宿：局部绑定（`Local`）、函数（`Fn`）、常量项（`Const`）、编译器内置（`Builtin`——`println_i32` 这类没有源码 `ItemId` 的函数，以及 `Box` / `Vec` 的关联函数）。**结构体成员也是这四种之一**：`assoc[sid]` 里装的就是 `ValueSym`，但**只装源码 `impl` 项**（方法落 `Fn`、关联常量落 `Const`）；`Box` / `Vec` 的内建成员与 derive 出来的 `clone` **不进 `assoc`**，走方法查找候选链上并列的那张内建表。
 
@@ -646,7 +646,7 @@ pub struct TyArena {
 | `is_scalar(ty) -> bool` | 规格：`size != 0 && !matches!(kind, Array \| Struct \| Vec)`；mem2reg 的 `is_promotable` 与后端的"一个字还是 N 字节"开关 |
 | `coerce(from, to) -> Option<Coercion>` | 一对类型的隐式转换判据（允许清单见 [`spec-mapping.md`](spec-mapping.md) §7.3）；`None` = 不允许。`Identity` / `MutToShared` / `RefToInner` / `Never` 四值就是 lowering 要发的动作（`Coercion` 在 `tables.rs`） |
 | `derefs_to(cur, target, mutable_path) -> bool` | `coerce` 的帮手：`cur` 沿内置解引用（`&U` / `&mut U` / `Box<U>` → `U`）能否走到 `target`；`mutable_path` ⇒ 路径上不许出现共享引用（`&mut S` → `&mut T` 的要求） |
-| `lub(tys) -> Option<TyId>` | 一组结果的公共类型（三步算法见 [`spec-mapping.md`](spec-mapping.md) §7.3）；`None` = UB，**不报错**（M1.6 接上；当前是 `todo!()`） |
+| `lub(tys) -> Option<TyId>` | 一组结果的公共类型（三步算法见 [`spec-mapping.md`](spec-mapping.md) §7.3）；全 `!` ⇒ `Never`，空输入 ⇒ `None`（唯一还活着的 `None` 来源）。换目标那一支两步还没按规范收紧，见 [`plan.md`](plan.md) §0.4 的 P1-10 |
 
 **布局怎么算**（`layout_of`，与规范参考表逐条一致）：
 
@@ -894,7 +894,7 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 
 **要维护的只有一样东西：当前作用域**——就是 `Sema.scopes` 那个栈（§2.2.1），进块压、出块弹；**当前作用域恒为栈顶**（`Sema::cur_scope()`），没有第二处要同步的状态。第 5 步里 `insert_local`（**只给 `let` 用**，遮蔽、不查重）与 `declare_value`（顶层 item / 关联项 / **形参**，撞了就报）不是一回事。`BindingId` 由**出生地**决定（§2.2.1）：`let` 用 `BindingId::Let(stmt_id)`、形参用 `BindingId::Param { item, index }`、接收者用 `BindingId::Recv(item)`——**没有计数器、没有 `new_binding`**。
 
-**哪些 AST 节点会带出一个块**——第 5 步只有这五处换作用域：函数体 `Fn.body`、`ExprKind::Block`、`ExprKind::Loop`、`ExprKind::While.body`、`ExprKind::If.then_block`。`else` 不在这张表里：`If.else_branch` 是一个 `ExprId`（`else { … }` 是块表达式、`else if` 是 `If` 表达式），两者都从 `check_expr` 那扇门进来。**`check_block` 的机制**一行：`push_scope()` ⇒ 按源码顺序 `check_stmt`（每条语句的结论按 id **写下标**、不 push——parser 建节点是后序、sema 走 AST 是前序）⇒ 取块值（最后一条 `semi: false` 的表达式语句）⇒ `pop_scope()` ⇒ 把块类型**返回**给上层（不落表）。
+**哪些 AST 节点会带出一个块**——第 5 步只有这五处换作用域：函数体 `Fn.body`、`ExprKind::Block`、`ExprKind::Loop`、`ExprKind::While.body`、`ExprKind::If.then_block`。`else` 不在这张表里：`If.else_branch` 是一个 `ExprId`（`else { … }` 是块表达式、`else if` 是 `If` 表达式），两者都从 `check_expr` 那扇门进来。**`check_block` 的机制**一行：`push_scope()` ⇒ 按源码顺序 `check_stmt`（每条语句的结论按 id **写下标**、不 push——parser 建节点是后序、sema 走 AST 是前序）⇒ 取块值（最后一条 `semi: false` 的表达式语句）⇒ `pop_scope()` ⇒ 把块类型**返回**给上层（不落表）。**块类型三条规则**：① 任何一条语句的类型是 `!` ⇒ 块是 `!`（控制流到不了下一条，后面全不可达），尾语句也算；② 否则有块值 ⇒ 块的类型就是块值的类型；③ 都没有 ⇒ `()`。**非尾语句的值必须能丢掉**——与 `()` 相容即可（`!` 不相容检查里自然放行），`{ 1 }` 后面还跟着语句就是编译错误。⚠ **早退检测只决定块类型，不改检查流程**：死代码照查（名字、类型、非 place 目标都报错），只有 place 可变性按 UB 放过（`never.md` §Unreachable code）。
 
 **`check_stmt` 只有三个变体**：`Empty` 什么也不做；`Expr { expr, .. }` ⇒ `check_expr`（`semi` 在这条路上用不上）；`Let { binding, ty, init, .. }` ⇒ **先 `check_expr(init)`、再 `resolve_type(ty)`（有标注时）、最后发绑定并插入当前作用域**（顺序是规范钉的：*a local binding is visible only after its initializer*——先走 `init` 再插绑定，`let x = x;` 里的 `x` 就不是正在声明的那个）。`semi` 留给后面的块定型——它是"谁是块尾"的**唯一**依据（§1.3.5）。
 
@@ -917,7 +917,7 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 `ExprKind::Binary` 的每个臂因此 1–4 行、逐行对应 [`spec-mapping.md`](spec-mapping.md) §7.2 的一张表：算术 = 两侧 `is_int` 且剥完相等、结果取该标量；位 = 同上换 `is_int_or_bool`；移位 = 两侧各自 `is_int`、**允许异型**、结果取左侧；逻辑 = 两侧原样都 `bool`、结果 `bool`；序比较 = `orderable`、结果 `bool`；相等 = 两侧 `TyId` 相同、结果 `bool`。一元 `-` / `!` 走同一个 `peel_shared`（`-` 另加有符号检查）。两个操作数**先都算完类型再判**，结果各自给（算术 / 位 / 移位给标量，比较给 `bool`）。
 
 
-**循环栈**：`break` / `continue` 要一个 `Vec<LoopInfo>`，每层记三样：`kind`（`loop` 还是 `while`——判「`break` 值只在 `loop` 里合法」要看栈顶）、`expected`（`loop` 自己的类型当期望类型下传给 break 值）、`break_tys`（这一层已见的 break 值类型；收齐后算 `loop` 的类型，一个都没有就是 `!`）。进循环压、出循环弹。**两种循环的体都必须与 `()` 相容**（`loop { 1 }` / `while false { 1 }` 都是编译错误，发散体靠 `!` 的转换放行）⇒ 体按 `Some(Unit)` 定型。⚠ **`while` 的条件在压这一层之前走，且走条件前把外层整摞暂时取走**（`mem::take`，走完放回）——`loop-expr.md:21` 要求条件里的跳转 "must target a loop nested inside that condition"，指向该 `while` 自己或任何外层循环都是错。跳转的判据因此只有一条：**栈空即非法**（`InvalidJumpTarget`）。⚠ 这张栈只回答"合不合法"；lowering 的 `LowerCtx.loops` 那张表回答"跳到哪个块"（那张表的元素类型叫 `LoopCtx`，见 [`arch-phase2.md`](arch-phase2.md) §2.3.1），**两张不是一回事，名字也故意分开**。
+**循环栈**：`break` / `continue` 要一个 `Vec<LoopInfo>`，每层记三样：`kind`（`loop` 还是 `while`——判「`break` 值只在 `loop` 里合法」要看栈顶）、`expected`（`loop` 自己的类型当期望类型下传给 break 值）、`break_tys`（这一层已见的 break 值类型；**裸 `break;` 供 `()` 也要记一条**，收齐后算 `loop` 的类型，一条都没有才是 `!`）。进循环压、出循环弹。**两种循环的体都必须与 `()` 相容**（`loop { 1 }` / `while false { 1 }` 都是编译错误，发散体靠 `!` 的转换放行）⇒ 体按 `Some(Unit)` 定型。⚠ **`while` 的条件在压这一层之前走，且走条件前把外层整摞暂时取走**（`mem::take`，走完放回）——`loop-expr.md:21` 要求条件里的跳转 "must target a loop nested inside that condition"，指向该 `while` 自己或任何外层循环都是错。跳转的判据因此只有一条：**栈空即非法**（`InvalidJumpTarget`）。⚠ 这张栈只回答"合不合法"；lowering 的 `LowerCtx.loops` 那张表回答"跳到哪个块"（那张表的元素类型叫 `LoopCtx`，见 [`arch-phase2.md`](arch-phase2.md) §2.3.1），**两张不是一回事，名字也故意分开**。
 
 **`resolve_type` 把语法类型换成 `TyId`，五种语法形态各一条**（`ast::TypeKind` 正好五个变体）：`Paren(t)` 递归进去（`Box<(i32)>` 走的就是这里）；`Path(p)` 交给 `resolve_type_path`；`Unit` 直接 `TyKind::Unit`；`Ref { mutable, inner }` 递归后包一层；`Array { elem, len }` **先递归 `elem`、再 `array_len(len)` 求出数、最后一起 intern**——**数的存在必须先于那次 `intern`**（理由见前文 2c）。
 
@@ -959,7 +959,7 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 |---|---|
 | **name** | 名字查不到、用错命名空间（`fn` 与 `const` 撞车，`struct` 与 `fn` 不撞）、重复定义 |
 | **type** | 类型不匹配、隐式转换不成立（引用 coercion 远没有 Rust 多）、`as` 的合法组合之外、数组长度不是 `usize` 常量 |
-| **mutability** | `cat` 不是 `Place(Mutable)` 却要写它（赋值 / `&mut` / `&mut self` 接收者）；`Vec` 下标那一步隐含借用向量，那一刻不是 `Mutable` ⇒ 元素降成 `Shared`、里面存再多 `&mut` 也拿不回可变访问（判据与两张例表见 §2.2.1） |
+| **mutability** | `cat` 不是 `Place(Mutable)` 却要写它（赋值 / `&mut` / `&mut self` 接收者）；`Vec` 下标那一步隐含借用向量，那一刻不是 `Mutable` ⇒ 元素降成 `Shared`、里面存再多 `&mut` 也拿不回可变访问；降成 `Shared` 的元素在转换位点上再被拦一次（可变再借用）（判据与例表见 §2.2.1） |
 | **capability** | derive 的**互相牵连 + 逐字段**检查：`Copy` 必须同时请求 `Clone`、`Eq` 必须同时请求 `PartialEq`、`Box` 字段挡 `Copy`、`&mut` 字段挡 `Clone` |
 | **constant** | 常量初始化式类型不符、常量环（直接 / 间接 / 关联三种都要检出）、负号加在无符号常量上 |
 | **layout** | 布局环（`struct A { a: A }`）；**只有 `Box`/`Vec` 能破环**，内联数组不破环 |

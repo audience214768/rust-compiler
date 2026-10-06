@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use tables::{Checked, Coercion, PlaceMut, Tables, TyId, Category};
 
-/// `scopes` 栈的下标（`ROOT` = crate 根）；sema 内部类型，不进交接面。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ScopeId(pub usize);
 
@@ -25,7 +24,6 @@ const ROOT: ScopeId = ScopeId(0);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StructId(pub usize);
 
-/// 绑定的身份就是它的出生地：语句的 `StmtId` / 函数的第 `index` 个形参。
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BindingId {
     Param { item_id: ItemId, index: usize },
@@ -33,24 +31,19 @@ pub enum BindingId {
     Recv(ItemId),
 }
 
-/// 一个形参槽位。⚠ `recv` 上是**两个不同的 `mut`**：引用可变（`&mut self`）在 `ty` 里，绑定可变（`mut self`）在 `binding_mut` 里。
 #[derive(Copy, Clone, Debug)]
 pub struct ParamSig {
     pub ty: TyId,
     pub binding_mut: bool,
 }
 
-/// 一个可调物的签名。用户函数与内建都走这个形状，调用点只认它。
 #[derive(Clone, Debug)]
 pub struct FnSig {
-    /// 接收者槽位（`S` / `&S` / `&mut S`）；自由函数与关联函数是 `None`。`self` 就是第零个参数
     pub recv: Option<ParamSig>,
-    /// 形参槽位，不含接收者
     pub params: Vec<ParamSig>,
     pub ret: TyId,
 }
 
-/// 内建函数 / 内建成员。载荷是接收者或容器的具体类型，签名由它现算。
 #[derive(Copy, Clone, Debug)]
 pub enum Builtin {
     GetI32,
@@ -68,11 +61,9 @@ pub enum Builtin {
 }
 
 impl Builtin {
-    /// 接收者、形参、返回类型一次算齐；内建成员的接收者形态就在这儿定死。
     pub fn sig(&self, tys: &mut TyArena) -> FnSig {
         let unit = tys.intern(TyKind::Unit);
         let usize_ty = tys.intern(TyKind::Usize);
-        // 第二项是接收者：（被引用的容器，是否 `&mut`）
         let (recv, params, ret) = match *self {
             Builtin::GetI32 => (None, Vec::new(), tys.intern(TyKind::I32)),
             Builtin::PrintI32 | Builtin::PrintlnI32 => (None, vec![tys.intern(TyKind::I32)], unit),
@@ -87,7 +78,6 @@ impl Builtin {
             Builtin::VecPush(t) => (Some((t, true)), vec![vec_elem(tys, t)], unit),
             Builtin::VecRemove(t) => (Some((t, true)), vec![usize_ty], vec_elem(tys, t)),
         };
-        // 内建的形参绑定都不是 `mut`（规范 `undefined-behavior/builtin.md` 给的签名就没有）
         let recv = recv.map(|(inner, mutable)| ParamSig {
             ty: tys.intern(TyKind::Ref { mutable, inner }),
             binding_mut: false,
@@ -161,14 +151,12 @@ enum Color {
     Black, //finish
 }
 
-/// 循环栈的一层：`break` 值的合法性（M1.6）要看它是 `loop` 还是 `while`。
 #[derive(Copy, Clone, Debug)]
 enum LoopKind {
     Loop,
     While,
 }
 
-/// 循环栈的元素：`break` 合法性 + 这个循环收的 `break` 值（后两个字段 M1.6 填）。
 struct LoopInfo {
     kind: LoopKind,
     expected: Option<TyId>,
@@ -415,6 +403,9 @@ impl TyArena {
                 }
                 lub_ty_id = Some(new_ty_id);
             }
+        }
+        if lub_ty_id.is_none() && tys.len() > 0 {
+            return Some(self.intern(TyKind::Never));
         }
         lub_ty_id
     }
@@ -950,7 +941,6 @@ impl<'a> Sema<'a> {
         Ok(())
     }
 
-    /// 内建表：`base`（候选链上某个已解引用的类型）上名为 `name` 的内建成员。
     fn builtin_method(&self, base: TyId, name: &str) -> Option<Builtin> {
         match self.tys.kinds[base.0] {
             TyKind::Boxed(_) if name == "clone" => Some(Builtin::Clone(base)),
@@ -1226,6 +1216,16 @@ impl<'a> Sema<'a> {
             },
             _ => own,
         };
+        // 可变再借用：place 已跨过一层 `&`（`Vec` 下标插的借用是主要来源），目标就不能再要 `&mut`
+        if let (Some(Category::Place(PlaceMut::Shared)), Some(exp)) = (self.tables.exprs[expr_id.0].cat, expected) {
+            let mut_ref = |t: TyId| matches!(self.tys.kinds[t.0], TyKind::Ref { mutable: true, .. });
+            if mut_ref(ty_id) && mut_ref(exp) {
+                return Err(SemError {
+                    kind: SemErrorKind::NotMutablePlace,
+                    span: self.ast.exprs[expr_id.0].span,
+                });
+            }
+        }
         self.typed(expr_id, ty_id)
     }
 
@@ -1324,6 +1324,29 @@ impl<'a> Sema<'a> {
                     _ => None,
                 };
                 let rhs_ty_id = self.check_expr(*rhs, expected)?;
+                let bad_mismatch = SemError {
+                    kind: SemErrorKind::OperandTypeMismatch,
+                    span: expr.span,
+                };
+                let bad_shape = SemError {
+                    kind: SemErrorKind::InvalidOperatorOperand,
+                    span: expr.span,
+                };
+                match op {
+                    AssignOp::AddAssign | AssignOp::SubAssign | AssignOp::MulAssign | AssignOp::DivAssign | AssignOp::RemAssign => {
+                        let (l, r) = self.scalar_operands(lhs_ty_id, rhs_ty_id, is_int).ok_or(bad_shape)?;
+                        if l != r {
+                            return Err(bad_mismatch);
+                        }
+                    }
+                    AssignOp::BitAndAssign | AssignOp::BitOrAssign | AssignOp::BitXorAssign => {
+                        let (l, r) = self.scalar_operands(lhs_ty_id, rhs_ty_id, is_int_or_bool).ok_or(bad_shape)?;
+                        if l != r {
+                            return Err(bad_mismatch);
+                        }
+                    }
+                    _ => {}
+                }
                 self.tys.interner[&TyKind::Unit]
             }
             ExprKind::Binary { lhs, rhs, op } => {
@@ -1377,7 +1400,6 @@ impl<'a> Sema<'a> {
             }
 
             ExprKind::Cast { expr_id: cur_expr_id, type_id } => {
-                // `as` 不给操作数 expected（`1 as u32` 里 `1` 是 `i32`）；只放行 整数→整数、bool→整数
                 let cur_ty_id = self.check_expr(*cur_expr_id, None)?;
                 let expect_ty_id = self.resolve_type(*type_id)?;
                 let src = self.tys.kinds[cur_ty_id.0];
@@ -1393,7 +1415,6 @@ impl<'a> Sema<'a> {
             }
             ExprKind::Block(block_id) => {
                 let ty_id = self.check_block(*block_id, expected)?;
-                // 块是值不是 place（规范 `expressions.md` §Places and values）；place 形式只有变量、解引用、字段、索引、括号
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 ty_id
             }
@@ -1404,7 +1425,7 @@ impl<'a> Sema<'a> {
                         span: expr.span,
                     });
                 }
-                self.tys.interner[&TyKind::Never]
+                self.tys.intern(TyKind::Never)
             }
             ExprKind::Break(break_expr_id) => {
                 if self.loops.is_empty() {
@@ -1413,22 +1434,55 @@ impl<'a> Sema<'a> {
                         span: expr.span,
                     });
                 }
-                // TODO(M1.6)：带值 break 的 expected = 目标循环的期望；break 自身是 `!`
-                if let Some(break_expr_id) = break_expr_id {
-                    let ty_id = self.check_expr(*break_expr_id, self.loops.last().unwrap().expected)?;
-                    ty_id
-                } else {
-                    self.tys.interner[&TyKind::Never]
+                let ty_id = match break_expr_id {
+                    Some(break_expr_id) => self.check_expr(*break_expr_id, self.loops.last().unwrap().expected)?,
+                    None => self.tys.intern(TyKind::Unit),
+                };
+                self.loops.last_mut().unwrap().break_tys.push(ty_id);
+                self.tys.intern(TyKind::Never)
+            }
+            ExprKind::Return(return_expr_id) => {
+                if self.cur_ret.is_none() {
+                    return Err(SemError { 
+                        kind: SemErrorKind::RetNotInFn, 
+                        span: expr.span,
+                    });
                 }
+                if let Some(return_expr_id) = return_expr_id {
+                    let ty_id = self.check_expr(*return_expr_id, self.cur_ret)?;
+                } else if self.cur_ret.unwrap() != self.tys.intern(TyKind::Unit) {
+                    return Err(SemError { 
+                        kind: SemErrorKind::RetTypeNotMatch, 
+                        span: expr.span, 
+                    });
+                }
+                self.tys.intern(TyKind::Never)
             }
             ExprKind::Loop(block_id) => {
-                // TODO(M1.6)：收集 break 值；无 break ⇒ `!`
                 self.loops.push(LoopInfo::new(LoopKind::Loop, expected));
-                // 循环体必须是 `()`（`loop { 1 }` 是编译错误），发散体靠 `!` 的转换放行
                 let body_ty = self.check_block(*block_id, Some(self.tys.interner[&TyKind::Unit]))?;
-                self.loops.pop();
-                // break 值已经按 `expected` 转换过，循环自己也就取 `expected`
-                expected.unwrap_or(body_ty)
+                if self.tys.coerce(body_ty, self.tys.interner[&TyKind::Unit]).is_none() {
+                    return Err(SemError { 
+                        kind: SemErrorKind::InvalidLoopBody, 
+                        span: expr.span, 
+                    });
+                }
+                let ret_tys = self.loops.pop().unwrap();
+                if ret_tys.break_tys.len() > 0 {
+                    if expected.is_some() {
+                        expected.unwrap()
+                    } else {
+                        let Some(lub_ty_id) = self.tys.lub(ret_tys.break_tys.as_slice()) else {
+                            return Err(SemError { 
+                                kind: SemErrorKind::TypeMismatch, 
+                                span: expr.span,
+                            });
+                        };
+                        lub_ty_id
+                    }
+                } else {
+                    self.tys.intern(TyKind::Never)
+                }
             }
             ExprKind::While { cond, body } => {
                 // 条件里新起的循环才归它管：条件期间把外层循环栈摘掉
@@ -1438,16 +1492,7 @@ impl<'a> Sema<'a> {
                 self.loops.push(LoopInfo::new(LoopKind::While, Some(self.tys.intern(TyKind::Unit))));
                 self.check_block(*body, Some(self.tys.interner[&TyKind::Unit]))?;
                 self.loops.pop();
-                self.tys.interner[&TyKind::Unit]
-            }
-            ExprKind::Return(return_expr_id) => {
-                if let Some(return_expr_id) = return_expr_id {
-                    let ty_id = self.check_expr(*return_expr_id, self.cur_ret)?;
-                    ty_id
-                } else {
-                    self.tys.interner[&TyKind::Unit]
-                }
-
+                self.tys.intern(TyKind::Unit)
             }
             ExprKind::Call { callee, args } => {
                 self.check_expr(*callee, None)?;
@@ -1518,9 +1563,9 @@ impl<'a> Sema<'a> {
                 self.check_expr(*cond, Some(self.tys.interner[&TyKind::Bool]))?;
                 let then_ty = self.check_block(*then_block, expected)?;
                 match else_branch {
-                    None => then_ty,
+                    // 无 `else` 的 `if` 条件假时正常走完 ⇒ 它自己的类型是 `()`，不是分支的类型
+                    None => self.tys.intern(TyKind::Unit),
                     Some(else_expr) => {
-                        // 有 else：两边都吃外层期望（规范 `if-expr.md`）；没有外层期望才取 LUB，`!` 让位给另一边
                         let else_ty = self.check_expr(*else_expr, expected)?;
                         let never = self.tys.intern(TyKind::Never);
                         if then_ty == never && else_ty == never {
@@ -1539,9 +1584,7 @@ impl<'a> Sema<'a> {
                 let (ty_id, mut state) = self.tys.derefs(base_place(self.tables.exprs[recv.0].cat), recv_ty_id);
                 self.check_expr(*index, Some(self.tys.interner[&TyKind::Usize]))?;
                 let elem_ty_id = match self.tys.kinds[ty_id.0] {
-                    // 数组索引不插容器借用，place 状态原样穿过（`heap.md`）
                     TyKind::Array { elem, ..} => elem,
-                    // Vec 索引隐含借用向量：向量那一刻不是可变 place 的话，元素里再多的 `&mut` 也拿不回可变访问
                     TyKind::Vec(elem) => {
                         if state != PlaceMut::Mutable {
                             state = PlaceMut::Shared;
@@ -1589,7 +1632,6 @@ impl<'a> Sema<'a> {
                         self.sig_of(ValueSym::Fn(item_id), expr.span)?.ret
                     }
                     ValueSym::Local(binding_id) => {
-                        // 三种绑定的 cat 都是 `mut` 决定 Mutable / 不带 mut 决定 Immutable（`let` 不属于签名，只有它读 AST）
                         match binding_id {
                             BindingId::Let(stmt_id) => {
                                 let StmtKind::Let { binding, mutable, ty, init } = self.ast.stmts[stmt_id.0].kind else {
@@ -1681,10 +1723,8 @@ impl<'a> Sema<'a> {
                 let Some(hit) = hit else {
                     return Err(bad);
                 };
-                // 点号形态：接收者是隐式的，实参表里没有它
                 let sig = self.sig_of(hit, expr.span)?;
                 let recv_sig = sig.recv.unwrap();
-                // 对号的是**走到命中那一层**之后的 place 状态，不是接收者表达式自己的 cat
                 if let TyKind::Ref { mutable: true, inner } = self.tys.kinds[recv_sig.ty.0] {
                     debug_assert_eq!(inner, base, "候选链停在命中那一层，接收者内层必然是它");
                     if state != PlaceMut::Mutable {
@@ -1775,11 +1815,12 @@ impl<'a> Sema<'a> {
                 Ok(self.tys.intern(TyKind::Unit))
             }
             StmtKind::Expr { expr, semi} => {
-                if semi {
-                    self.check_expr(expr, None)?;
+                let ty_id = self.check_expr(expr, None)?;
+                // 带分号的语句丢掉表达式的值，但丢掉的是「值」不是「走不走得完」：`!` 要留着
+                if semi && ty_id != self.tys.intern(TyKind::Never) {
                     Ok(self.tys.intern(TyKind::Unit))
                 } else {
-                    self.check_expr(expr, None)
+                    Ok(ty_id)
                 }
             }
             StmtKind::Let { binding, mutable, ty, init } => {
@@ -1807,18 +1848,33 @@ impl<'a> Sema<'a> {
             return Ok(self.tys.intern(TyKind::Unit));
         }
         self.push_scope();
+        let mut exit_early = false;
         for i in 0..self.ast.blocks[block_id.0].stmts.len() - 1 {
             let stmt_id = self.ast.blocks[block_id.0].stmts[i];
-            let _ = self.check_stmt(stmt_id)?;   //it must be unit, otherwise it should merge with next stmt
+            let ty_id = self.check_stmt(stmt_id)?;
+            let never = self.tys.intern(TyKind::Never);
+            if ty_id == never {
+                exit_early = true;
+            } else if self.tys.coerce(ty_id, self.tys.interner[&TyKind::Unit]).is_none() {
+                // 非尾语句丢掉的值必须是 `()`：没带分号又定了型，就该并进下一条语句里去
+                return Err(SemError {
+                    kind: SemErrorKind::TypeMismatch,
+                    span: self.ast.stmts[stmt_id.0].span,
+                });
+            }
         }
         let last = *self.ast.blocks[block_id.0].stmts.last().unwrap();
-        // 尾表达式接整块的 expected（`StmtKind::Expr` 那一支只给 `None`）
         let ty_id = match self.ast.stmts[last.0].kind {
             StmtKind::Expr { expr, semi: false } => self.check_expr(expr, expected),
             _ => self.check_stmt(last),
-        };
+        }?;
         self.pop_scope();
-        ty_id
+        let never = self.tys.intern(TyKind::Never);
+        if exit_early || ty_id == never {
+            Ok(never)
+        } else {
+            Ok(ty_id)
+        }
     }
 
     fn check_fn(&mut self, item_id: ItemId) -> Result<(), SemError> {
@@ -1848,7 +1904,15 @@ impl<'a> Sema<'a> {
                 ValueSym::Local(BindingId::Param { item_id, index: i }), 
                 param.binding.span)?;
             }
-            self.check_block(*body, self.cur_ret)?;
+            let ret_ty_id = self.check_block(*body, self.cur_ret)?;
+            if ret_ty_id != self.tys.intern(TyKind::Never) { //如果不是！返回，说明有尾置返回类型
+                if self.cur_ret.is_none() && ret_ty_id != self.tys.intern(TyKind::Unit) || self.cur_ret.is_some() && self.cur_ret.unwrap() != ret_ty_id {
+                    return Err(SemError { 
+                        kind: SemErrorKind::RetTypeNotMatch, 
+                        span: self.ast.items[item_id.0].span,
+                    })
+                }
+            }
             self.pop_scope();
             self.cur_ret = None;
         }
@@ -1866,7 +1930,6 @@ impl<'a> Sema<'a> {
                         (*has_generic_params, recv.is_some(), params.len(), *ret);
                     if is_main {
                         have_main = true;
-                        // 入口契约：空参数表、无泛型参数、无接收者、返回 `()`（可省略）
                         let ret_ok = match ret {
                             Some(t) => self.resolve_type(t)? == self.tys.intern(TyKind::Unit),
                             None => true,

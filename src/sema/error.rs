@@ -87,7 +87,9 @@ pub enum SemErrorKind {
 
     ArrayTypeNotMatch,
 
-    
+    RetTypeNotMatch,
+
+    RetNotInFn,
 }
 
 /// 与 `FrontendError` 同形（`arch.md` §1.1）：`{kind, span}` + 带 `src` 的渲染。
@@ -179,6 +181,12 @@ impl SemError {
             }
             SemErrorKind::ArrayTypeNotMatch => {
                 format!(" {} 数组的元素无法统一", text())
+            }
+            SemErrorKind::RetTypeNotMatch => {
+                format!(" {} 返回类型不一致", text())
+            }
+            SemErrorKind::RetNotInFn => {
+                format!(" {} return 不在函数体里面", text())
             }
         }
     }
