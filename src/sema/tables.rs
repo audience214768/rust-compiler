@@ -12,9 +12,22 @@ pub struct Checked {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TyId(pub usize);
 
+/// 一个 place 能写到什么程度。判据（`operator-expr.md`）：穿过一层共享引用后，再多的 `*` 也拿不回可写。
+/// 它编码的就是 (现在能写?, 写路径上跨过 `&` 没有?) 两位——(能写, 跨过) 那格不可达，所以是三种而不是四种。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PlaceMut {
+    /// 现在就能写：`let mut x` / `mut self` / 物化的临时值
+    Mutable,
+    /// 现在不能写；若里面还存着 `&mut`，`*` 一层之后能写：`let p = &mut x` 的 `p`、`&mut self` 的 `self`
+    Immutable,
+    /// 现在不能写，`*` 之后也永远不能——写路径上已经穿过一层共享引用了。
+    /// **不会出现在绑定上**：`let q = &p` 的 `q` 是 `Immutable`（`&` 还没跨过去），`*q` 才跨过它 ⇒ `Shared`
+    Shared,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Category {
-    Place,
+    Place(PlaceMut),
     Value,
 }
 
@@ -34,8 +47,11 @@ pub enum Coercion {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ExprInfo {
     pub res: Option<ValueSym>,
+    /// 转换**后**的类型（codegen 读这个）；来源类型靠 `coercion` 反推
     pub ty_id: Option<TyId>,
     pub cat: Option<Category>,
+    /// 出口那儿做过的隐式转换；`None` = 没做
+    pub coercion: Option<Coercion>,
 }
 
 #[derive(Debug, Default)]

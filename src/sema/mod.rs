@@ -1,11 +1,11 @@
-#![allow(dead_code, unused_variables)] // WIP：写完全部 todo!() 后删掉这一行
+#![allow(dead_code, unused_variables, unused_assignments, unreachable_code)] // WIP：写完全部 todo!() 后删掉这一行
 
 pub mod error;
 pub mod tables;
 
 use crate::frontend::Span;
 use crate::frontend::ast::{
-    self, Ast, ConstValueKind, ExprId, ExprKind, ItemId, ItemKind, Lit, PathIdentSegment, StmtId, StmtKind, TypeKind
+    self, AssignOp, Ast, ConstValueKind, ExprId, ExprKind, ItemId, ItemKind, Lit, PathIdentSegment, StmtId, StmtKind, TypeKind, BinOp
 };
 use crate::frontend::lexer::base_and_digits_at;
 use crate::sema::tables::Category::Value;
@@ -14,7 +14,7 @@ use error::*;
 use std::cmp::max;
 use std::collections::HashMap;
 use std::hash::Hash;
-use tables::{Checked, Coercion, Tables, TyId, Category};
+use tables::{Checked, Coercion, PlaceMut, Tables, TyId, Category};
 
 /// `scopes` 栈的下标（`ROOT` = crate 根）；sema 内部类型，不进交接面。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -33,11 +33,21 @@ pub enum BindingId {
     Recv(ItemId),
 }
 
-/// 内建成员要的接收者形态；`None` 用在关联函数上——点号形态永不匹配它。
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SelfKind {
-    Shared,
-    Mut,
+/// 一个形参槽位。⚠ `recv` 上是**两个不同的 `mut`**：引用可变（`&mut self`）在 `ty` 里，绑定可变（`mut self`）在 `binding_mut` 里。
+#[derive(Copy, Clone, Debug)]
+pub struct ParamSig {
+    pub ty: TyId,
+    pub binding_mut: bool,
+}
+
+/// 一个可调物的签名。用户函数与内建都走这个形状，调用点只认它。
+#[derive(Clone, Debug)]
+pub struct FnSig {
+    /// 接收者槽位（`S` / `&S` / `&mut S`）；自由函数与关联函数是 `None`。`self` 就是第零个参数
+    pub recv: Option<ParamSig>,
+    /// 形参槽位，不含接收者
+    pub params: Vec<ParamSig>,
+    pub ret: TyId,
 }
 
 /// 内建函数 / 内建成员。载荷是接收者或容器的具体类型，签名由它现算。
@@ -58,50 +68,44 @@ pub enum Builtin {
 }
 
 impl Builtin {
-    pub fn self_kind(&self) -> Option<SelfKind> {
-        match *self {
-            Builtin::GetI32 | Builtin::PrintI32 | Builtin::PrintlnI32 | Builtin::ContainerNew(_) => {
-                None
-            }
-            Builtin::Clone(_)
-            | Builtin::ArrayLen(_)
-            | Builtin::VecLen(_)
-            | Builtin::VecIsEmpty(_) => Some(SelfKind::Shared),
-            Builtin::VecPush(_) | Builtin::VecRemove(_) => Some(SelfKind::Mut),
-        }
-    }
-
-    /// 接收者类型（`&T` / `&mut T`）；关联函数没有接收者，返回 `None`。
-    pub fn recv_ty(&self, tys: &mut TyArena) -> Option<TyId> {
-        let container = match *self {
-            Builtin::Clone(t)
-            | Builtin::ArrayLen(t)
-            | Builtin::VecLen(t)
-            | Builtin::VecIsEmpty(t)
-            | Builtin::VecPush(t)
-            | Builtin::VecRemove(t) => t,
-            _ => return None,
-        };
-        let mutable = self.self_kind() == Some(SelfKind::Mut);
-        Some(tys.intern(TyKind::Ref { mutable, inner: container }))
-    }
-
-    pub fn sig(&self, tys: &mut TyArena) -> (Vec<TyId>, TyId) {
+    /// 接收者、形参、返回类型一次算齐；内建成员的接收者形态就在这儿定死。
+    pub fn sig(&self, tys: &mut TyArena) -> FnSig {
         let unit = tys.intern(TyKind::Unit);
         let usize_ty = tys.intern(TyKind::Usize);
-        match *self {
-            Builtin::GetI32 => (Vec::new(), tys.intern(TyKind::I32)),
-            Builtin::PrintI32 | Builtin::PrintlnI32 => (vec![tys.intern(TyKind::I32)], unit),
+        // 第二项是接收者：（被引用的容器，是否 `&mut`）
+        let (recv, params, ret) = match *self {
+            Builtin::GetI32 => (None, Vec::new(), tys.intern(TyKind::I32)),
+            Builtin::PrintI32 | Builtin::PrintlnI32 => (None, vec![tys.intern(TyKind::I32)], unit),
             Builtin::ContainerNew(t) => match tys.kinds[t.0] {
-                TyKind::Boxed(inner) => (vec![inner], t),
-                _ => (Vec::new(), t),
+                TyKind::Boxed(inner) => (None, vec![inner], t),
+                _ => (None, Vec::new(), t),
             },
-            Builtin::Clone(t) => (Vec::new(), t),
-            Builtin::ArrayLen(_) | Builtin::VecLen(_) => (Vec::new(), usize_ty),
-            Builtin::VecIsEmpty(_) => (Vec::new(), tys.intern(TyKind::Bool)),
-            Builtin::VecPush(t) => (vec![vec_elem(tys, t)], unit),
-            Builtin::VecRemove(t) => (vec![usize_ty], vec_elem(tys, t)),
-        }
+            Builtin::Clone(t) => (Some((t, false)), Vec::new(), t),
+            Builtin::ArrayLen(t) => (Some((t, false)), Vec::new(), usize_ty),
+            Builtin::VecLen(t) => (Some((t, false)), Vec::new(), usize_ty),
+            Builtin::VecIsEmpty(t) => (Some((t, false)), Vec::new(), tys.intern(TyKind::Bool)),
+            Builtin::VecPush(t) => (Some((t, true)), vec![vec_elem(tys, t)], unit),
+            Builtin::VecRemove(t) => (Some((t, true)), vec![usize_ty], vec_elem(tys, t)),
+        };
+        // 内建的形参绑定都不是 `mut`（规范 `undefined-behavior/builtin.md` 给的签名就没有）
+        let recv = recv.map(|(inner, mutable)| ParamSig {
+            ty: tys.intern(TyKind::Ref { mutable, inner }),
+            binding_mut: false,
+        });
+        let params = params
+            .into_iter()
+            .map(|ty| ParamSig { ty, binding_mut: false })
+            .collect();
+        FnSig { recv, params, ret }
+    }
+}
+
+/// 一个表达式**当 place 基座**时的状态：值物化成可变临时（`make().f = 1` / `make_array()[0] = 7`）。
+fn base_place(cat: Option<Category>) -> PlaceMut {
+    match cat {
+        Some(Category::Place(place_mut)) => place_mut,
+        Some(Category::Value) => PlaceMut::Mutable,
+        None => unreachable!("it should have cat"),
     }
 }
 
@@ -319,18 +323,36 @@ impl TyArena {
         Ok(layout)
     }
 
-    fn derefs(&self, mut cur: TyId) -> (TyId, bool) {
-        let mut final_mutable = true;
+    fn step(state: PlaceMut, ty: TyKind) -> PlaceMut {
+        match ty {
+            TyKind::Ref { mutable, .. } => {
+                if mutable {
+                    if let PlaceMut::Shared = state {
+                        state
+                    } else {
+                        PlaceMut::Mutable
+                    }
+                } else {
+                    PlaceMut::Shared
+                }
+            }
+            TyKind::Boxed(_) => state,
+            _ => unreachable!("it should be dereferenceable"),
+        }
+    }
+
+    fn derefs(&self, base: PlaceMut, mut cur: TyId) -> (TyId, PlaceMut) {
+        let mut state = base;
         loop {
             match self.kinds[cur.0] {
-                TyKind::Ref { mutable, inner } => {
-                    final_mutable &= mutable;
+                TyKind::Ref { inner, .. } | TyKind::Boxed(inner) => {
+                    state = Self::step(state, self.kinds[cur.0]);
                     cur = inner;
                 }
-                TyKind::Boxed(ty_id) => cur = ty_id,
-                _ => break (cur, final_mutable)
+                _ => break,
             }
         }
+        (cur, state)
     }
 
     fn derefs_to(&self, mut cur: TyId, target: TyId, mutable_path: bool) -> bool {
@@ -346,7 +368,6 @@ impl TyArena {
         }
     }
 
-    /// 允许的隐式调整（允许清单见 `spec-mapping.md` §7.3）；`None` = 不允许。
     fn coerce(&self, from: TyId, to: TyId) -> Option<Coercion> {
         if from == to {
             return Some(Coercion::Identity);
@@ -376,22 +397,23 @@ impl TyArena {
     }
 
     fn lub(&mut self, tys: &[TyId]) -> Option<TyId> {
-        // TODO(M1.1⑤ 你写)：! 忽略 → 第一个非 ! 当 T → 后来的能 coerce 就留、整体能换才换、否则 None
         if tys.len() == 0 { return None; }
         let mut lub_ty_id = None;
-        for new_ty_id in tys {
-            if *new_ty_id == self.intern(TyKind::Never) { 
+        for i in 0..tys.len() {
+            let new_ty_id = tys[i];
+            if new_ty_id == self.intern(TyKind::Never) { 
                 continue 
             } else if lub_ty_id.is_none() {
-                lub_ty_id = Some(*new_ty_id);
+                lub_ty_id = Some(new_ty_id);
                 continue;
             }
-            if let Some(coercion) = self.coerce(lub_ty_id.unwrap(), *new_ty_id) {
-                lub_ty_id = Some(*new_ty_id);
-            } else {
-                let Some(coercion) = self.coerce(*new_ty_id, lub_ty_id.unwrap()) else {
-                    return None;
-                };
+            if self.coerce(new_ty_id, lub_ty_id.unwrap()).is_none() {
+                for j in 0..i {
+                    if self.coerce(tys[i], new_ty_id).is_none() {
+                        return None;
+                    }
+                }
+                lub_ty_id = Some(new_ty_id);
             }
         }
         lub_ty_id
@@ -414,6 +436,7 @@ struct Sema<'a> {
     cur_ret: Option<TyId>,
     cur_self: Option<StructId>,
     struct_items: Vec<ItemId>,
+    fn_sig: HashMap<ItemId, FnSig>,
     assoc: HashMap<StructId, HashMap<&'a str, ValueSym>>,
     value_to_impl: HashMap<ItemId, StructId>,
     const_color: HashMap<ItemId, Color>,
@@ -434,12 +457,22 @@ pub fn check(ast: &Ast, src: &[u8]) -> Result<Checked, SemError> {
         cur_ret: None,
         cur_self: None,
         struct_items: Vec::new(),
+        fn_sig: HashMap::new(),
         assoc: HashMap::new(),
         value_to_impl: HashMap::new(),
         const_color: HashMap::new(),
     };
     sema.run()?;
     Ok(Checked { tables: sema.tables, tys: sema.tys })
+}
+
+
+fn is_int(ty_kind: TyKind) -> bool {
+    matches!(ty_kind, TyKind::I32 | TyKind::Isize | TyKind::U32 | TyKind::Usize)
+}
+
+fn is_int_or_bool(ty_kind: TyKind) -> bool {
+    is_int(ty_kind) || ty_kind == TyKind::Bool
 }
 
 impl<'a> Sema<'a> {
@@ -782,7 +815,16 @@ impl<'a> Sema<'a> {
                 };
                 self.tys.intern(kind)
             }
-            None => expected.unwrap_or_else(|| self.tys.intern(TyKind::I32)),
+            // 无后缀字面量只在四个整数类型里取型；别的 expected（`()`、`bool`、引用…）一律兜底 i32
+            None => {
+                let int_expected = expected.filter(|e| {
+                    matches!(
+                        self.tys.kinds[e.0],
+                        TyKind::I32 | TyKind::U32 | TyKind::Isize | TyKind::Usize
+                    )
+                });
+                int_expected.unwrap_or_else(|| self.tys.intern(TyKind::I32))
+            }
         };
 
         let run = self.text(digits).as_bytes();
@@ -929,6 +971,90 @@ impl<'a> Sema<'a> {
         }
     }
 
+    fn sig_of(&mut self, sym: ValueSym, span: Span) -> Result<FnSig, SemError> {
+        match sym {
+            ValueSym::Builtin(builtin) => Ok(builtin.sig(&mut self.tys)),
+            ValueSym::Fn(item_id) => self
+                .fn_sig
+                .get(&item_id)
+                .cloned()
+                .ok_or(SemError {
+                    kind: SemErrorKind::NotCallable,
+                    span,
+                }),
+            _ => Err(SemError {
+                kind: SemErrorKind::NotCallable,
+                span,
+            }),
+        }
+    }
+
+    fn check_fn_sigs(&mut self) -> Result<(), SemError> {
+        let ast = self.ast;
+        for i in 0..ast.root.len() {
+            let item_id = ast.root[i];
+            match &ast.items[item_id.0].kind {
+                ItemKind::Fn { .. } => {
+                    self.cur_self = None;
+                    self.resolve_fn_sig(item_id)?;
+                }
+                ItemKind::Impl { target, items } => {
+                    let ty_id = self.resolve_type(*target)?;
+                    let struct_id = match self.tys.kinds[ty_id.0] {
+                        TyKind::Struct(struct_id) => struct_id,
+                        _ => continue,
+                    };
+                    for item_id in items.iter() {
+                        if matches!(ast.items[item_id.0].kind, ItemKind::Fn { .. }) {
+                            self.cur_self = Some(struct_id);
+                            self.resolve_fn_sig(*item_id)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.cur_self = None;
+        Ok(())
+    }
+
+    fn resolve_fn_sig(&mut self, item_id: ItemId) -> Result<(), SemError> {
+        let ast = self.ast;
+        let (recv, param_tys, ret_ty) = {
+            let ItemKind::Fn { recv, params, ret, .. } = &ast.items[item_id.0].kind else {
+                unreachable!("the item should be function");
+            };
+            (
+                recv.as_ref().map(|r| (r.by_ref, r.mutable)),
+                params.iter().map(|p| (p.ty, p.mutable)).collect::<Vec<_>>(),
+                *ret,
+            )
+        };
+        let recv = match (recv, self.cur_self) {
+            (Some((by_ref, mutable)), Some(struct_id)) => {
+                let base = self.tys.struct_ty[struct_id.0];
+                let ty = if by_ref {
+                    self.tys.intern(TyKind::Ref { mutable, inner: base })
+                } else {
+                    base
+                };
+                // 只有 `mut self` 能让 `self` 这个绑定重新赋值；`&mut self` 的可变在引用的类型里
+                Some(ParamSig { ty, binding_mut: !by_ref && mutable })
+            }
+            _ => None,
+        };
+        let mut params = Vec::new();
+        for (ty, mutable) in param_tys {
+            params.push(ParamSig { ty: self.resolve_type(ty)?, binding_mut: mutable });
+        }
+        let ret = match ret_ty {
+            Some(ty) => self.resolve_type(ty)?,
+            None => self.tys.intern(TyKind::Unit),
+        };
+        self.fn_sig.insert(item_id, FnSig { recv, params, ret });
+        Ok(())
+    }
+
     fn array_len(&mut self, cv: ast::ConstValueId) -> Result<u32, SemError> {
         let span = self.ast.consts[cv.0].span;
         let usize_ty = self.tys.intern(TyKind::Usize);
@@ -1045,20 +1171,72 @@ impl<'a> Sema<'a> {
         }
     }
 
+    fn peel_shared(&self, t: TyId) -> Option<TyId> {
+        match self.tys.kinds[t.0] {
+            TyKind::Ref { mutable: false, inner } => Some(inner),
+            TyKind::Ref { .. } => None,
+            _ => Some(t),
+        }
+    }
+
+    fn scalar_operands(&self, lt: TyId, rt: TyId, class: fn(TyKind) -> bool) -> Option<(TyId, TyId)> {
+        let l = self.peel_shared(lt)?;
+        let r = self.peel_shared(rt)?;
+        let ok = |t: TyId| class(self.tys.kinds[t.0]);
+        (ok(l) && ok(r)).then_some((l, r))
+    }
+
+    fn orderable(&self, lt: TyId, rt: TyId) -> bool {
+        let asym = matches!(
+            (self.tys.kinds[lt.0], self.tys.kinds[rt.0]),
+            (
+                TyKind::Ref { mutable: false, inner: a },
+                TyKind::Ref { mutable: true, inner: b },
+            ) if a == b
+        );
+        if lt != rt && !asym {
+            return false;
+        }
+        let mut base = lt;
+        while let TyKind::Ref { inner, .. } = self.tys.kinds[base.0] {
+            base = inner;
+        }
+        is_int_or_bool(self.tys.kinds[base.0])
+    }
+
     fn typed(&mut self, expr_id: ast::ExprId, ty: TyId) -> Result<TyId, SemError> {
         self.tables.exprs[expr_id.0].ty_id = Some(ty);
         Ok(ty)
     }
 
-    fn check_expr(
+    fn check_expr(&mut self, expr_id: ast::ExprId, expected: Option<TyId>) -> Result<TyId, SemError> {
+        let own = self.check_expr_inner(expr_id, expected)?;
+        let ty_id = match expected {
+            Some(exp) if own != exp => match self.tys.coerce(own, exp) {
+                Some(coercion) => {
+                    self.tables.exprs[expr_id.0].coercion = Some(coercion);
+                    exp
+                }
+                None => {
+                    return Err(SemError {
+                        kind: SemErrorKind::TypeMismatch,
+                        span: self.ast.exprs[expr_id.0].span,
+                    })
+                }
+            },
+            _ => own,
+        };
+        self.typed(expr_id, ty_id)
+    }
+
+    fn check_expr_inner(
         &mut self,
         expr_id: ast::ExprId,
         expected: Option<TyId>,
     ) -> Result<TyId, SemError> {
         let expr = &self.ast.exprs[expr_id.0];
-        match &expr.kind {
+        Ok(match &expr.kind {
             ExprKind::Array(exprs) => {
-                // 期望 `[T; N]`：每个元素拿 `T`、长度必须相等；否则元素之间走 LUB
                 let expected_elem = match expected.map(|e| self.tys.kinds[e.0]) {
                     Some(TyKind::Array { elem, len }) => {
                         if len as usize != exprs.len() {
@@ -1085,7 +1263,7 @@ impl<'a> Sema<'a> {
                     }
                 };
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                self.typed(expr_id, ty_id)
+                ty_id
             }
             ExprKind::ArrayRepeat { elem, len } => {
                 // TODO(M3)：`N > 1` 时元素还得是 `Copy`
@@ -1105,37 +1283,119 @@ impl<'a> Sema<'a> {
                 let elem_ty_id = self.check_expr(*elem, expected_elem)?;
                 let ty_id = self.tys.intern(TyKind::Array { elem: elem_ty_id, len: array_len });
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                self.typed(expr_id, ty_id)
+                ty_id
             }
-            ExprKind::Assign { lhs, rhs, .. } => {
-                // TODO(M1.4)：9a / 9b；右操作数的 expected = 目标类型；结果恒 `()`
+            ExprKind::Neg(inner) => {
+                let bad = SemError {
+                    kind: SemErrorKind::InvalidOperatorOperand,
+                    span: expr.span,
+                };
+                let inner_ty = self.check_expr(*inner, None)?;
+                let t = self.peel_shared(inner_ty).ok_or(bad)?;
+                if !matches!(self.tys.kinds[t.0], TyKind::I32 | TyKind::Isize) {
+                    return Err(bad);
+                }
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
+                t
+            }
+            ExprKind::Not(inner) => {
+                let bad = SemError {
+                    kind: SemErrorKind::InvalidOperatorOperand,
+                    span: expr.span,
+                };
+                let inner_ty = self.check_expr(*inner, None)?;
+                let t = self.peel_shared(inner_ty).ok_or(bad)?;
+                if !is_int_or_bool(self.tys.kinds[t.0]) {
+                    return Err(bad);
+                }
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
+                t
+            }
+            ExprKind::Assign { op, lhs, rhs } => {
                 let lhs_ty_id = self.check_expr(*lhs, None)?;
-                let Some(Category::Place) = self.tables.exprs[lhs.0].cat else {
+                let Some(Category::Place(PlaceMut::Mutable)) = self.tables.exprs[lhs.0].cat else {
                     return Err(SemError {
-                        kind: SemErrorKind::NotAPlace,
+                        kind: SemErrorKind::NotMutablePlace,
                         span: expr.span,
                     })
                 };
-                let rhs_ty_id = self.check_expr(*rhs, Some(lhs_ty_id))?;
-                self.typed(expr_id, self.tys.interner[&TyKind::Unit])
+                let expected = match op {
+                    AssignOp::Assign => Some(lhs_ty_id),
+                    _ => None,
+                };
+                let rhs_ty_id = self.check_expr(*rhs, expected)?;
+                self.tys.interner[&TyKind::Unit]
             }
-            ExprKind::Binary { lhs, rhs, .. } => {
-                // TODO(M1.4)：九组规则（结果 = 左类型；移位两侧可异型；算术允许一层 `&`）
-                let lhs_ty_id = self.check_expr(*lhs, None)?;
-                self.check_expr(*rhs, Some(lhs_ty_id))?;
+            ExprKind::Binary { lhs, rhs, op } => {
+                let lt = self.check_expr(*lhs, None)?;
+                let rt = self.check_expr(*rhs, None)?;
+                let bad_shape = SemError {
+                    kind: SemErrorKind::InvalidOperatorOperand,
+                    span: expr.span,
+                };
+                let bad_mismatch = SemError {
+                    kind: SemErrorKind::OperandTypeMismatch,
+                    span: expr.span,
+                };
+                let ty_id = match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                        let (l, r) = self.scalar_operands(lt, rt, is_int).ok_or(bad_shape)?;
+                        if l != r {
+                            return Err(bad_mismatch);
+                        }
+                        l
+                    }
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                        let (l, r) = self.scalar_operands(lt, rt, is_int_or_bool).ok_or(bad_shape)?;
+                        if l != r {
+                            return Err(bad_mismatch);
+                        }
+                        l
+                    }
+                    BinOp::Shl | BinOp::Shr => self.scalar_operands(lt, rt, is_int).ok_or(bad_shape)?.0,
+                    BinOp::And | BinOp::Or => {
+                        if self.tys.kinds[lt.0] != TyKind::Bool || self.tys.kinds[rt.0] != TyKind::Bool {
+                            return Err(bad_shape);
+                        }
+                        self.tys.intern(TyKind::Bool)
+                    }
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        if !self.orderable(lt, rt) {
+                            return Err(bad_mismatch);
+                        }
+                        self.tys.intern(TyKind::Bool)
+                    }
+                    BinOp::Eq | BinOp::Ne => {
+                        if lt != rt {
+                            return Err(bad_mismatch);
+                        }
+                        self.tys.intern(TyKind::Bool)
+                    }
+                };
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                self.typed(expr_id, lhs_ty_id)
+                ty_id
+            }
+
+            ExprKind::Cast { expr_id: cur_expr_id, type_id } => {
+                // `as` 不给操作数 expected（`1 as u32` 里 `1` 是 `i32`）；只放行 整数→整数、bool→整数
+                let cur_ty_id = self.check_expr(*cur_expr_id, None)?;
+                let expect_ty_id = self.resolve_type(*type_id)?;
+                let src = self.tys.kinds[cur_ty_id.0];
+                let dst = self.tys.kinds[expect_ty_id.0];
+                if !(is_int(dst) && (is_int(src) || matches!(src, TyKind::Bool))) {
+                    return Err(SemError {
+                        kind: SemErrorKind::InvalidCast,
+                        span: expr.span,
+                    });
+                }
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
+                expect_ty_id
             }
             ExprKind::Block(block_id) => {
                 let ty_id = self.check_block(*block_id, expected)?;
-                // place 身份随尾表达式（与 `Paren` 同理）
-                let tail = self.ast.blocks[block_id.0].stmts.last().copied();
-                let cat = match tail.map(|s| &self.ast.stmts[s.0].kind) {
-                    Some(StmtKind::Expr { expr, semi: false }) => self.tables.exprs[expr.0].cat,
-                    _ => Some(Category::Value),
-                };
-                self.tables.exprs[expr_id.0].cat = cat;
-                self.typed(expr_id, ty_id)
+                // 块是值不是 place（规范 `expressions.md` §Places and values）；place 形式只有变量、解引用、字段、索引、括号
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
+                ty_id
             }
             ExprKind::Continue => {
                 if self.loops.is_empty() {
@@ -1144,7 +1404,7 @@ impl<'a> Sema<'a> {
                         span: expr.span,
                     });
                 }
-                self.typed(expr_id, self.tys.interner[&TyKind::Never]) 
+                self.tys.interner[&TyKind::Never]
             }
             ExprKind::Break(break_expr_id) => {
                 if self.loops.is_empty() {
@@ -1156,17 +1416,19 @@ impl<'a> Sema<'a> {
                 // TODO(M1.6)：带值 break 的 expected = 目标循环的期望；break 自身是 `!`
                 if let Some(break_expr_id) = break_expr_id {
                     let ty_id = self.check_expr(*break_expr_id, self.loops.last().unwrap().expected)?;
-                    self.typed(expr_id, ty_id)
+                    ty_id
                 } else {
-                    self.typed(expr_id, self.tys.interner[&TyKind::Never])
+                    self.tys.interner[&TyKind::Never]
                 }
             }
             ExprKind::Loop(block_id) => {
-                // TODO(M1.6)：收集 break 值；无 break ⇒ `!`；期望下发给每个 break
+                // TODO(M1.6)：收集 break 值；无 break ⇒ `!`
                 self.loops.push(LoopInfo::new(LoopKind::Loop, expected));
-                let ty_id = self.check_block(*block_id, None)?;
+                // 循环体必须是 `()`（`loop { 1 }` 是编译错误），发散体靠 `!` 的转换放行
+                let body_ty = self.check_block(*block_id, Some(self.tys.interner[&TyKind::Unit]))?;
                 self.loops.pop();
-                self.typed(expr_id, ty_id)
+                // break 值已经按 `expected` 转换过，循环自己也就取 `expected`
+                expected.unwrap_or(body_ty)
             }
             ExprKind::While { cond, body } => {
                 // 条件里新起的循环才归它管：条件期间把外层循环栈摘掉
@@ -1176,131 +1438,52 @@ impl<'a> Sema<'a> {
                 self.loops.push(LoopInfo::new(LoopKind::While, Some(self.tys.intern(TyKind::Unit))));
                 self.check_block(*body, Some(self.tys.interner[&TyKind::Unit]))?;
                 self.loops.pop();
-                self.typed(expr_id, self.tys.interner[&TyKind::Unit])
+                self.tys.interner[&TyKind::Unit]
             }
             ExprKind::Return(return_expr_id) => {
-                // TODO(M1.1③)：操作数的 expected = `cur_ret`；函数尾同
                 if let Some(return_expr_id) = return_expr_id {
                     let ty_id = self.check_expr(*return_expr_id, self.cur_ret)?;
-                    self.typed(expr_id, ty_id)
+                    ty_id
                 } else {
-                    self.typed(expr_id, self.tys.interner[&TyKind::Unit])
+                    self.tys.interner[&TyKind::Unit]
                 }
-                
+
             }
             ExprKind::Call { callee, args } => {
-                let ty_id = self.check_expr(*callee, None)?;
-                match self.tables.exprs[callee.0].res {
-                    None => {
-                        return Err(SemError {
-                            kind: SemErrorKind::NotCallable,
-                            span: expr.span,
-                        });
-                    }
-                    Some(ValueSym::Const(_)) => {
-                        return Err(SemError {
-                            kind: SemErrorKind::NotCallable,
-                            span: expr.span,
-                        });
-                    }
-                    Some(ValueSym::Local(_)) => {
-                        return Err(SemError {
-                            kind: SemErrorKind::NotCallable,
-                            span: expr.span,
-                        });
-                    }
-                    Some(ValueSym::Builtin(builtin)) => {
-                        let (params, ret_ty) = builtin.sig(&mut self.tys);
-                        let recv_ty = builtin.recv_ty(&mut self.tys);
-                        let want = params.len() + recv_ty.is_some() as usize;
-                        if want != args.len() {
-                            return Err(SemError {
-                                kind: SemErrorKind::ArgCountMismatch,
-                                span: expr.span,
-                            });
-                        }
-                        for (i, arg) in args.iter().enumerate() {
-                            // 路径形态（`Type::method(recv, …)`）的接收者是普通第一实参，不做 autoref
-                            let expected = match recv_ty {
-                                Some(r) if i == 0 => r,
-                                _ => params[i - recv_ty.is_some() as usize],
-                            };
-                            self.check_expr(*arg, Some(expected))?;
-                        }
-                        return self.typed(expr_id, ret_ty);
-                    }
-                    Some(ValueSym::Fn(item_id)) => {
-                        if let ItemKind::Fn { recv, params, ret, .. } =
-                            &self.ast.items[item_id.0].kind
-                        {
-                            let recv_ty = match recv {
-                                Some(r) => {
-                                    let Some(&struct_id) = self.value_to_impl.get(&item_id) else {
-                                        return Err(SemError {
-                                            kind: SemErrorKind::NotCallable,
-                                            span: expr.span,
-                                        });
-                                    };
-                                    let base = self.tys.struct_ty[struct_id.0];
-                                    Some(if r.by_ref {
-                                        self.tys.intern(TyKind::Ref { mutable: r.mutable, inner: base })
-                                    } else {
-                                        base
-                                    })
-                                }
-                                None => None,
-                            };
-                            let want = params.len() + recv_ty.is_some() as usize;
-                            if want != args.len() {
-                                return Err(SemError {
-                                    kind: SemErrorKind::ArgCountMismatch,
-                                    span: expr.span,
-                                });
-                            }
-                            for (i, arg) in args.iter().enumerate() {
-                                let expected = match recv_ty {
-                                    Some(r) if i == 0 => r,
-                                    _ => self.resolve_type(params[i - recv_ty.is_some() as usize].ty)?,
-                                };
-                                self.check_expr(*arg, Some(expected))?;
-                            }
-                            let ret_ty = match ret {
-                                Some(ret_type) => self.resolve_type(*ret_type)?,
-                                None => self.tys.intern(TyKind::Unit),
-                            };
-                            return self.typed(expr_id, ret_ty);
-                        } else {
-                            unreachable!("it should be fn");
-                        }
-                    }
-                }
-            }
-            ExprKind::Cast { expr_id: cur_expr_id, type_id } => {
-                // `as` 不给操作数 expected（`1 as u32` 里 `1` 是 `i32`）；只放行 整数→整数、bool→整数
-                let cur_ty_id = self.check_expr(*cur_expr_id, None)?;
-                let expect_ty_id = self.resolve_type(*type_id)?;
-                let is_int = |k: TyKind| {
-                    matches!(k, TyKind::I32 | TyKind::U32 | TyKind::Isize | TyKind::Usize)
-                };
-                let src = self.tys.kinds[cur_ty_id.0];
-                let dst = self.tys.kinds[expect_ty_id.0];
-                if !(is_int(dst) && (is_int(src) || matches!(src, TyKind::Bool))) {
+                self.check_expr(*callee, None)?;
+                let Some(sym) = self.tables.exprs[callee.0].res else {
                     return Err(SemError {
-                        kind: SemErrorKind::InvalidCast,
+                        kind: SemErrorKind::NotCallable,
+                        span: expr.span,
+                    });
+                };
+                let sig = self.sig_of(sym, expr.span)?;
+                let recv_args = sig.recv.is_some() as usize;
+                if sig.params.len() + recv_args != args.len() {
+                    return Err(SemError {
+                        kind: SemErrorKind::ArgCountMismatch,
                         span: expr.span,
                     });
                 }
+                for (i, arg) in args.iter().enumerate() {
+                    let expected = match sig.recv {
+                        Some(recv) if i == 0 => recv.ty,
+                        _ => sig.params[i - recv_args].ty,
+                    };
+                    self.check_expr(*arg, Some(expected))?;
+                }
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                self.typed(expr_id, expect_ty_id)
+                sig.ret
             }
             ExprKind::Deref(inner) => {
                 let ty_id = self.check_expr(*inner, None)?;
                 match self.tys.kinds[ty_id.0] {
-                    TyKind::Ref { inner, .. } | TyKind::Boxed(inner) => {
-                        self.tables.exprs[expr_id.0].cat = Some(Category::Place);
-                        self.typed(expr_id, inner)
+                    TyKind::Ref { inner: inner_ty, .. } | TyKind::Boxed(inner_ty) => {
+                        let state = TyArena::step(base_place(self.tables.exprs[inner.0].cat), self.tys.kinds[ty_id.0]);
+                        self.tables.exprs[expr_id.0].cat = Some(Category::Place(state));
+                        inner_ty
                     }
-                    _ => Err(SemError {
+                    _ => return Err(SemError {
                         kind: SemErrorKind::NotDereferenceable,
                         span: expr.span,
                     }),
@@ -1308,75 +1491,91 @@ impl<'a> Sema<'a> {
             }
             ExprKind::Ref { inner, mutable } => {
                 let ty_id = self.check_expr(*inner, None)?;
-                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                let ty_id = self.tys.intern(TyKind::Ref { mutable: *mutable , inner: ty_id });
-                self.typed(expr_id, ty_id)
-            }
-            ExprKind::Neg(inner) => {
-                let ty_id = self.check_expr(*inner, None)?;
-                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                self.typed(expr_id, ty_id)
-            }
-            ExprKind::Not(inner) => {
-                let ty_id = self.check_expr(*inner, Some(self.tys.interner[&TyKind::Bool]))?;
-                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                self.typed(expr_id, ty_id)
+                if *mutable && matches!(self.tables.exprs[inner.0].cat, Some(Category::Place(m)) if m != PlaceMut::Mutable) {
+                    return Err(SemError { 
+                        kind: SemErrorKind::NotMutablePlace, 
+                        span: expr.span,
+                    });
+                }
+                if self.tables.exprs[inner.0].cat == Some(Category::Value) {
+                    self.tables.exprs[expr_id.0].cat = Some(Category::Value);
+                } else {
+                    self.tables.exprs[expr_id.0].cat = if *mutable {
+                        Some(Category::Place(PlaceMut::Mutable))
+                    } else {
+                        Some(Category::Place(PlaceMut::Immutable))
+                    }
+                }
+                self.tys.intern(TyKind::Ref { mutable: *mutable, inner: ty_id })
             }
             ExprKind::Paren(inner) => {
-                // 括号不改变含义：expected 照传，place 身份与名字解析的结果照抄
                 let ty_id = self.check_expr(*inner, expected)?;
                 self.tables.exprs[expr_id.0].cat = self.tables.exprs[inner.0].cat;
                 self.tables.exprs[expr_id.0].res = self.tables.exprs[inner.0].res;
-                self.typed(expr_id, ty_id)
+                ty_id
             }
             ExprKind::If { cond, then_block, else_branch } => {
-                // TODO(M1.6)：条件必须 bool；无 else ⇒ 分支期望 `()`；有 else ⇒ 两分支 coerce / lub
                 self.check_expr(*cond, Some(self.tys.interner[&TyKind::Bool]))?;
-                let ty_id = self.check_block(*then_block, expected)?;
-                if let Some(else_expr) = else_branch {
-                    self.check_expr(*else_expr, Some(ty_id))?;
+                let then_ty = self.check_block(*then_block, expected)?;
+                match else_branch {
+                    None => then_ty,
+                    Some(else_expr) => {
+                        // 有 else：两边都吃外层期望（规范 `if-expr.md`）；没有外层期望才取 LUB，`!` 让位给另一边
+                        let else_ty = self.check_expr(*else_expr, expected)?;
+                        let never = self.tys.intern(TyKind::Never);
+                        if then_ty == never && else_ty == never {
+                            never
+                        } else {
+                            self.tys.lub(&[then_ty, else_ty]).ok_or(SemError {
+                                kind: SemErrorKind::TypeMismatch,
+                                span: expr.span,
+                            })?
+                        }
+                    }
                 }
-                self.typed(expr_id, ty_id)
             }
             ExprKind::Index { recv, index } => {
                 let recv_ty_id = self.check_expr(*recv, None)?;
-                let (ty_id, _mutable) = self.tys.derefs(recv_ty_id);
+                let (ty_id, mut state) = self.tys.derefs(base_place(self.tables.exprs[recv.0].cat), recv_ty_id);
                 self.check_expr(*index, Some(self.tys.interner[&TyKind::Usize]))?;
                 let elem_ty_id = match self.tys.kinds[ty_id.0] {
+                    // 数组索引不插容器借用，place 状态原样穿过（`heap.md`）
                     TyKind::Array { elem, ..} => elem,
-                    TyKind::Vec(ty_id) => ty_id,
+                    // Vec 索引隐含借用向量：向量那一刻不是可变 place 的话，元素里再多的 `&mut` 也拿不回可变访问
+                    TyKind::Vec(elem) => {
+                        if state != PlaceMut::Mutable {
+                            state = PlaceMut::Shared;
+                        }
+                        elem
+                    }
                     _ => return Err(SemError {
                         kind: SemErrorKind::InvalidIndex,
                         span: expr.span,
                     }),
                 };
-                self.tables.exprs[expr_id.0].cat = Some(Category::Place);
-                self.typed(expr_id, elem_ty_id)
+                self.tables.exprs[expr_id.0].cat = Some(Category::Place(state));
+                elem_ty_id
             }
             ExprKind::Lit(lit) => {
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 match lit {
                     Lit::Int { digits, suffix } => {
                         let (_, ty_id) = self.eval_int_literal(*digits, *suffix, expected);
-                        self.typed(expr_id, ty_id)
+                        ty_id
                     }
                     Lit::Bool(bool) => {
-                        self.typed(expr_id, self.tys.interner[&TyKind::Bool])
+                        self.tys.interner[&TyKind::Bool]
                     }
                 }
             }
-            ExprKind::Unit => {
-                let unit = self.tys.intern(TyKind::Unit);
-                self.typed(expr_id, unit)
-            }
+            ExprKind::Unit => self.tys.intern(TyKind::Unit),
             ExprKind::Path(path_id) => {
                 let res = self.resolve_value_path(*path_id)?;
                 self.tables.exprs[expr_id.0].res = Some(res);
                 let ty_id = match res {
                     ValueSym::Builtin(builtin) => {
                         self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                        // 内建当值用（函数当值是 UB）：给它的返回类型
-                        builtin.sig(&mut self.tys).1
+                        builtin.sig(&mut self.tys).ret
                     }
                     ValueSym::Const(item_id) => {
                         self.tables.exprs[expr_id.0].cat = Some(Category::Value);
@@ -1387,21 +1586,19 @@ impl<'a> Sema<'a> {
                     }
                     ValueSym::Fn(item_id) => {
                         self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                        let ItemKind::Fn { ret, .. } = self.ast.items[item_id.0].kind else {
-                            unreachable!("the item should be function");
-                        };
-                        if ret.is_none() {
-                            self.tys.intern(TyKind::Unit)
-                        } else {
-                            self.resolve_type(ret.unwrap())?
-                        }
+                        self.sig_of(ValueSym::Fn(item_id), expr.span)?.ret
                     }
                     ValueSym::Local(binding_id) => {
-                        self.tables.exprs[expr_id.0].cat = Some(Category::Place);
+                        // 三种绑定的 cat 都是 `mut` 决定 Mutable / 不带 mut 决定 Immutable（`let` 不属于签名，只有它读 AST）
                         match binding_id {
                             BindingId::Let(stmt_id) => {
                                 let StmtKind::Let { binding, mutable, ty, init } = self.ast.stmts[stmt_id.0].kind else {
                                     unreachable!("the item should be let stmt");
+                                };
+                                self.tables.exprs[expr_id.0].cat = if mutable {
+                                    Some(Category::Place(PlaceMut::Mutable))
+                                } else {
+                                    Some(Category::Place(PlaceMut::Immutable))
                                 };
                                 if ty.is_some() {
                                     self.resolve_type(ty.unwrap())?
@@ -1410,39 +1607,38 @@ impl<'a> Sema<'a> {
                                 }
                             }
                             BindingId::Param { item_id, index } => {
-                                let ItemKind::Fn { params, ..} = &self.ast.items[item_id.0].kind else {
-                                    unreachable!("the item should be function");
-                                };
-                                self.resolve_type(params[index].ty)?
+                                let param = self.sig_of(ValueSym::Fn(item_id), expr.span)?.params[index];
+                                if param.binding_mut {
+                                    self.tables.exprs[expr_id.0].cat = Some(Category::Place(PlaceMut::Mutable));
+                                } else {
+                                    self.tables.exprs[expr_id.0].cat = Some(Category::Place(PlaceMut::Immutable));
+                                }
+                                param.ty
                             }
                             BindingId::Recv(item_id) => {
-                                // `self` 的类型由接收者形态定：`&self` ⇒ `&S`、`&mut self` ⇒ `&mut S`、`self` ⇒ `S`
-                                let ItemKind::Fn { recv, .. } = &self.ast.items[item_id.0].kind else {
-                                    unreachable!("the item should be function");
+                                let Some(recv) = self.sig_of(ValueSym::Fn(item_id), expr.span)?.recv else {
+                                    return Err(SemError {
+                                        kind: SemErrorKind::InvalidImplTarget,
+                                        span: expr.span
+                                    });
                                 };
-                                let struct_id = match self.value_to_impl.get(&item_id) {
-                                    Some(&s) => s,
-                                    None => self.cur_self.expect("接收者一定在某个 impl 里"),
-                                };
-                                let base = self.tys.struct_ty[struct_id.0];
-                                match recv {
-                                    Some(r) if r.by_ref => {
-                                        self.tys.intern(TyKind::Ref { mutable: r.mutable, inner: base })
-                                    }
-                                    _ => base,
+                                if recv.binding_mut {
+                                    self.tables.exprs[expr_id.0].cat = Some(Category::Place(PlaceMut::Mutable));
+                                } else {
+                                    self.tables.exprs[expr_id.0].cat = Some(Category::Place(PlaceMut::Immutable));
                                 }
+                                recv.ty
                             }
                         }
                     }
                 };
-                self.typed(expr_id, ty_id)
+                ty_id
             }
             ExprKind::Method { recv, name, args, has_type_args } => {
                 let bad = SemError {
                     kind: SemErrorKind::NoSuchMethod,
                     span: expr.span,
                 };
-                // 方法段上的类型实参是 compile error（生命周期实参合法、已在 parser 里丢掉）
                 if *has_type_args {
                     return Err(SemError {
                         kind: SemErrorKind::InvalidPath,
@@ -1456,15 +1652,14 @@ impl<'a> Sema<'a> {
                 let ident_name = self.text(ident.span);
                 // 候选链：沿内置解引用逐个 base 试 `assoc`（struct）与内建表（Box / Vec / 数组）
                 let mut base = recv_ty_id;
+                let mut state = base_place(self.tables.exprs[recv.0].cat);
                 let mut hit = None;
                 loop {
                     if let TyKind::Struct(struct_id) = self.tys.kinds[base.0] {
                         if let Some(&ValueSym::Fn(item_id)) =
                             self.assoc.get(&struct_id).and_then(|m| m.get(ident_name))
                         {
-                            // 点号形态只找方法：没有接收者的关联函数不是候选
-                            if let ItemKind::Fn { recv, .. } = &self.ast.items[item_id.0].kind
-                                && recv.is_some()
+                            if self.fn_sig.get(&item_id).is_some_and(|s| s.recv.is_some())
                             {
                                 hit = Some(ValueSym::Fn(item_id));
                             }
@@ -1476,58 +1671,47 @@ impl<'a> Sema<'a> {
                         break;
                     }
                     match self.tys.kinds[base.0] {
-                        TyKind::Ref { inner, .. } | TyKind::Boxed(inner) => base = inner,
+                        TyKind::Ref { inner, .. } | TyKind::Boxed(inner) => {
+                            state = TyArena::step(state, self.tys.kinds[base.0]);
+                            base = inner;
+                        }
                         _ => break,
                     }
                 }
                 let Some(hit) = hit else {
                     return Err(bad);
                 };
-                if let ValueSym::Builtin(builtin) = hit {
-                    let (params, ret_ty) = builtin.sig(&mut self.tys);
-                    if params.len() != args.len() {
+                // 点号形态：接收者是隐式的，实参表里没有它
+                let sig = self.sig_of(hit, expr.span)?;
+                let recv_sig = sig.recv.unwrap();
+                // 对号的是**走到命中那一层**之后的 place 状态，不是接收者表达式自己的 cat
+                if let TyKind::Ref { mutable: true, inner } = self.tys.kinds[recv_sig.ty.0] {
+                    debug_assert_eq!(inner, base, "候选链停在命中那一层，接收者内层必然是它");
+                    if state != PlaceMut::Mutable {
                         return Err(SemError {
-                            kind: SemErrorKind::ArgCountMismatch,
+                            kind: SemErrorKind::NotMutablePlace,
                             span: expr.span,
                         });
                     }
-                    for (i, arg) in args.iter().enumerate() {
-                        self.check_expr(*arg, Some(params[i]))?;
-                    }
-                    self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                    return self.typed(expr_id, ret_ty);
                 }
-                let ValueSym::Fn(item_id) = hit else {
-                    unreachable!("只有 Fn 和 Builtin 会进 hit");
-                };
-                let ItemKind::Fn { params, ret, .. } = &self.ast.items[item_id.0].kind else {
-                    unreachable!("the item should be function");
-                };
-                if params.len() != args.len() {
-                    return Err(SemError { 
-                        kind: SemErrorKind::ArgCountMismatch, 
-                        span: expr.span, 
+                if sig.params.len() != args.len() {
+                    return Err(SemError {
+                        kind: SemErrorKind::ArgCountMismatch,
+                        span: expr.span,
                     });
                 }
-                for i in 0..args.len() {
-                    let arg = args[i];
-                    let expected = self.resolve_type(params[i].ty)?;
-                    self.check_expr(arg, Some(expected))?;
+                for (i, arg) in args.iter().enumerate() {
+                    self.check_expr(*arg, Some(sig.params[i].ty))?;
                 }
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                let ty = if ret.is_none() {
-                    self.tys.intern(TyKind::Unit)
-                } else {
-                    self.resolve_type(ret.unwrap())?
-                };
-                self.typed(expr_id, ty)
+                sig.ret
             }
             ExprKind::Struct { path, fields } => {
-                // TODO(M1.5)：字段齐 / 重 / 未知 / 类型；字段值的 expected = 声明字段类型
                 let ty_id = self.resolve_type_path(*path)?;
                 let TyKind::Struct(struct_id) = self.tys.kinds[ty_id.0] else {
                     unreachable!("the path should be a struct type");
                 };
+                let mut init_check: HashMap<String, bool> = HashMap::new();
                 for field in fields {
                     let init_name = self.text(field.name.span);
                     let Some((_, expected)) = self.tys.structs[struct_id.0].fields.iter().find(|(name, _)| name == init_name) else {
@@ -1536,14 +1720,27 @@ impl<'a> Sema<'a> {
                             span: expr.span, 
                         })
                     };
+                    if init_check.get(init_name).copied().unwrap_or(false) {
+                        return Err(SemError { 
+                            kind: SemErrorKind::DuplicateInitializerField, 
+                            span: expr.span,
+                        });
+                    }
+                    init_check.insert(init_name.to_string(), true);
                     self.check_expr(field.value, Some(*expected))?;
                 }
+                if self.tys.structs[struct_id.0].fields.iter().any(|(name, _)| !init_check.get(name.as_str()).copied().unwrap_or(false)) {
+                    return Err(SemError {
+                        kind: SemErrorKind::MissingInitializerField,
+                        span: expr.span,
+                    });
+                }
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                self.typed(expr_id, ty_id)
+                ty_id
             }
             ExprKind::Field { recv, name } => {
                 let recv_ty_id = self.check_expr(*recv, None)?;
-                let (recv_ty, mutable) = self.tys.derefs(recv_ty_id);
+                let (recv_ty, state) = self.tys.derefs(base_place(self.tables.exprs[recv.0].cat), recv_ty_id);
                 let struct_id = match self.tys.kinds[recv_ty.0] {
                     TyKind::Struct(struct_id) => {
                         struct_id
@@ -1560,16 +1757,16 @@ impl<'a> Sema<'a> {
                     .find(|(n, _)| n == field_name)
                 {
                     Some((_, field_ty)) => {
-                        self.tables.exprs[expr_id.0].cat = Some(Category::Place);
-                        self.typed(expr_id, *field_ty)
+                        self.tables.exprs[expr_id.0].cat = Some(Category::Place(state));
+                        *field_ty
                     }
-                    None => Err(SemError {
+                    None => return Err(SemError {
                         kind: SemErrorKind::UnknownField,
                         span: expr.span,
                     }),
                 }
             }
-        }
+        })
     }
 
     fn check_stmt(&mut self, stmt_id: StmtId) -> Result<TyId, SemError> {
@@ -1586,11 +1783,12 @@ impl<'a> Sema<'a> {
                 }
             }
             StmtKind::Let { binding, mutable, ty, init } => {
-                // TODO(M1.2)：初值的 expected = 注解类型；结论落 `tables.let_tys`
-                self.check_expr(init, None)?;
-                if let Some(ty_id) = ty {
-                    self.resolve_type(ty_id)?;
-                }
+                // TODO(M1.2)：结论落 `tables.let_tys`
+                let expected = match ty {
+                    Some(ty_id) => Some(self.resolve_type(ty_id)?),
+                    None => None,
+                };
+                self.check_expr(init, expected)?;
                 self.insert_local(
                     self.text(binding.span), 
                     ValueSym::Local(BindingId::Let(stmt_id))
@@ -1600,7 +1798,6 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// 块的值（M1.1② 你写）：最后一条 `semi: false` 的表达式语句；规则见 spec-mapping §7.4。
     fn check_block(
         &mut self,
         block_id: ast::BlockId,
@@ -1614,7 +1811,12 @@ impl<'a> Sema<'a> {
             let stmt_id = self.ast.blocks[block_id.0].stmts[i];
             let _ = self.check_stmt(stmt_id)?;   //it must be unit, otherwise it should merge with next stmt
         }
-        let ty_id = self.check_stmt(*self.ast.blocks[block_id.0].stmts.last().unwrap());
+        let last = *self.ast.blocks[block_id.0].stmts.last().unwrap();
+        // 尾表达式接整块的 expected（`StmtKind::Expr` 那一支只给 `None`）
+        let ty_id = match self.ast.stmts[last.0].kind {
+            StmtKind::Expr { expr, semi: false } => self.check_expr(expr, expected),
+            _ => self.check_stmt(last),
+        };
         self.pop_scope();
         ty_id
     }
@@ -1634,17 +1836,13 @@ impl<'a> Sema<'a> {
                     span: self.ast.items[item_id.0].span,
                 });
             }
-            self.cur_ret = Some(match ret {
-                Some(ret_type) => self.resolve_type(*ret_type)?,
-                None => self.tys.intern(TyKind::Unit),
-            });
+            self.cur_ret = Some(self.fn_sig[&item_id].ret);
             self.push_scope();
             if recv.is_some() {
                 self.declare_value("self", ValueSym::Local(BindingId::Recv(item_id)), self.ast.items[item_id.0].span)?;
             }
             for i in 0..params.len() {
                 let param = &params[i];
-                let binding_ty = self.resolve_type(param.ty)?;
                 self.declare_value(
                     self.text(param.binding.span), 
                 ValueSym::Local(BindingId::Param { item_id, index: i }), 
@@ -1723,6 +1921,7 @@ impl<'a> Sema<'a> {
         self.check_consts()?;
         self.finish_structs()?;
         self.check_layouts()?;
+        self.check_fn_sigs()?;
         self.check_crate()?;
         Ok(())
     }

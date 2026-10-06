@@ -345,17 +345,43 @@ pub struct Tables {
 
 pub struct ExprInfo {
     pub res: Option<ValueSym>,      // 名字解析结果（解析到哪个绑定 / 函数 / 常量 / 内置）
-    pub ty_id: Option<TyId>,        // 定型结论；None 只表示「还没写」
-    pub coercion: Option<Coercion>, // 该处插入的隐式转换（随 M1 各 coercion 位点加）
-    pub cat: Category,              // Place | Value（M1.5 各臂顺手填）
+    pub ty_id: Option<TyId>,        // 定型结论；记的是**转换后**的类型
+    pub coercion: Option<Coercion>, // 出口那儿做过的那一次隐式转换；None = 没做
+    pub cat: Option<Category>,      // Place(PlaceMut) | Value；None 只表示「还没写」（各臂顺手填）
 }
 ```
 
-**当前代码里只有前两个字段**（`res` / `ty_id`）：`cat` / `coercion` 是 M1 的目标形状，随各自的臂落地时再加（见 [`plan.md`](plan.md) §0.1）。
+**`ty_id` 与 `coercion` 是同一件事的两面**：`ty_id` 是转换**后**的类型（下游 codegen 按它选 load / 位宽），来源类型与"做了什么调整"由 `coercion` 说（`MutToShared` / `RefToInner` / `Never` / `Identity` 四选一，见 §1.3.5）。两者都在 `check_expr` 的出口一次写下。
+
+**`cat` 是二选一，但 `Place` 那一支带一个三态**：`Category::Place(PlaceMut) | Category::Value`。判据是"写路径上跨过共享引用没有"——跨过一层 `&` 之后，再多的 `*` 也拿不回可写（`operator-expr.md`）：
+
+| 状态 | 例子 | 能赋值 | 后面接 `*` 还能拿回可写吗 |
+|---|---|---|---|
+| `Mutable` | `let mut x` / `mut self` / 物化出来的临时值 | ✔ | —— |
+| `Immutable` | `let p = &mut x` 的 `p`、`&mut self` 的 `self`、没写 `mut` 的形参 | ✘ | **能**（`*p = 3` 合法） |
+| `Shared` | `let q = &p;` 之后的 **`*q`**（`q: &&mut i32`） | ✘ | **不能**（`**q = 2` 报错） |
+
+⚠ **`Shared` 不会落在任何绑定上**：`let q = &p;` 里 `q` 自己是 `Immutable`（`&` 还没跨过去），跨过 `q` 里那个 `&` 得到的 `*q` 才是 `Shared`。`Shared` 只由下面"推一层"这个动作产生。
+
+**推一层只有两条规则**，`Deref` / `Field` / `Index` 的 `cat`、方法接收者候选链上的可变性判定全由它们推出：
+
+```
+基座：  Value 当基座 ⇒ Mutable（物化成可变临时值，规范 expressions.md §Temporary places）
+        Place(m) 当基座 ⇒ m
+
+推进一层内置解引用（Ref 或 Boxed，其余类型不推进）：
+        &mut T  ⇒  原来是 Shared 就还是 Shared，否则 Mutable
+        &T      ⇒  Shared
+        Box<T>  ⇒  不变
+```
+
+⇒ `let p = &mut x`（`p` 是 `Immutable`）接一个 `*`：走 `&mut` 层、基座不是 `Shared` ⇒ `Mutable`，`*p = 3` 合法。`let q = &p`（`q` 是 `Immutable`）接一个 `*`：走 `&` 层 ⇒ `Shared`；再接一个 `*`：基座已是 `Shared` ⇒ 还是 `Shared`，`**q = 2` 报错。**`Box<T> ⇒ 不变` 这一格与 Rust 不同**：规范 `heap.md` 里"不可变的拥有者"挡住的只是**替换内容**，里面存的 `&mut U` 照样给得出可变访问——所以 `Box` 自己不降级，降级只由它里面那个 `&` 带来。于是 `let b = Box::<i32>::new(1); *b = 2;` 是**编译错误**（不可变的 `b` ⇒ `*b` 也 `Immutable`），而 `let b = Box::<&mut i32>::new(&mut x); **b = 2;` 合法（`*b` 走 `Box` 不变、`**b` 走 `&mut` ⇒ `Mutable`）。
+
+**`Vec` 下标是这条规则之外的一步**：数组下标与 `Box` 解引用一样**不插借用**，`Vec` 下标则**隐含借用向量本身**（`heap.md` §Indexing and mutable access）——那一刻向量不是 `Mutable` 的话，元素状态直接降成 `Shared`，元素里存再多 `&mut` 也拿不回可变访问（`fn f(values: Vec<&mut i32>) { *values[0] = 2; }` 因为少了 `mut` 而报错）。这正是"不可变向量不因元素是 `&mut` 就变可变"，与上面 `Box` 那格是同一个意思在两种容器上的两种落法：**`Box` 不插借用，`Vec` 插**。
 
 **粒度是一行结论**：名字解析、类型、转换、place 判定**都在同一行**，按表达式 id 读一次就拿到全部（`resolutions` / `expr_cat` / `coercions` 这类分表不再单列）。`ValueSym` 是名字解析的四种归宿：局部绑定（`Local`）、函数（`Fn`）、常量项（`Const`）、编译器内置（`Builtin`——`println_i32` 这类没有源码 `ItemId` 的函数，以及 `Box` / `Vec` 的关联函数）。**结构体成员也是这四种之一**：`assoc[sid]` 里装的就是 `ValueSym`，但**只装源码 `impl` 项**（方法落 `Fn`、关联常量落 `Const`）；`Box` / `Vec` 的内建成员与 derive 出来的 `clone` **不进 `assoc`**，走方法查找候选链上并列的那张内建表。
 
-**`item_sig`（`ItemId → FnSig { recv, params, ret }`）留在 `Sema` 内部**，不进 `Tables`：读它的只有 sema 自己（调用检查、`self`、参数类型）；后端靠 `ExprInfo.res` 知道"调的是谁"，靠每行 `ty_id` 知道类型。
+**`item_sig`（`ItemId → FnSig { recv, params, ret }`，每个槽位是 `ParamSig { ty, binding_mut }`）留在 `Sema` 内部**，不进 `Tables`：读它的只有 sema 自己（调用检查、`self`、参数类型、参数与接收者的绑定可变性）；后端靠 `ExprInfo.res` 知道"调的是谁"，靠每行 `ty_id` 知道类型。它在**走函数体之前**由一趟专门的预扫填满（`check_fn_sigs`）——签名里的 `Self` 在这一趟就换成所属 struct 的实际类型，此后调用点与**声明处**读的是同一份结论，前向引用（`main` 调后面才声明的函数）也不再需要"先解析再回来"。
 
 **没有块表**：`ast.blocks` 与 `ast.exprs` 是两个独立的 arena（块 id 与表达式 id 数值上会撞车），块类型用 `check_block` 的返回值向上传、不落表；lowering 若真要按 `BlockId` 查类型，再加一行 `blocks: Vec<Option<TyId>>` 即可。
 
@@ -513,13 +539,11 @@ struct Sema<'a> {
     cur_ret:   Option<TyId>,  // 当前函数的声明返回类型：函数尾与 `return` 的期望类型就是它
     cur_self:  Option<StructId>, // `Self` 指谁：正在声明字段的那个 struct，或正在走的 impl 的目标
     struct_items: Vec<ItemId>,   // 2a 收的 struct item，按声明顺序；下标即 StructId —— 桥，第 3 步靠它回到 AST
-    item_sig:  HashMap<ItemId, FnSig>, // 每个函数的签名：接收者 / 参数 / 返回类型（`FnSig` 三个 `TyId` 字段）
+    item_sig:  HashMap<ItemId, FnSig>, // 每个函数的签名：接收者 / 参数 / 返回类型（每槽一个 `ParamSig`，带 `binding_mut`）
     const_color: HashMap<ItemId, Color>, // 2c 的环检测：只装**进过**的常量项，不在表里 = 没进过（求出来的值在 `tables.const_values`）
     assoc:     HashMap<StructId, HashMap<&'a str, ValueSym>>,  // 每个 struct 的关联项命名空间
 }
 ```
-
-**已落地与待落地**：上表 `loops`（还是 `Vec<LoopKind>`）、`cur_ret`、`item_sig` 三处是待落形状，随 M1 各步落地；其余字段已在。
 
 **新加一张表的准入条件：留桥、留索引，不留"筛选副本"、不留"纯缓存标量"。** **桥** = 连接两个**互不认识的 id 空间**、且映射**重算不出来**的表（`struct_items`：`StructId` ↔ `ItemId`；好处是**可断言**，稠密有序）；**索引** = 把现存的东西**按另一把键**重排（`assoc`、`struct_ty`；判据是"换了一把键"，**不是**"键空间无界"）；**筛选副本** = 把现存列表按 `kind` 筛一遍得到的清单，**不收**（顶层 `impl` / `const` 本来就在 `ast.root` 里，三条子趟都直接扫它；多一张副本就多一条"必须记得 push"的**静默**失败面）；**纯缓存标量** = 能一个表达式推出来的标量，**不收、改成方法**（`cur_scope()` 恒等于 `ScopeId(scopes.len() - 1)`）。**分界线：是不是"得恢复"**——**压栈时写一次**的（`Scope.parent`）留着是廉价的显式化；**每次弹栈都要记得恢复**的（`cur_scope` 字段）是纯 bug 面。逐个字段的审计与完整推导见 [`arch-phase2.md`](arch-phase2.md) §2.2.1。
 
@@ -545,17 +569,30 @@ pub enum BindingId { Param { item: ItemId, index: usize }, Let(StmtId), Recv(Ite
 
 pub enum ValueSym {
     Local(BindingId),  // let 绑定 / 形参 / 接收者。lowering 的 vars 表（BindingId → alloca）拿它做键
-    Fn(ast::ItemId),   // 顶层函数或方法：签名与函数体都还在 ast.items 里，这里只记身份、不复制
+    Fn(ast::ItemId),   // 顶层函数或方法：函数体在 ast.items 里、签名在 item_sig 里，这里只记身份、不复制
     Const(ast::ItemId),// 顶层常量或关联常量
     Builtin(Builtin),  // 编译器提供、没有源码 ItemId 的函数（见下）
 }
 
 pub enum Builtin {
-    GetI32, PrintI32, PrintlnI32,
-    BoxNew(TyId), VecNew(TyId), BoxClone(TyId), VecClone(TyId),  // 载荷是元素 / 被包类型
-    VecLen(TyId), VecPush(TyId),
+    GetI32, PrintI32, PrintlnI32,        // 无载荷：自由函数，签名固定
+    ContainerNew(TyId),                  // `Box<T>::new` / `Vec<T>::new`，载荷是那个容器类型
+    Clone(TyId),                         // `Box` / `Vec` / 数组 / 任意 derive 出的 `clone`
+    ArrayLen(TyId), VecLen(TyId), VecIsEmpty(TyId),
+    VecPush(TyId), VecRemove(TyId),      // 载荷是容器类型，元素类型由它现推
 }
+
+/// 一个可调物的签名：用户函数与内建走同一个形状
+pub struct FnSig { recv: Option<ParamSig>, params: Vec<ParamSig>, ret: TyId }
+
+/// 一个形参槽位：类型 + **绑定**是否 `mut`（`mut x: i32` / `mut self`）。
+/// 接收者复用同一个形状——`self` 语义上就是第零个参数。
+pub struct ParamSig { pub ty: TyId, pub binding_mut: bool }
 ```
+
+**`ParamSig` 比 `TyId` 多一个 `binding_mut` 是必需的**：类型答不出"这个绑定能不能重新赋值"。`Path` 落到 `BindingId::Let` 时读 AST 上那个 `mut` 就够了（`let` 不属于任何签名），但形参与接收者的 `mut` 写在**函数签名**上、离使用点很远 ⇒ 预扫时一并收进 `FnSig`，此后 `Path` 只查表。**`recv` 上有两个不同的 `mut`，正好是交叉的**：`&mut self` 是**引用可变、绑定不可变**（`self` 能改字段、不能把自己重新赋值），`mut self` 是**无引用、绑定可变**。"引用可不可变"编码在 `ty` 里，"绑定可不可变"就是 `binding_mut`——`fn f(&mut self) { self = …; }` 非法正是靠后者拒掉。内建每个槽位填 `binding_mut: false`：这不是占位，是**真值**——规范 `undefined-behavior/builtin.md` 给的就是 `fn print_i32(value: i32) -> ();`，本来就没有 `mut`。
+
+**载荷是"接收者 / 容器的具体类型"而不是 `ValueSym` 的身份**：内建的签名随类型而变（`Vec<i32>::push` 收 `i32`、`Vec<bool>::push` 收 `bool`），把它算成一个**函数** `Builtin::sig(&self, tys) -> FnSig` 就够，不必逐个类型各存一份。`recv` 为空 = 关联函数（`new`）或自由函数（`println_i32`），点号形态永不匹配它。**`sig` 是内建签名唯一的出处**，调用点（`Call` 的路径形态与 `Method` 的点号形态）都不再自己拼接收者与形参。
 
 **往上面两张表里插名字、撞名就报错的入口只有 `declare_type` / `declare_value` 两个**（`let` 与形参不走它们——它们的绑定在初始式走完之后才可见）。**四条由负例钉死的纪律**：① **struct 名不进 `values`** ⇒ `struct Same` 与 `fn Same` 共存，而 `S(1)` 是"未解析的值名"；② **`let` 的绑定在初始式之后才可见**（先走 `init` 再插绑定），否则 `let x = x;` 会拿到自己；③ **`self` 走普通作用域绑定**：`check_fn` 在有接收者时把 `self` 声明进作用域，值 `ValueSym::Local(BindingId::Recv(item))`（`self` 语义上就是第零个参数）；impl 常量求值 / 无接收者的关联函数 / 根函数三种情况都没有这条绑定，查不到即报错——`cur_self` 只管 `Self`；④ **保护名只填根作用域、只填各自那张表**——`i32`/`u32`/`isize`/`usize`/`bool` 进 `types`，三个内建 I/O 进 `values`，局部绑定**不查**保护名（`let Vec = …;` 合法）。四个 derive 名（`Copy`/`Clone`/`PartialEq`/`Eq`）**故意不登记**：把它们当 struct 名用是 UB，而我们选择"UB 从简"（`spec-mapping.md` §4）。
 
@@ -849,11 +886,11 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 
 **第 2 步与第 5 步的分工**：顶层 `fn` / `struct` 与关联项都不看声明顺序（`names.md`）⇒ 名字在第 2 步**全部**落地，第 5 步**只查不改**；`let` 反过来顺序敏感，只能边走边加。
 
-**第 5 步：走函数体。** 入口是 `check_crate`（这一趟的分发器），它扫一遍 `ast.root`：顶层 `Fn` ⇒ 判 entry 四条、设 `cur_self = None`、`check_fn(item_id)`；`Impl { target, items }` ⇒ `resolve_type(target)` 求出 `Struct(sid)`（2b 已经拒过别的），设 `cur_self = Some(sid)`，再对 `items` 里每个 `Fn` 调 `check_fn`；`Struct` / `Const` 跳过。**不遍历 `assoc` 去找"关联的 `Fn`"**：那是 `HashMap`、迭代顺序逐进程变（报错顺序不可复现），而且里面还混着常量；`ast.root` → `Impl.items` 才是那份清单。**必须查全部函数，不是只查可达的**：签名里的错（`fn f(x: Missing) {}`）没人调用它也一样要报。
+**第 5 步：走函数签名与函数体。** 先一趟 `check_fn_sigs` 把**每个**函数的签名解析进 `item_sig`（`ast.root` 里的顶层 `fn`、以及每个 `Impl.items` 里的 `fn`，解析时 `cur_self` 设成它所属的 struct）——**全部都解析，不留懒加载**：签名里的 `Self` 只有在这一趟才有人替它回答"我属于谁"，而调用点可能是它前面声明的函数（`main` 调后面才写的 `helper`）。函数体的入口是 `check_crate`（这一趟的分发器），它扫一遍 `ast.root`：顶层 `Fn` ⇒ 判 entry 四条、设 `cur_self = None`、`check_fn(item_id)`；`Impl { target, items }` ⇒ `resolve_type(target)` 求出 `Struct(sid)`（2b 已经拒过别的），设 `cur_self = Some(sid)`，再对 `items` 里每个 `Fn` 调 `check_fn`；`Struct` / `Const` 跳过。**不遍历 `assoc` 去找"关联的 `Fn`"**：那是 `HashMap`、迭代顺序逐进程变（报错顺序不可复现），而且里面还混着常量；`ast.root` → `Impl.items` 才是那份清单。**必须查全部函数，不是只查可达的**：签名里的错（`fn f(x: Missing) {}`）没人调用它也一样要报。
 
 **entry 四条**（只对顶层那个叫 `main` 的函数判；判据是 `self.text(name.span) == "main"`，**不能**用 `lookup_value("main")`——`const main: i32 = 1;` 会让值命名空间命中 `Const`，误判成"有 main"）：整份没有顶层 `fn main` ⇒ 报错；`has_generic_params` ⇒ 报错；`params` 非空 ⇒ 报错；`resolve_type(ret)` 不是 `Unit` ⇒ 报错（`ret` 缺省就是 `Unit`，所以 `fn main() -> ()` 要放行）。**先走签名，再走身体**（目前只落了"必须有 `main`"这一条）。
 
-**每个函数 `check_fn(&mut self, item_id: ItemId)`**（签名里**没有** `cur_self` 参数——**调用方先设 `self.cur_self` 再调**，因为"这个函数属于哪个 struct"是调用点的知识）：`recv.is_some()` 而 `cur_self` 为空 ⇒ 报错（顶层函数不能有接收者）；解析 `ret` 存进 `item_sig` 与 `cur_ret`；`push_scope()` 装形参（每个形参 `resolve_type` ⇒ `declare_value`，**查重不是遮蔽**：`fn f(x: i32, x: i32) {}` 必须报错）；`check_block(body)`（再压一层）；`pop_scope()`。**接收者不是形参**：`recv` 是 `Option<Receiver>`、不占 `params` 的位置；`check_fn` 在 `push_scope()` 之后按 `recv.is_some()` 把 `self` 声明进作用域（值 `ValueSym::Local(BindingId::Recv(item))`），由此"`self` 指谁"由作用域表回答，`cur_self` 只管 `Self`。
+**每个函数 `check_fn(&mut self, item_id: ItemId)`**（签名里**没有** `cur_self` 参数——**调用方先设 `self.cur_self` 再调**，因为"这个函数属于哪个 struct"是调用点的知识）：`recv.is_some()` 而 `cur_self` 为空 ⇒ 报错（顶层函数不能有接收者）；`cur_ret` 取自 `item_sig`；`push_scope()` 装形参（每个形参 `declare_value`，**查重不是遮蔽**：`fn f(x: i32, x: i32) {}` 必须报错）；`check_block(body)`（再压一层）；`pop_scope()`。**接收者不是形参**：`recv` 是 `Option<Receiver>`、不占 `params` 的位置；`check_fn` 在 `push_scope()` 之后按 `recv.is_some()` 把 `self` 声明进作用域（值 `ValueSym::Local(BindingId::Recv(item))`），由此"`self` 指谁"由作用域表回答，`cur_self` 只管 `Self`。**形参与 `self` 的类型不在 `check_fn` 里算**——它们是 `item_sig` 里的第 `index` 格与 `recv` 格，`Path` 解析到这两种绑定时直接读表。
 
 **要维护的只有一样东西：当前作用域**——就是 `Sema.scopes` 那个栈（§2.2.1），进块压、出块弹；**当前作用域恒为栈顶**（`Sema::cur_scope()`），没有第二处要同步的状态。第 5 步里 `insert_local`（**只给 `let` 用**，遮蔽、不查重）与 `declare_value`（顶层 item / 关联项 / **形参**，撞了就报）不是一回事。`BindingId` 由**出生地**决定（§2.2.1）：`let` 用 `BindingId::Let(stmt_id)`、形参用 `BindingId::Param { item, index }`、接收者用 `BindingId::Recv(item)`——**没有计数器、没有 `new_binding`**。
 
@@ -861,10 +898,26 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 
 **`check_stmt` 只有三个变体**：`Empty` 什么也不做；`Expr { expr, .. }` ⇒ `check_expr`（`semi` 在这条路上用不上）；`Let { binding, ty, init, .. }` ⇒ **先 `check_expr(init)`、再 `resolve_type(ty)`（有标注时）、最后发绑定并插入当前作用域**（顺序是规范钉的：*a local binding is visible only after its initializer*——先走 `init` 再插绑定，`let x = x;` 里的 `x` 就不是正在声明的那个）。`semi` 留给后面的块定型——它是"谁是块尾"的**唯一**依据（§1.3.5）。
 
-**`check_expr` 是定型的主场**（签名 `check_expr(e, expected: Option<TyId>) -> Result<TyId, SemError>`）：① 递归进子表达式（`ast::ExprKind` 25 个变体全覆盖，`Cast` 另加 `resolve_type`、`ArrayRepeat.len` 走常量求值）；② `Path` 做名字解析，`Field` / `Index` / `Deref` / `Method` 查 `TyArena` 拿类型；③ 带块的变体压弹作用域；④ `break` / `continue` 查循环栈、`return` 与函数尾查 `cur_ret`；⑤ 按每个变体自己的规则算出类型，末尾**写一次** `tables.exprs[e]` 并把类型**返回**给父节点——**父节点用返回值、不读表**。`expected` 是上下文往下传的"这里应该是什么类型"（`let x: u8 = 1;` 里的 `u8`），字面量靠它决定自己的类型；块类型用 `check_block` 的返回值传（`ast.blocks` 与 `ast.exprs` 是两个独立 arena）。判据表见 [`spec-mapping.md`](spec-mapping.md) §7「定型规则表」。
+**`check_expr` 是定型的主场**，分**内层与出口**两层，签名都是 `check_expr(e, expected: Option<TyId>) -> Result<TyId, SemError>`。
+
+**内层（`check_expr_inner`）只算"这个表达式自己是什么类型"**：① 递归进子表达式（`ast::ExprKind` 25 个变体全覆盖，`Cast` 另加 `resolve_type`、`ArrayRepeat.len` 走常量求值）；② `Path` 做名字解析，`Field` / `Index` / `Deref` / `Method` 查 `TyArena` 拿类型；③ 带块的变体压弹作用域；④ `break` / `continue` 查循环栈、`return` 与函数尾查 `cur_ret`；⑤ 按每个变体自己的规则算出类型。它**不写表**。
+
+**出口做隐式转换（coercion）**：自己的类型与 `expected` 不同就查 `TyArena::coerce` 的允许清单（`types.md` 的五行 + 内置解引用，§2.2.1）——允许则把**转换后**的类型（就是 `expected`）与转换种类写进 `ExprInfo.coercion`、返回 `expected`；不允许则就地报 `TypeMismatch`。转换后的类型是 `ty_id` 的唯一来源，由 `typed` **写一次** `tables.exprs[e]` 并把类型**返回**给父节点——**父节点用返回值、不读表**，各臂再也不自己写表。
+
+`expected` 是上下文往下传的"这里应该是什么类型"（`let x: u8 = 1;` 里的 `u8`），字面量靠它决定自己的类型；块类型用 `check_block` 的返回值传（`ast.blocks` 与 `ast.exprs` 是两个独立 arena）。判据表见 [`spec-mapping.md`](spec-mapping.md) §7「定型规则表」。
+
+**但"给不给 `expected`"由调用点定，不能一刀切**：规范把转换位点列成一张**封闭清单**（`types.md` §Coercion sites），清单外给了 `expected` 就是假拒。给的有：注解 `let` 的初值、常量初值、赋值右操作数（只有 `=` 那一支——`+=` 的右边是运算符操作数）、实参、`return` 与函数尾、struct 字段初值、下标的 index（`usize`）、`if` / `while` 的条件（`bool`）；**一律给 `None`** 的有：二元 / 一元运算符的操作数、`==` / `!=` 两侧、`as` 的操作数、`&e` / `&mut e` 的内层（期望类型不穿透运算符、不穿过借用；移位两侧甚至可以异型）。`Paren` 内层、块尾、`if` 两分支、`break` 值、`[T; N]` 的元素**只把拿到的 `expected` 往下传**，自己不发明一个。条件位点收的是"必须是 `bool`"这条**类型要求**（`types.md:67`），给 `Some(Bool)` 让它走同一条出口转换 ⇒ `!` 型的条件（`if return {}`）靠 `Never` 的转换自动放行。
+
+**运算符的操作数判据只有三个助手**——九组规则看着有五套，实际只有三个自由度：**每侧剥几层引用**、**剥完两侧要不要相等**、**剥完必须是什么标量**。
+
+- `peel_shared(t)`：`&T` → `T`，非引用原样返回，`&mut T` → `None`。「只允许一层」不在这里管，由后面的标量检查补上——`&&T` 剥完还是 `&T`，本来就不是标量。
+- `scalar_operands(lt, rt, class)`：两侧各 `peel_shared` 一次，各自落在 `class` 认的标量上。`class` 是个 `fn(TyKind) -> bool`，调用点写 `is_int`（算术 / 移位）或 `is_int_or_bool`（位运算）。
+- `orderable(lt, rt)`：**比较类一层都不剥**，直接判「两侧类型相同，或左 `&T` 恰好配右 `&mut T`」，再要求引用链底部是有序标量（**不穿 `Box`**、不穿 struct / 数组）。
+
+`ExprKind::Binary` 的每个臂因此 1–4 行、逐行对应 [`spec-mapping.md`](spec-mapping.md) §7.2 的一张表：算术 = 两侧 `is_int` 且剥完相等、结果取该标量；位 = 同上换 `is_int_or_bool`；移位 = 两侧各自 `is_int`、**允许异型**、结果取左侧；逻辑 = 两侧原样都 `bool`、结果 `bool`；序比较 = `orderable`、结果 `bool`；相等 = 两侧 `TyId` 相同、结果 `bool`。一元 `-` / `!` 走同一个 `peel_shared`（`-` 另加有符号检查）。两个操作数**先都算完类型再判**，结果各自给（算术 / 位 / 移位给标量，比较给 `bool`）。
 
 
-**循环栈**：`break` / `continue` 要一个 `Vec<LoopInfo>`，每层记三样：`kind`（`loop` 还是 `while`——判「`break` 值只在 `loop` 里合法」要看栈顶）、`expected`（`loop` 自己的类型当期望类型下传给 break 值）、`break_tys`（这一层已见的 break 值类型；收齐后算 `loop` 的类型，一个都没有就是 `!`）。进循环压、出循环弹。⚠ **`while` 的条件在压这一层之前走，且走条件前把外层整摞暂时取走**（`mem::take`，走完放回）——`loop-expr.md:21` 要求条件里的跳转 "must target a loop nested inside that condition"，指向该 `while` 自己或任何外层循环都是错。跳转的判据因此只有一条：**栈空即非法**（`InvalidJumpTarget`）。⚠ 这张栈只回答"合不合法"；lowering 的 `LowerCtx.loops` 那张表回答"跳到哪个块"（那张表的元素类型叫 `LoopCtx`，见 [`arch-phase2.md`](arch-phase2.md) §2.3.1），**两张不是一回事，名字也故意分开**。
+**循环栈**：`break` / `continue` 要一个 `Vec<LoopInfo>`，每层记三样：`kind`（`loop` 还是 `while`——判「`break` 值只在 `loop` 里合法」要看栈顶）、`expected`（`loop` 自己的类型当期望类型下传给 break 值）、`break_tys`（这一层已见的 break 值类型；收齐后算 `loop` 的类型，一个都没有就是 `!`）。进循环压、出循环弹。**两种循环的体都必须与 `()` 相容**（`loop { 1 }` / `while false { 1 }` 都是编译错误，发散体靠 `!` 的转换放行）⇒ 体按 `Some(Unit)` 定型。⚠ **`while` 的条件在压这一层之前走，且走条件前把外层整摞暂时取走**（`mem::take`，走完放回）——`loop-expr.md:21` 要求条件里的跳转 "must target a loop nested inside that condition"，指向该 `while` 自己或任何外层循环都是错。跳转的判据因此只有一条：**栈空即非法**（`InvalidJumpTarget`）。⚠ 这张栈只回答"合不合法"；lowering 的 `LowerCtx.loops` 那张表回答"跳到哪个块"（那张表的元素类型叫 `LoopCtx`，见 [`arch-phase2.md`](arch-phase2.md) §2.3.1），**两张不是一回事，名字也故意分开**。
 
 **`resolve_type` 把语法类型换成 `TyId`，五种语法形态各一条**（`ast::TypeKind` 正好五个变体）：`Paren(t)` 递归进去（`Box<(i32)>` 走的就是这里）；`Path(p)` 交给 `resolve_type_path`；`Unit` 直接 `TyKind::Unit`；`Ref { mutable, inner }` 递归后包一层；`Array { elem, len }` **先递归 `elem`、再 `array_len(len)` 求出数、最后一起 intern**——**数的存在必须先于那次 `intern`**（理由见前文 2c）。
 
@@ -906,7 +959,7 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 |---|---|
 | **name** | 名字查不到、用错命名空间（`fn` 与 `const` 撞车，`struct` 与 `fn` 不撞）、重复定义 |
 | **type** | 类型不匹配、隐式转换不成立（引用 coercion 远没有 Rust 多）、`as` 的合法组合之外、数组长度不是 `usize` 常量 |
-| **mutability** | 写一个不可变的 place；**透过 `Vec` 下标写时，路径上任何一层共享/不可变就不行** |
+| **mutability** | `cat` 不是 `Place(Mutable)` 却要写它（赋值 / `&mut` / `&mut self` 接收者）；`Vec` 下标那一步隐含借用向量，那一刻不是 `Mutable` ⇒ 元素降成 `Shared`、里面存再多 `&mut` 也拿不回可变访问（判据与两张例表见 §2.2.1） |
 | **capability** | derive 的**互相牵连 + 逐字段**检查：`Copy` 必须同时请求 `Clone`、`Eq` 必须同时请求 `PartialEq`、`Box` 字段挡 `Copy`、`&mut` 字段挡 `Clone` |
 | **constant** | 常量初始化式类型不符、常量环（直接 / 间接 / 关联三种都要检出）、负号加在无符号常量上 |
 | **layout** | 布局环（`struct A { a: A }`）；**只有 `Box`/`Vec` 能破环**，内联数组不破环 |
@@ -953,7 +1006,7 @@ struct LoopCtx {
 | `break` / `continue` / `return` | 一条终结指令 **+ 开一个不可达的新块**继续降后面的语句（新块的终结指令留着 `Unreachable` 占位不动，§2.2.2）。**不可达代码照样要降**——语义阶段照样检查它 |
 | `println_i32` 等内建 | 一条 `declare` + 一条 `Call`（包装体见 §2.3.5） |
 
-**整套 lowering 的枢纽只有两个函数**（place/value 二象性，直接消费 §1.2.3 的 `Category`）：`lower_place(e) -> ValueId` 返回**一个 `ptr`、绝不 load**，`lower_value(e)` = 前者且标量时补一条 `load`；`tables.exprs[e].cat` 决定哪一个是合法的、`tables.exprs[e].ty_id` 决定要不要补 `load`，**lowering 绝不自己重新判断"这是不是 place"**（那是 sema 的活）。`Category::Place` 降出来的是**一个 `ptr`**、不是那个 place 的类型的值 ⇒ `&x` 就是 `lower_place(x)`、`*r` 也走 `lower_place`（引用运行期就是一个 `ptr`）、`&mut T → &T` 同样**零指令**（§2.2.2 没有 `Bitcast`）。
+**整套 lowering 的枢纽只有两个函数**（place/value 二象性，直接消费 §1.2.3 的 `Category`）：`lower_place(e) -> ValueId` 返回**一个 `ptr`、绝不 load**，`lower_value(e)` = 前者且标量时补一条 `load`；`tables.exprs[e].cat` 决定哪一个是合法的、`tables.exprs[e].ty_id` 决定要不要补 `load`，**lowering 绝不自己重新判断"这是不是 place"**（那是 sema 的活）。`Category::Place(_)` 降出来的是**一个 `ptr`**、不是那个 place 的类型的值 ⇒ `&x` 就是 `lower_place(x)`、`*r` 也走 `lower_place`（引用运行期就是一个 `ptr`）、`&mut T → &T` 同样**零指令**（§2.2.2 没有 `Bitcast`）。**`PlaceMut` 那个载荷 lowering 不看**——它只分 `Place` / `Value` 两支；三态是 sema 用来拒负例的，写进表里只是为了"一行结论"这条约定（§1.2.3）。
 
 **聚合类型只住在内存里，`Value.ty` 恒为标量**：标量（四个整数 / `bool` / `&T` / `&mut T` / **`Box<T>`**）是一个 SSA 值、mem2reg 能提升；聚合（struct / `[T;N]` / **`Vec<T>`**）**或任何被取过地址的**住一个栈槽，访问一律"地址 + `GEP` + 标量 load/store"、mem2reg 不动它。⇒ mem2reg 永远不会插一个 struct 的 φ，寄存器分配永远不见多字宽的值，后端只需要**一套**"搬字节"的概念；整块聚合的搬家是一条 `Memcpy`。**`Vec<T>` 是 `%Vec = type { ptr, i32, i32 }`**（数据指针 / 长度 / 容量，12 字节 align 4）：**长度必须存**（`len()` 可观测），容量自由（`heap.md`：*Capacity and growth are unobservable implementation choices*）；它**永远不会被提升**（每个方法都收 `&self`/`&mut self`，地址必然被取）。
 
