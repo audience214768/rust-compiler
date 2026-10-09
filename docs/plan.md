@@ -30,23 +30,15 @@
 
 ## 0. 现在做这一步
 
-**当前步：M3 能力与 derive**——M1.6 与 M2 都已结账（`blocks-if-and-never`、`vec-index-mutability` 两组清零）。剩的 **17 条全部属于 M3**，见下表与 §0.3。
+**当前步：语义阶段已收口**——M1–M4 结账：`semantic` 236 条全绿，§0.4 那份"不改变测试结果"的欠账（P1-10 / P2-1 / P2-8 / P2-9）也逐条收干净，`mod.rs` 头部的 `#![allow(...)]` 已删。**下一步是 §1.4 的 W5–W8（IR 阶段）**：内存里的 IR + `.ll` 打印器。
 
 | 门 | 现在 |
 |---|---|
-| `cargo test` | 36 |
-| `make sema-acc` | **64/69** |
-| `make sema-test` | **219/236**（64 正 + 155 负） |
-
-§0.4 的落地顺序走到第 3 步。已收的：出口转换、M1.4 运算符九组、P1-6 复合赋值、**整个 M1.6**、**整个 M2**（含 §0.2 的 M2.1）。
-
-**红的 17 条全部属于 M3**，按 §0.3 的两个子步分：
-
-| 子步 | 正例 | 负例 | 组 |
-|---|---|---|---|
-| M3.1 能力需求侧 | — | 6 | `copy-clone-and-equality` ×3、`trait-dispatch-and-reference-equality` ×2、`arrays` ×1 |
-| M3.2 derive 声明侧 | — | 6 | `copy-clone-and-equality` ×5、`recursive-traits` ×1 |
-| derive 生成的 `clone` 没接（P2-4，两子步都要） | 5 | — | `copy-clone-and-equality` ×2、`recursive-traits` ×1、`comprehensive-owned-tree` ×1、`trait-dispatch-and-reference-equality` ×1 |
+| `cargo test` | 41 |
+| `make lex-test` | **53/53** |
+| `make parse-test` | **442/442** |
+| `make sema-acc` | **69/69** |
+| `make sema-test` | **236/236**（69 正 + 167 负） |
 
 ⚠ **量数前先 `cargo build`**：`make sema-acc` / `make sema-test` 跑的是 `target/debug/my-compiler`，Makefile 里没有 `cargo build` 依赖。
 
@@ -69,7 +61,7 @@
 
 **两个新工具，先写好并用单测钉住**（都只吃 `TyId` 吐 `TyId`、不碰 AST，所以能脱离整棵树单独测；实际挂在 `TyArena` 上——要看类型的**结构**，即 `self.kinds`，见 arch-phase2.md #33）：
 - `coerce(from, to) -> Option<Coercion>`：`types.md` 允许清单五行 + 内置解引用三步（`&U→U`、`&mut U→U`、`Box<U>→U`，可重复）；**不做** `Vec` 解引用、**不隐式借** `Box`。**已落**（连 `derefs_to` 帮手，两个单测）。
-- `lub(&[TyId]) -> Option<TyId>`：`types.md` 三步算法（`!` 忽略；换目标要求"之前所有结果也能调过去"；不找第三个类型；全 `!` ⇒ `!`）。**step 1 已对、"全 `!` ⇒ `!`" 已落；换目标那一支还差两处判据 + 一处回填，见 §0.4 的 P1-10**。⚠ 换目标那支的死循环不返回 `None`，所以现在 `None` 只表示"输入为空"——`If` 臂里那句"两边都是 `!`"的特判因此成了冗余（`lub` 已经会吐 `Some(Never)`），收 P1-10 时一起删。
+- `lub(&[TyId]) -> Option<(TyId, Vec<Option<Coercion>>)>`：`types.md` 三步算法（`!` 忽略；换目标要求"之前所有结果也能调过去"；不找第三个类型；全 `!` ⇒ `!`）。**已落**：返回值带上"每个非 `Never`、非目标的输入要做的调整"，`Array` / `If` / `Loop` 三个臂据此回填那些表达式已写下的 `ty_id` / `coercion`；`None` 现在只表示"输入为空"（单测钉着规范表上的几种情形）。
 
 **三条通信纪律**（整个 M1 通用）：
 1. **单点写表**：结论只在 `check_expr` 的**出口**写一次（`typed` 写 `ty_id`，出口顺带写 `coercion`）；各臂只算类型、**返回**给父节点——父节点用返回值，**不读表**。`None` 只为"还没写"存在（`sized_like` 的预填值：裸 `TyId` 没有诚实的预填值，拿真类型预填会把"忘写"伪装成它）；`()` 就是普通的 `Some(unit_ty)`（`TyKind::Unit` 已存在、`intern` 去重，`Never` 同理），**不是 `None`**。
@@ -78,13 +70,13 @@
 
 | 步 | 做什么 | 还差的负例 | 经手 |
 |---|---|---|---|
-| **M1.1 机制与两个纯函数** | ① `check_expr` / `check_block` 改成返回类型 + 单点写表；② 块 / 语句规则：块值 = 最后一条 `semi:false` 的表达式语句，末尾带 `;` ⇒ 丢值，非末尾无 `;` ⇒ 必须 `()` 或 `!`，全路径早退（`return` / `break` / `continue`）⇒ `!`；③ `cur_ret` + `return` / 函数尾按声明返回类型检查；④ `LoopInfo` 骨架（取代 `Vec<LoopKind>`；lowering 侧那张 `LoopCtx` 是另一回事）；⑤ `coerce` / `lub` 两个纯函数 + 单测；⑥ 崩溃四点 | ——（机制步，本身不清负例；正例开始回升） | **全部已落**——②③ 随 M1.6 一起收口；`lub` 只剩 P1-10 那一支 |
-| **M1.2 名字、字面量、签名** | `item_sig`（含 recv）、`Tables.let_tys`、`BindingId → TyId` 访问器；`Path` 出类型（`Local` / `Fn` / `Const` / `Builtin` 四种）；`Lit` 改用 `eval_int_literal(…, expected)`；**ctor 成员落成真值**（`resolve_value_path` 的 ctor 分支按尾名 `new` / `clone` / `len` / `push` 查表，未命中收紧成报错）——**查的那张表就是 `Builtin::sig()`，已落，只剩分支接线**；**let 位点检查**（声明类型 vs 初值，带 expected）；`main` 签名三查（值参数 / 泛型参数 / 非 unit 返回；**显式 `-> ()` 必须接受**）；顺手把 `ArrayRepeat` 改用 `array_len`（一行） | ——（这一批负例已清） | **已落**：ctor 分支接线、`main` 签名三查、`ArrayRepeat` 改 `array_len`、`item_sig` 预扫（`check_fn_sigs`：每个函数连 `recv` 一起解析落表，`Path` 的 `Param` / `Recv` 与调用点都读它）、let 位点的 expected（随出口转换）。**剩 `Tables.let_tys`，你写** |
-| **M1.3 调用与成员** | `Call` 全量：`Fn` → 签名（实参逐个按 expected 查）→ 返回类型，**arity 要算上接收者**（`recv` 是单独字段不在 `params` 里 ⇒ 应到实参数 = `params.len() + recv.is_some() as usize`）；`Builtin` → **`Builtin::sig()`**；`Local` / `Const` 当被调一律 `NotCallable`（函数当值是 UB ⇒ 局部量永远装不了函数，**不用查它的类型**）；错误分清 `NotCallable` / `ArgCountMismatch` / `TypeMismatch`。**方法查找并进这步**：接收者候选链（解引用引用与 `Box`，每个候选试 `T` / `&T` / `&mut T`），命中即定型（含内置成员 `push` / `len` / `remove` / `clone`、derive 成员、用户 `impl` 方法）；无候选 ⇒ `NoSuchMethod`；`&mut self` 要可变 place——**可变性判据在 M2**，这里先把"解析到谁"记对；**点号只找方法、双冒号只找关联函数**（三条假绿正因此）。算法见 [`spec-mapping.md`](spec-mapping.md) §7.6 | ——（这一批负例已清） | **已落**：`Call` 两支 + arity 补接收者 + 内建表 + 候选链（**简化版：无 autoref / 无接收者可变性 / 只认 struct 与内建表**）。**剩候选链的引用层排序与 autoref，你写** |
+| **M1.1 机制与两个纯函数** | ① `check_expr` / `check_block` 改成返回类型 + 单点写表；② 块 / 语句规则：块值 = 最后一条 `semi:false` 的表达式语句，末尾带 `;` ⇒ 丢值，非末尾无 `;` ⇒ 必须 `()` 或 `!`，全路径早退（`return` / `break` / `continue`）⇒ `!`；③ `cur_ret` + `return` / 函数尾按声明返回类型检查；④ `LoopInfo` 骨架（取代 `Vec<LoopKind>`；lowering 侧那张 `LoopCtx` 是另一回事）；⑤ `coerce` / `lub` 两个纯函数 + 单测；⑥ 崩溃四点 | ——（机制步，本身不清负例；正例开始回升） | **全部已落**——②③ 随 M1.6 一起收口 |
+| **M1.2 名字、字面量、签名** | `item_sig`（含 recv）、`Tables.let_tys`、`BindingId → TyId` 访问器；`Path` 出类型（`Local` / `Fn` / `Const` / `Builtin` 四种）；`Lit` 改用 `eval_int_literal(…, expected)`；**ctor 成员落成真值**（`resolve_value_path` 的 ctor 分支按尾名 `new` / `clone` / `len` / `push` 查表，未命中收紧成报错）——**查的那张表就是 `Builtin::sig()`，已落，只剩分支接线**；**let 位点检查**（声明类型 vs 初值，带 expected）；`main` 签名三查（值参数 / 泛型参数 / 非 unit 返回；**显式 `-> ()` 必须接受**）；顺手把 `ArrayRepeat` 改用 `array_len`（一行） | ——（这一批负例已清） | **已落**：ctor 分支接线、`main` 签名三查、`ArrayRepeat` 改 `array_len`、`item_sig` 预扫（`check_fn_sigs`：每个函数连 `recv` 一起解析落表，`Path` 的 `Param` / `Recv` 与调用点都读它）、let 位点的 expected（随出口转换）、`Tables.let_tys`（`Let` 语句臂写下、`BindingId::Let` 读它，不再从初值反推） |
+| **M1.3 调用与成员** | `Call` 全量：`Fn` → 签名（实参逐个按 expected 查）→ 返回类型，**arity 要算上接收者**（`recv` 是单独字段不在 `params` 里 ⇒ 应到实参数 = `params.len() + recv.is_some() as usize`）；`Builtin` → **`Builtin::sig()`**；`Local` / `Const` 当被调一律 `NotCallable`（函数当值是 UB ⇒ 局部量永远装不了函数，**不用查它的类型**）；错误分清 `NotCallable` / `ArgCountMismatch` / `TypeMismatch`。**方法查找并进这步**：接收者候选链（解引用引用与 `Box`，每个候选试 `T` / `&T` / `&mut T`），命中即定型（含内置成员 `push` / `len` / `remove` / `clone`、derive 成员、用户 `impl` 方法）；无候选 ⇒ `NoSuchMethod`；`&mut self` 要可变 place——**可变性判据在 M2**，这里先把"解析到谁"记对；**点号只找方法、双冒号只找关联函数**（三条假绿正因此）。算法见 [`spec-mapping.md`](spec-mapping.md) §7.6 | ——（这一批负例已清） | **已落**：`Call` 两支 + arity 补接收者 + 内建表 + 候选链（**严格按位：候选 `C` 命中 ⟺ 声明接收者类型恰是 `C`**；`&mut` 候选带可变性检查；autoref 形态记进接收者的 `coercion`） |
 | **M1.4 运算符九组** | 九组规则按 `operator-expr.md`（表见 [`spec-mapping.md`](spec-mapping.md) §7.2）：算术 / 位 / 移位 → 左侧整数；比较 / 逻辑 → `bool`；`as` → 目标类型（**不给操作数期望类型**）；赋值与复合赋值 → `()`。三个例外照抄语料：移位两侧**可以不同型**、算术允许**一层 `&`**、序关系的 `&` / `&mut` **方向敏感**。错误分 `OperandTypeMismatch` / `InvalidOperatorOperand` / `ConditionNotBool` / `InvalidCast` | `scalar-reference-operators` 4、`boolean-and-short-circuit` 4、`integer-arithmetic` 3、`shifts` 2 = **13** | **已落**：三个助手（`peel_shared` / `scalar_operands` / `orderable`）撑起六组各 1–4 行，一元 `-` / `!` 走同一个助手，`if` / `while` 条件改传 `Some(Bool)`（顺带清掉 `rej-no-integer-truthiness`）。**复合赋值的类型规则**（§0.4 的 P1-6）随后补上：算术 / 位运算组按 `scalar_operands` 查两侧同型，移位组**不查**（两侧本就允许不同型）⇒ `compound-assignment` 组 5/5。**这一列清空** |
-| **M1.5 聚合与引用** | struct 字面量（字段齐 / 重 / 未知 / 类型，expected 传到字段值）、`Field`（查 `StructDef.fields` + 引用 / `Box` 的解引用链，**不走类型命名空间**）、`Index`（下标 expected `usize`；数组 / `Vec` / 引用 / `Box` 的解引用链）、数组与 `[elem; len]`（元素按 expected `T`，长度必须 = `N`）、`Ref` / `Deref` 出类型 + 引用位点的 coercion。**顺手把这几个臂的 `cat` 填了**（path / field / index / deref / paren 的 place 身份） | ——（这一批负例已清；`arrays` 剩的 2 条分属 M2 与 M3.1） | **已落**：`Array`（含 expected + 长度）、`ArrayRepeat`、`Field` / `Index` / `Deref` / `Paren` 的解引用链与 `cat`、`Cast` 合法性、struct 字面量的未知 / 缺 / 重字段与字段初值 expected。**这一列清空，无需你补** |
-| **M1.6 控制流与 never** | `If`（无 else ⇒ 分支必须 `()`；有 else ⇒ 两分支走 `coerce` / `lub`，**不留 `None`**）；`Loop`（break 收集 + 无 break ⇒ `!`）；`While` 恒 `()` 且体与 `()` 相容（发散也行）；`return` / `break` / `continue` 自身记 `!`；`break` 不可达也参与；跳转目标合法性（循环外的 break / continue、`while` 条件里的跳转不能指向该 `while` 或外层）。**五处穿透**（括号 / 块尾 / `if` 两分支 / `break` 值 / 数组元素）在这一步全部打通 | `blocks-if-and-never` **0**（清零） | **已落，这一列清空**。① `Return` / `Break` / `Continue` 自身产出 `!`，裸 `return;` 按 `cur_ret == Unit` 判；② `check_stmt` 带分号时**只丢值不丢 `!`**，`check_block` 非尾语句既查早退又查"与 `()` 相容"，尾语句的 `!` 也当早退；`check_fn` 的守卫这才真正生效；③ `Loop` 收 `break_tys`（裸 `break;` 供 `()`），无 break ⇒ `!`、有 break ⇒ `expected` 或 `lub(break_tys)`，体必须与 `()` 相容；④ 无 `else` 的 `if` 自身是 `()`（不是 `then_ty`）。⚠ `lub` 换目标那一支的死代码还在（P1-10），但它现在**不影响任何测试** |
-| **M1.7 收口** | 删掉 `mod.rs` 头部的 `#![allow(dead_code, unused_variables)]`、把 §0.4 的缺陷逐条收回、三个数记档 | **硬门：`make sema-acc` 回到 69/69，负例只许涨不许跌** | 你写 |
+| **M1.5 聚合与引用** | struct 字面量（字段齐 / 重 / 未知 / 类型，expected 传到字段值）、`Field`（查 `StructDef.fields` + 引用 / `Box` 的解引用链，**不走类型命名空间**）、`Index`（下标 expected `usize`；数组 / `Vec` / 引用 / `Box` 的解引用链）、数组与 `[elem; len]`（元素按 expected `T`，长度必须 = `N`）、`Ref` / `Deref` 出类型 + 引用位点的 coercion。**顺手把这几个臂的 `cat` 填了**（path / field / index / deref / paren 的 place 身份） | ——（这一批负例已清；`arrays` 剩的 2 条后归 M2 与 M3.1，均已落） | **已落**：`Array`（含 expected + 长度）、`ArrayRepeat`、`Field` / `Index` / `Deref` / `Paren` 的解引用链与 `cat`、`Cast` 合法性、struct 字面量的未知 / 缺 / 重字段与字段初值 expected。**这一列清空，无需你补** |
+| **M1.6 控制流与 never** | `If`（无 else ⇒ 分支必须 `()`；有 else ⇒ 两分支走 `coerce` / `lub`，**不留 `None`**）；`Loop`（break 收集 + 无 break ⇒ `!`）；`While` 恒 `()` 且体与 `()` 相容（发散也行）；`return` / `break` / `continue` 自身记 `!`；`break` 不可达也参与；跳转目标合法性（循环外的 break / continue、`while` 条件里的跳转不能指向该 `while` 或外层）。**五处穿透**（括号 / 块尾 / `if` 两分支 / `break` 值 / 数组元素）在这一步全部打通 | `blocks-if-and-never` **0**（清零） | **已落，这一列清空**。① `Return` / `Break` / `Continue` 自身产出 `!`，裸 `return;` 按 `cur_ret == Unit` 判；② `check_stmt` 带分号时**只丢值不丢 `!`**，`check_block` 非尾语句既查早退又查"与 `()` 相容"，尾语句的 `!` 也当早退；`check_fn` 的守卫这才真正生效；③ `Loop` 收 `break_tys`（裸 `break;` 供 `()`），无 break ⇒ `!`、有 break ⇒ `expected` 或 `lub(break_tys)`，体必须与 `()` 相容；④ 无 `else` 的 `if` 自身是 `()`（不是 `then_ty`）；⑤ `If` / `Loop` / `Array` 三个臂按 `lub` 回传的调整回填子表达式（`&mut T → &T` 这类） |
+| **M1.7 收口** | 删掉 `mod.rs` 头部的 `#![allow(dead_code, unused_variables)]`、把 §0.4 的缺陷逐条收回、三个数记档 | **硬门：`make sema-acc` 回到 69/69，负例只许涨不许跌** | **已落**：`#![allow]` 删掉、17 条 sema 侧告警清零（含两处死代码：`LoopKind`、`StructDef.name`）、两个错误变体接上（`ConditionNotBool` / `NotAPlace`），只剩 `src/frontend/ast.rs` 那 7 条老告警 |
 
 **怎么验**：每个子步先跑三个命令记下当前数（`cargo test` · `make sema-acc` · `make sema-test`），做完再跑一次回填——**正例下降一律当回归处理**；负例下降先看是不是预期内的。
 
@@ -96,23 +88,19 @@
 |---|---|---|---|
 | **M2.1 沿途可变性** | "写一个 place 要沿途每层都可写"：`NotAPlace` / `NotMutablePlace`；`Vec` 下标的隐式可变借用（含**可变再借用**：`let r: &mut i32 = values[0];` 也要求向量在那一步可变）；不可达代码里的 place 可变性按 UB **不管**。⚠ **临时值可以可变**（`Vec::<i32>::new().push(5)` 合法），别一刀切成报错 | **0**（`vec-index-mutability` 22/22） | **已落**：`PlaceMut` 三态随 `Category` 传染（基座：`Value` 物化成 `Mutable`，`Place(m)` 原样；一层 `&mut` ⇒ `Mutable`、`&` ⇒ `Shared`、`Box` ⇒ 不变）；`FnSig` 收 `ParamSig{ty, binding_mut}`，`recv` 上两个 `mut` 分开；`derefs` 吃基座态、`step` 推一层；`Vec` 下标插容器借用、数组与 `Box` 不插；块产出值、`if` 两分支都吃外层期望；可变再借用按 `heap.md` §Indexing and mutable access 查在 `check_expr` 出口 |
 
-### 0.3 M3 能力与 derive；M4 收紧欠账
-
-**为什么能力放最后**：能力（`Copy` / `Clone` / `PartialEq`）是"**类型定完之后再查资格**"——`==` 的两个操作数先各自定型，再问"这个类型够不够格比"，所以能干净地切在 M1 后面。
+### 0.3 M4 收紧欠账
 
 | 步 | 做什么 | 还差的负例 | 经手 |
 |---|---|---|---|
-| **M3.1 能力需求侧** | `Copy` / `Clone` / `PartialEq` 的需求检查：`==` 要求两侧同源且实现 `PartialEq`、`[e; N>1]` 要求 `Copy`、`Box` 挡 `Copy`、空容器 `clone` 也要元素 `Clone`…… | `copy-clone-and-equality` 3、`trait-dispatch-and-reference-equality` 2、`arrays` 1 = **6** | 你写 |
-| **M3.2 derive 声明侧** | derive 声明侧四查（重复 derive、`Eq` 要求 `PartialEq`、字段能力不满足、递归 `Vec` 字段不能 `Copy`……） | `copy-clone-and-equality` 5、`recursive-traits` 1 = **6** | 你写 |
-| **M4.1 收紧欠账** | `assoc` 未命中从"静默放过"改成报错；`SelfValue` 分支去掉 `cur_self` 旧门；把 M1–M3 剩下的"临时放过"逐条收干净 | 见 §0.4 缺陷清单 | 你写 |
+| **M4.1 收紧欠账** | **P2-8**（autoref 形态记进 `ExprInfo.coercion`）、**P2-9**（点号候选位按接收者形态筛）；另见 M1.7 收口：删 `mod.rs` 头部那行 `#![allow(...)]` | 见 §0.4 | **已落**：`Coercion` 加 `AutoRef` / `AutoRefMut`、`candidate_method(cand, name)` 按"声明接收者类型恰是候选位"筛、`&mut` 候选带可变性检查（自动借要求 place `Mutable`；接收者自己是 `&mut` 时透过它再借一次） |
 
 **分界一句话**：**M1 = 每个表达式是什么**（类型 + 是不是 place）；**M2 = 能不能写它**；**M3 = 这个类型够不够格**；**M4 = 收掉所有临时放过的口子**。
 
 **刻意不做**：不写借用检查器 / 所有权分析（`semantic/README.md` 明文）。
 
-### 0.4 M1 的设计结论与缺陷清单
+### 0.4 M1 的设计结论
 
-> **算法与规则本体**在 [`spec-mapping.md`](spec-mapping.md) §7（M1 施工图）——方法查找候选链、内建成员完整清单、期望类型位点、LUB 三步；**决策理由**在 [`arch-phase2.md`](arch-phase2.md) 决策 #35–#40；本节只留**做什么、按什么顺序做、现在哪几处是坏的**。
+> **算法与规则本体**在 [`spec-mapping.md`](spec-mapping.md) §7（M1 施工图）——方法查找候选链、内建成员完整清单、期望类型位点、LUB 三步；**决策理由**在 [`arch-phase2.md`](arch-phase2.md) 决策 #35–#40。
 
 **三条结论（一句话）**
 
@@ -124,29 +112,13 @@
 
 **UB 一律从简，不写识别代码**：UB 程序不在任何测试里，**报错和放行都行**，所以不为它写任何专门判断——顺着最自然的路径走，它落到哪就是哪（`Box::new(5)` 省 turbofish → ctor 分支没实参 ⇒ 报错；`let f = helper;` → 没有函数类型 ⇒ 当普通值）。唯一要守住的：**这些 UB 不能顺手把必须报的错一起放过**。
 
-**还没修的缺陷**（行号会随编辑漂移，认符号名；已修的条目直接删，不留"已完成"）
-
-| # | 缺陷 | 位置（`src/sema/mod.rs`） | 归属 |
-|---|---|---|---|
-| P1-10 | `lub` 的**方向是对的**（先试 `coerce(U, T)`，不成立才换 `U`，对应 `types.md:158` step 1），坏的是换 `U` 那一支：① `for j in 0..i` 里比的是 `coerce(tys[i], new_ty_id)`，而 `tys[i]` **就是** `new_ty_id` ⇒ `coerce` 在 `from == to` 处直接返回 `Identity`（`coerce` 首行）⇒ **循环恒真、`return None` 是死代码**（应为 `tys[j]`）；② 规范 step 2 还要求 `T` 也能调到 `U`，没查；③ 规范同一句的 *"and adjust those results too"* 没做——换成 `U` 之后**更早**那些表达式已写进表的 `ty_id` / `coercion` 要回填，而 `Array` 臂收完 `tys` 就直接 `intern`（`if` 臂同理）。**①② 只在规范判 UB（step 3）的程序上改变行为**，按"UB 从简"可以不查——那就把死循环删掉（别留着让人以为查了）；**③ 是真缺**（`&mut T → &T` 是零指令所以 codegen 今天看不出来，但表里 element 0 仍是 `&mut i32`、数组元素类型已是 `&i32`）。"全 `!` ⇒ `!`" 这一半已落。⚠ 因为它不再返回 `None`，`If` 臂里那句"两边都是 `!`"的特判已经多余，一并删 | `lub` / `Array` 臂 / `If` 臂 | M1.7 |
-| P2-1 | `Tables.let_tys` 还不存在，`BindingId::Let` 的类型靠 `init.ty_id.unwrap()` 现取。出口转换落地后初值已被调成注解类型，**暂时等价**；但这是"结论从初值反推"而不是"结论记在 let 上"，初值是 `!` 之类取不到型的表达式时就会错 | `BindingId::Let` 读处 | M1.2 |
-| P2-4 | derive 生成的 `clone` 没接：struct 的 `.clone()`、`Outer::clone` 路径形态、**共享引用自身的 `clone`**（`&T` 是 `Clone`，克隆的是引用不是目标）都还没有。**5 条正例**（`copy-clone-and-equality` 2、`recursive-traits` 1、`comprehensive-owned-tree` 1、`trait-dispatch-and-reference-equality` 1） | 内建表 / `resolve_value_path` | M3 |
-| P2-6 | `Cast` 合法性、`.clone()` 的 `T: Clone` 之类的**能力要求**一律还没有（struct 字面量的四种字段检查已收） | `Cast` 臂 / M3 | M3 |
-| P2-8 | 方法调用点的 **autoref 形态没记**：`ExprInfo.coercion` 里没有"自动借了 `&` / `&mut`"这一档，`Coercion` 枚举也没有对应变体。接收者的可变性**已经查了**（查的是循环里那一层的 `state`），只是没记下来——lowering 要区分 `&self` / `self` 时才有用 | `Method` 臂 | M4 |
-
-**接下来按这个顺序**（每步跑三个门看数）
-
-1. ~~**M1.6**~~：**已结账**（`blocks-if-and-never` 清零，正例 62 → **64**、负例 148 → **153**）。
-2. ~~**M2 收尾**~~：**已结账**（P2-7 落地，`vec-index-mutability` 22/22，负例 153 → **155**，正例没退）。
-3. **M3 能力 / derive**：12 条负例 + P2-4 那 5 条 `clone` 正例 ⇒ 正例 69/69。之后只剩 M1.7 收口与 P1-10 / P2-1 / P2-8 这些欠账。
-
 ---
 
 ## 1. 阶段任务安排
 
 ### 1.1 里程碑
 
-假设第 1 周为 9/14–9/20。**今天 2026-10-05，第 4 周周一**；下一站是 **W4（10/11）的 AST 验收**。
+假设第 1 周为 9/14–9/20。**今天 2026-10-09，第 4 周周五**；下一站是 **W4（10/11，本周日）的 AST 验收**。
 
 | 周 | 截止（周日 23:59） | 交付 | **要清的测试点**（判分 oracle） | 权重 |
 |---|---|---|---|---|
@@ -169,16 +141,26 @@
 
 ### 1.3 W1–W4 · AST 阶段（ddl 10/11）
 
-前端已就位，`lexer` 53/53 + `parser` 442/442 达标，**W4 当天只需现场复现**（方案与坑见 [`arch.md`](arch.md) §1、[`arch-phase1.md`](arch-phase1.md)）。W4 前只剩：
+前端已就位，`lexer` 53/53 + `parser` 442/442 + `semantic` 236/236 全达标，**W4 当天只需现场复现**（方案与坑见 [`arch.md`](arch.md) §1、[`arch-phase1.md`](arch-phase1.md)）。现场按这个顺序跑（**先 `cargo build`**——Makefile 不替你 build，跑的是 `target/debug/my-compiler`）：
 
-- [ ] **符号表 / 作用域 / 类型检查**（W4–W8 主战场，见 §0）
+```
+cargo build && cargo test        # 41 个单元测试
+make lex-test                    # 53/53
+make parse-test                  # 442/442
+make sema-acc                    # 69/69，只跑正例
+make sema-test                   # 236/236，正例 + 负例
+```
+
+判分口径：**退出码 0 = 接受、1 = 拒绝，信号 / panic(101) / 超时两种极性都算失败**（[`scripts/stage_test.py`](../scripts/stage_test.py)）；负例只要求"正常拒绝"，不看诊断措辞。逐例日志在 `target/tests/<stage>/`，`VERBOSE=true` 打详情，`ARGS=--group=…` / `--entry=…` 缩范围。
+
+W4 前只剩：
+
 - [ ] AST 打印/导出，作为验收与自查手段
 - [ ] 验收材料 + Code Review 自查（§4.2）。⚠「验收材料要交什么」至今没人定义过（§3.1）
 
 ### 1.4 W5–W8 · IR 阶段（ddl 11/8）
 
 - [ ] 在内存里建 LLVM 形状的 IR + `.ll` 文本打印器（形态见 [`arch.md`](arch.md) §2）。**clang 验证闭环已通**（`make ll-run`），剩下的只是**让 printer 产出 `.ll`**（`--emit-ll`，形状见 [`arch.md`](arch.md) §2.3.5）
-- [ ] **语义分析收尾**（符号表 / 类型检查 / coercion / 方法查找 / 常量求值）：`semantic` 的 **167 个负例**全在这一关，逐条对照 [`spec-mapping.md`](spec-mapping.md) §6 的检查项——**分解见 §0**
 - [ ] AST → IR lowering：局部变量、控制流、函数调用、数组、struct 布局、`Box`/`Vec` 内建、引用与解引用
 - [ ] **mem2reg**（alloca → SSA + phi）：低代码量、收益极高，且是后续优化的前置
 - [ ] 验收材料

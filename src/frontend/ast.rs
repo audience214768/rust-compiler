@@ -88,7 +88,7 @@ pub struct FieldDef {
 }
 
 /// `DeriveName -> Copy | Clone | PartialEq | Eq`（`traits-and-attributes.md`）。
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Derive {
     Copy,
     Clone,
@@ -222,8 +222,6 @@ pub enum ExprKind {
         rhs: ExprId,
     },
 
-    /// `UnitExpression -> ( )`。零载荷：`()` 里没有任何子表达式，
-    /// 所以不能拿 `Paren` 顶（那会硬造一个不存在的内层 `ExprId`）。
     Unit,
     Paren(ExprId),
     Array(Vec<ExprId>),

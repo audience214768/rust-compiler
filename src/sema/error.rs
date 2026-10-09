@@ -52,8 +52,6 @@ pub enum SemErrorKind {
     InvalidIndex,
     /// `*x` 的 `x` 不是引用（标量、`Vec` 都不可解引用）。
     NotDereferenceable,
-    /// 不允许的隐式转换（owned `Box` 不自动借、`Vec` 无 deref、`&` 不会变成 `&mut`）。
-    InvalidCoercion,
 
     // ── place 与可变性（0.3 的 `cat` + S8.3）──
     /// 赋值 / 可变借用的目标不是 place（字面量、算术结果、临时值）。
@@ -157,9 +155,6 @@ impl SemError {
                 text()
             ),
             SemErrorKind::NotDereferenceable => format!("`{}` 不是引用，不能解引用", text()),
-            SemErrorKind::InvalidCoercion => {
-                format!("`{}` 不能隐式转换成这里期望的类型", text())
-            }
             SemErrorKind::NotAPlace => format!("`{}` 不是可以赋值或借用的地方", text()),
             SemErrorKind::NotMutablePlace => {
                 format!("`{}` 不可变：写入路径上有一层不是可变访问", text())
@@ -172,7 +167,8 @@ impl SemError {
             SemErrorKind::DeriveRequiresOther => {
                 format!("`Copy` 必须显式同时派生 `Clone`；`Eq` 必须显式同时派生 `PartialEq`")
             }
-            SemErrorKind::DuplicateDerive => format!("derive 条目 `{}` 重复", text()),
+            // derive 名不带 span，印不出具体是哪一个
+            SemErrorKind::DuplicateDerive => format!("derive 条目重复：同一个能力只能请求一次"),
             SemErrorKind::InvalidMainSignature => {
                 format!("`main` 的签名不合法：不能有值参数、泛型参数或返回值")
             }

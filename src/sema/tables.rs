@@ -3,7 +3,8 @@ use std::collections::HashMap;
 
 use super::{ConstVal, TyArena, ValueSym};
 
-/// `sema` 交给下游（lowering）的全部产物：结论表 + 类型与布局。
+/// `sema` 交给下游（lowering）的全部产物：结论表 + 类型与布局；下游还没接上，所以这两个字段暂无读者
+#[allow(dead_code)]
 pub struct Checked {
     pub tables: Tables,
     pub tys: TyArena,
@@ -12,17 +13,11 @@ pub struct Checked {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TyId(pub usize);
 
-/// 一个 place 能写到什么程度。判据（`operator-expr.md`）：穿过一层共享引用后，再多的 `*` 也拿不回可写。
-/// 它编码的就是 (现在能写?, 写路径上跨过 `&` 没有?) 两位——(能写, 跨过) 那格不可达，所以是三种而不是四种。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum PlaceMut {
-    /// 现在就能写：`let mut x` / `mut self` / 物化的临时值
-    Mutable,
-    /// 现在不能写；若里面还存着 `&mut`，`*` 一层之后能写：`let p = &mut x` 的 `p`、`&mut self` 的 `self`
-    Immutable,
-    /// 现在不能写，`*` 之后也永远不能——写路径上已经穿过一层共享引用了。
-    /// **不会出现在绑定上**：`let q = &p` 的 `q` 是 `Immutable`（`&` 还没跨过去），`*q` 才跨过它 ⇒ `Shared`
-    Shared,
+pub enum PlaceMut { //注意到RX没有cell等具有内部可变性的结构，所以不存在mutable + shared的情况，所以可以直接使用三态
+    Mutable, //可写
+    Immutable, //不可写
+    Shared, //共享引用，注意&t其是一个值，而不是一个位置，共享应当是出现在解引用&时候出现
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -42,15 +37,17 @@ pub enum Coercion {
     RefToInner,
     /// `!` → 任意：这条路径不产值
     Never,
+    /// 点号调用给接收者自动借了一层 `&`（`method-call-expr.md` step 5）；记在接收者身上
+    AutoRef,
+    /// 同上，自动借的是 `&mut`
+    AutoRefMut,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ExprInfo {
     pub res: Option<ValueSym>,
-    /// 转换**后**的类型（codegen 读这个）；来源类型靠 `coercion` 反推
-    pub ty_id: Option<TyId>,
+    pub ty_id: Option<TyId>, //这个是转换后的
     pub cat: Option<Category>,
-    /// 出口那儿做过的隐式转换；`None` = 没做
     pub coercion: Option<Coercion>,
 }
 
@@ -58,6 +55,7 @@ pub struct ExprInfo {
 pub struct Tables {
     pub exprs: Vec<ExprInfo>,
     pub const_values: HashMap<ItemId, (ConstVal, TyId)>,
+    pub let_tys: Vec<Option<TyId>>,
 }
 
 impl Tables {
@@ -66,6 +64,7 @@ impl Tables {
         Self {
             exprs: vec![ExprInfo::default(); ast.exprs.len()],
             const_values: HashMap::new(),
+            let_tys: vec![None; ast.stmts.len()],
         }
     }
 }

@@ -308,7 +308,7 @@ pub struct Ast {
 |---|---|
 | `Item` | `Fn { name, has_generic_params, recv: Option<Receiver>, params, ret: Option<TypeId>, body }`、`Struct { derives, name, fields }`、`Const { name, ty, const_value_id }`、`Impl { target, items: Vec<ItemId> }`；**没有 `Use`** |
 | `Stmt` | `Empty` / `Let { binding, mutable, ty: Option<TypeId>, init }` / `Expr { expr, semi: bool }`——`semi` 必须如实记（§1.3.5） |
-| `Block` | `{ stmts: Vec<StmtId>, span }`，**没有 `tail` 字段**；`Block::tail()` 从 `stmts` 现算 |
+| `Block` | `{ stmts: Vec<StmtId>, span }`，**没有 `tail` 字段**；"谁是块尾"由语义阶段从 `stmts` 现算（`Sema::block_tail_expr`，§2.2.1） |
 | `Expr` | 25 个变体；`else_branch: Option<ExprId>`（`else if` 链要求 `else` 后跟表达式），而 `then_block` 是 `BlockId`——这个不对称是忠实于规范 |
 | `Type` | 只有 5 支：`Paren` / `Unit` / `Path` / `Ref { mutable, inner }` / `Array { elem, len }` |
 | `Path` | `segments: Vec<PathExprSegment>`；`PathIdentSegment` 三支 `Ident(Name)` / `SelfValue` / `SelfType` 必须可区分；`GenericArgs` 只留类型实参（生命周期实参已丢） |
@@ -339,19 +339,19 @@ pub struct Checked {              // sema::check 的返回值：结论 + 类型�
 
 pub struct Tables {
     pub exprs: Vec<ExprInfo>,     // 与 ast.exprs 同序同长：一个表达式一行结论
-    pub let_tys: Vec<Option<TyId>>, // 与 ast.stmts 同序同长：每个 let 槽的类型（lowering 开槽用；M1.2 落）
+    pub let_tys: Vec<Option<TyId>>, // 与 ast.stmts 同序同长：每条 `let` 转换后的类型（binding 读它，lowering 开槽用）
     pub const_values: HashMap<ItemId, (ConstVal, TyId)>, // 常量项的值与类型
 }
 
 pub struct ExprInfo {
     pub res: Option<ValueSym>,      // 名字解析结果（解析到哪个绑定 / 函数 / 常量 / 内置）
     pub ty_id: Option<TyId>,        // 定型结论；记的是**转换后**的类型
-    pub coercion: Option<Coercion>, // 出口那儿做过的那一次隐式转换；None = 没做
+    pub coercion: Option<Coercion>, // 这条表达式上做过的隐式转换（出口给的，或点号调用给接收者补的自动借用）；None = 没做
     pub cat: Option<Category>,      // Place(PlaceMut) | Value；None 只表示「还没写」（各臂顺手填）
 }
 ```
 
-**`ty_id` 与 `coercion` 是同一件事的两面**：`ty_id` 是转换**后**的类型（下游 codegen 按它选 load / 位宽），来源类型与"做了什么调整"由 `coercion` 说（`MutToShared` / `RefToInner` / `Never` / `Identity` 四选一，见 §1.3.5）。两者都在 `check_expr` 的出口一次写下。
+**`ty_id` 与 `coercion` 是同一件事的两面**：`ty_id` 是转换**后**的类型（下游 codegen 按它选 load / 位宽），来源类型与"做了什么调整"由 `coercion` 说（六种：`Identity` / `MutToShared` / `RefToInner` / `Never` / `AutoRef` / `AutoRefMut`，后两种来自方法查找，见本节末尾）。两者在 `check_expr` 的出口一次写下；LUB 换目标时由消费它的臂回填，点号调用给接收者补的自动借用写在被调的那个接收者表达式上。**落表口径只有一条：类型真的变了才写**（`Identity` 只是 `coerce` 的返回值，从不进表），于是 `coercion.is_some()` ⟺ 这个表达式的值需要动一下。
 
 **`cat` 是二选一，但 `Place` 那一支带一个三态**：`Category::Place(PlaceMut) | Category::Value`。判据是"写路径上跨过共享引用没有"——跨过一层 `&` 之后，再多的 `*` 也拿不回可写（`operator-expr.md`）：
 
@@ -378,6 +378,8 @@ pub struct ExprInfo {
 ⇒ `let p = &mut x`（`p` 是 `Immutable`）接一个 `*`：走 `&mut` 层、基座不是 `Shared` ⇒ `Mutable`，`*p = 3` 合法。`let q = &p`（`q` 是 `Immutable`）接一个 `*`：走 `&` 层 ⇒ `Shared`；再接一个 `*`：基座已是 `Shared` ⇒ 还是 `Shared`，`**q = 2` 报错。**`Box<T> ⇒ 不变` 这一格与 Rust 不同**：规范 `heap.md` 里"不可变的拥有者"挡住的只是**替换内容**，里面存的 `&mut U` 照样给得出可变访问——所以 `Box` 自己不降级，降级只由它里面那个 `&` 带来。于是 `let b = Box::<i32>::new(1); *b = 2;` 是**编译错误**（不可变的 `b` ⇒ `*b` 也 `Immutable`），而 `let b = Box::<&mut i32>::new(&mut x); **b = 2;` 合法（`*b` 走 `Box` 不变、`**b` 走 `&mut` ⇒ `Mutable`）。
 
 **`Vec` 下标是这条规则之外的一步**：数组下标与 `Box` 解引用一样**不插借用**，`Vec` 下标则**隐含借用向量本身**（`heap.md` §Indexing and mutable access）——那一刻向量不是 `Mutable` 的话，元素状态直接降成 `Shared`，元素里存再多 `&mut` 也拿不回可变访问（`fn f(values: Vec<&mut i32>) { *values[0] = 2; }` 因为少了 `mut` 而报错）。这正是"不可变向量不因元素是 `&mut` 就变可变"，与上面 `Box` 那格是同一个意思在两种容器上的两种落法：**`Box` 不插借用，`Vec` 插**。**降成 `Shared` 的元素交出去时还要再拦一次**（可变再借用）：`heap.md` 同一段把四类操作并列——赋值、复合赋值、**可变借用或再借用**、`&mut self` 接收者——都要求"向量在下标那一步可变"；前三类各自有落点，第四类**没有节点可挂**（`let r: &mut i32 = values[0];` 里既没有 `&mut` 表达式、也没有赋值，元素 place 是直接交给 `let` 初值的），所以落成 `check_expr` 出口的一道兜底：place 态是 `Shared`、表达式类型是 `&mut _`、且 `expected` 也是 `&mut _` ⇒ `NotMutablePlace`。`&mut T → &T` 那一档只要求共享访问，所以目标类型是 `&_` 时放行（`let r: &i32 = values[0];` 合法）。
+
+**方法查找的候选链是"类型"的序列**（算法见 [`spec-mapping.md`](spec-mapping.md) §7.6）：从接收者类型起沿内置解引用逐层走，每层按 `T`、`&T`、`&mut T` 三三一组；**一个方法命中候选 `C` ⟺ 它的 self 类型正好是 `C`**（查 `assoc` 与内建表用的"宿主"是候选 `C` 自己再剥一层引用——候选只有 `T` / `&T` / `&mut T` 三种形状，所以宿主恰在一步之外；再往下剥就错了，`&&U` 这一位问的是 `&U` 自己身上的 `clone`）。于是"引用层的次序"是：base 是 `&U` 时，候选 `&U`（= `U` 的 `&self` 方法，`U` 的 `clone` 就在其中）**排在** `&&U`（= 引用自身的 clone，`&T` 永远 `Clone`、克隆的是引用不是目标）**前面**——`view: &Box<i32>` 的 `view.clone()` 因此拿到 `Box<i32>`（`Box::clone` 的 self 类型正好是 `&Box<i32>`），而 `r: &Opaque` 目标不 `Clone`，才回落成复制引用、拿到 `&Opaque`。⚠ **struct 自己 derive 出的 `clone` 也不在 `assoc` 里**，所以 struct 这一层查完 `assoc` 未命中，还要再看一次内建表（`root.clone()` 落在这一格）。**命中即把命中的那个 `ValueSym` 写进点号调用表达式的 `res`**（lowering 靠它知道调的是谁），形态上只有两种：候选位就是接收者自己的类型 ⇒ 原样传给方法；候选位是接收者外面那一层引用 ⇒ 给**接收者**记一次自动借用（`Coercion::AutoRef` / `AutoRefMut`，lowering 据此取地址）。`&mut` 候选另有一道可变性要求：候选是外层自动借的那一层 ⇒ 借的是接收者这个 place，它必须是 `Mutable`（`Immutable` / `Shared` 都拒）；候选就是接收者自己的类型、而那个类型是 `&mut _` ⇒ 是透过它再借一次，判据交给"推一层"那条规则（`step` ⇒ 共享引用来的路径不行，而不可变 place 里存的 `&mut` 可以）。
 
 **粒度是一行结论**：名字解析、类型、转换、place 判定**都在同一行**，按表达式 id 读一次就拿到全部（`resolutions` / `expr_cat` / `coercions` 这类分表不再单列）。`ValueSym` 是名字解析的四种归宿：局部绑定（`Local`）、函数（`Fn`）、常量项（`Const`）、编译器内置（`Builtin`——`println_i32` 这类没有源码 `ItemId` 的函数，以及 `Box` / `Vec` 的关联函数）。**结构体成员也是这四种之一**：`assoc[sid]` 里装的就是 `ValueSym`，但**只装源码 `impl` 项**（方法落 `Fn`、关联常量落 `Const`）；`Box` / `Vec` 的内建成员与 derive 出来的 `clone` **不进 `assoc`**，走方法查找候选链上并列的那张内建表。
 
@@ -620,6 +622,7 @@ pub struct StructDef {            // "一个 struct 的字段表"本身，TyKind
     pub span:   Span,                 // 名字那一处；布局环的报错要指回 `struct Bad` 的 `Bad`
     pub fields: Vec<(String, TyId)>,  // 声明顺序：规范要求 src 顺序 = 布局顺序
     pub offsets: Vec<u32>,            // ★ 算出来的，不是声明的：与 fields 同长同序（layout_of 填）
+    pub derives: HashSet<Derive>,     // ★ 这个 struct 声明的能力；落表时已去重（重复当场报错）
 }
 
 pub struct TyArena {
@@ -632,21 +635,22 @@ pub struct TyArena {
 }
 ```
 
-`StructDef.span` 与 `struct_ty` 的存在理由都是"手边只剩一个 id"：布局环要 span 才能报位置，`Self` 要换成一个 `TyId` 而 `structs` 里只有 `StructDef`。**`interner` 是类型去重的入口**：`intern(kind)` 先查表，命中返回已有的 `TyId`，没命中才 push 进 `kinds` 并记表 ⇒「两个类型相同」在整条流水线上就是「`TyId` 相等」。**自引用 struct 的顺序**：`struct A { next: Box<A> }` 解析字段时会再遇到 `A` ⇒ `TyKind::Struct(id)` 必须在字段解析**之前**就能 intern，字段表由 `finish_struct(id)` 事后填（§2.3.1「聚合先造壳、后填字段」）。**`struct_items`（`StructId → ItemId`）挂在 `Sema` 上、不在这张表里**（2a 自己 push，`new_struct` 与它必须成对出现）；**`TyArena::finish_struct` 与 `Sema::finish_structs` 只差一个 `s`**（前者装一张 struct 的字段，后者是第 3 步的驱动器）；**`ll_ty` 就是下文那张拼写表本身**，只服务 printer，别在别处另写一份。
+`StructDef.span` 与 `struct_ty` 的存在理由都是"手边只剩一个 id"：布局环要 span 才能报位置，`Self` 要换成一个 `TyId` 而 `structs` 里只有 `StructDef`。**`interner` 是类型去重的入口**：`intern(kind)` 先查表，命中返回已有的 `TyId`，没命中才 push 进 `kinds` 并记表 ⇒「两个类型相同」在整条流水线上就是「`TyId` 相等」。**自引用 struct 的顺序**：`struct A { next: Box<A> }` 解析字段时会再遇到 `A` ⇒ `TyKind::Struct(id)` 必须在字段解析**之前**就能 intern，字段表由 `finish_struct(id)` 事后填（§2.3.1「聚合先造壳、后填字段」）。**`derives` 是"声明出来的能力"，不是算出来的**：`declare_items` 造壳时就 insert 进集合，`insert` 返 `false` ⇒ 重复条目当场报 `DuplicateDerive`，所以表里存下来的天然是规范化的集合，之后"这个 struct 支不支持 `Clone`"就是一次 `contains`（判据落在 `capable`，见下）。**`struct_items`（`StructId → ItemId`）挂在 `Sema` 上、不在这张表里**（2a 自己 push，`new_struct` 与它必须成对出现）；**`TyArena::finish_struct` 与 `Sema::finish_structs` 只差一个 `s`**（前者装一张 struct 的字段，后者是第 3 步的驱动器）；**`ll_ty` 就是下文那张拼写表本身**，只服务 printer，别在别处另写一份。
 
 **`TyArena` 上的操作**（它不认识 AST；错误自己报，span 取自 `StructDef`）：
 
 | 名字 | 干什么 |
 |---|---|
 | `intern(kind) -> TyId` | 去重入口；未命中时推 `kinds` **并**给 `layouts` 补一个 `None`（两张表必须永远同长） |
-| `new_struct(name, span) -> (StructId, TyId)` | **造壳**：`fields` / `offsets` 先留空 ⇒ 推 `structs` ⇒ intern 出 `TyKind::Struct(id)` ⇒ 记进 `struct_ty`、给 `visiting` 推一个 `White` |
+| `new_struct(name, span, derives) -> (StructId, TyId)` | **造壳**：`fields` / `offsets` 先留空 ⇒ 推 `structs` ⇒ intern 出 `TyKind::Struct(id)` ⇒ 记进 `struct_ty`、给 `visiting` 推一个 `White` |
 | `finish_struct(id, fields)` | **往 `StructDef.fields` 里装东西的唯一入口**（装**一张** struct） |
+| `capable(ty, d: Derive) -> bool` | **能力谓词**：这个类型够不够格 `Copy` / `Clone` / `PartialEq` / `Eq`。**struct 只看它自己声明没声明、不往字段里递归** ⇒ 递归类型（`struct Node { children: Vec<Node> }`）天然终止。三处共用：内建 `clone` 的可用性（§1.2.3 的方法查找）、需求侧（`==` 要 `PartialEq`、`[e; N>1]` 要 `Copy`）、声明侧（逐字段查） |
 | `struct_ty(id) -> TyId` | 取 `struct_ty[id]`；`Self` 要换成 `TyId` 时用它 |
 | `layout_of(ty) -> Result<Layout, SemError>` | 下表；布局环在这里报 |
 | `is_scalar(ty) -> bool` | 规格：`size != 0 && !matches!(kind, Array \| Struct \| Vec)`；mem2reg 的 `is_promotable` 与后端的"一个字还是 N 字节"开关 |
-| `coerce(from, to) -> Option<Coercion>` | 一对类型的隐式转换判据（允许清单见 [`spec-mapping.md`](spec-mapping.md) §7.3）；`None` = 不允许。`Identity` / `MutToShared` / `RefToInner` / `Never` 四值就是 lowering 要发的动作（`Coercion` 在 `tables.rs`） |
+| `coerce(from, to) -> Option<Coercion>` | 一对类型的隐式转换判据（允许清单见 [`spec-mapping.md`](spec-mapping.md) §7.3）；`None` = 不允许。六个值就是 lowering 要发的动作（`Coercion` 在 `tables.rs`；`AutoRef` / `AutoRefMut` 由点号调用自己记在接收者身上，见 §1.2.3） |
 | `derefs_to(cur, target, mutable_path) -> bool` | `coerce` 的帮手：`cur` 沿内置解引用（`&U` / `&mut U` / `Box<U>` → `U`）能否走到 `target`；`mutable_path` ⇒ 路径上不许出现共享引用（`&mut S` → `&mut T` 的要求） |
-| `lub(tys) -> Option<TyId>` | 一组结果的公共类型（三步算法见 [`spec-mapping.md`](spec-mapping.md) §7.3）；全 `!` ⇒ `Never`，空输入 ⇒ `None`（唯一还活着的 `None` 来源）。换目标那一支两步还没按规范收紧，见 [`plan.md`](plan.md) §0.4 的 P1-10 |
+| `lub(tys) -> Option<(TyId, Vec<Option<Coercion>>)>` | 一组结果的公共类型（三步算法见 [`spec-mapping.md`](spec-mapping.md) §7.3）；全 `!` ⇒ `Never`，空输入 ⇒ `None`（唯一还活着的 `None` 来源）。换目标那一支要连"之前每个结果"一起验；末尾给**每个**输入回传它要做的调整——`!` 不参与挑目标，但它自己照样被写到公共类型上（与出口对 `!` 的口径一致），本来就同型的槽给 `None`。`Array` / `If` / `Loop` 三个臂拿到后据此回填那几个表达式已写下的 `ty_id` / `coercion`（`&mut T → &T` 是零指令，但表里得是最终类型） |
 
 **布局怎么算**（`layout_of`，与规范参考表逐条一致）：
 
@@ -842,7 +846,7 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 | 2a | `declare_items` | 扫 `ast.root`：顶层 item 进根作用域 + **重名检查**；`struct` 顺手**造壳**；`impl` 什么都不做 | 根 `types` / `values`；`struct_items`；`TyArena` 里的空壳 | 第 1 步 |
 | 2b | `declare_impls` | 扫 `ast.root` 挑出 `impl`：解析目标类型，把关联项的**名字**写进 `assoc` | `assoc` | 2a **全部**走完 |
 | 2c | `check_consts` | 扫 `ast.root`：**求常量值**，每个 `const` 项（顶层 + 关联）都求一遍，再跟它声明的类型比对（`resolve_type` 会顺带 intern 新类型：`kinds` / `interner` / `layouts` 三格，**不碰 `StructDef.fields`**） | `tables.const_values` / `const_color` | 2a（顶层名字）、2b（`assoc`——`Self::N` / `Config::N` 要用） |
-| 3 | `finish_structs` | 填每张 struct 的**字段表**（顺带查字段重名） | `StructDef.fields` | 第 2 步**全部**走完 |
+| 3 | `finish_structs` | 填每张 struct 的**字段表**（顺带查字段重名，以及"每个声明了的 derive × 每个字段"的能力检查） | `StructDef.fields` | 第 2 步**全部**走完 |
 | 4 | `check_layouts` | **每个** struct 都算一遍布局（环检测就在里面） | `TyArena.layouts` / `StructDef.offsets` / `visiting` | 第 3 步 |
 | 5 | `check_crate` → `check_fn` / `check_block` / `check_stmt` / `check_expr` | 走函数体（表达式、语句、块）。**`check_crate` 是这一趟的分发器**：扫 `ast.root` 把顶层的 `Fn` 与每个 `Impl` 里的 `Fn` 挑出来、判 entry 四条，再逐个交给 `check_fn` | `tables.exprs`（每行 `res` / `ty_id` / `coercion` / `cat`）、`tables.let_tys`：定型与 place 判定的结论全在这里，排期见 [`plan.md`](plan.md) §0 | 2a / 2b（名字齐）、2c（常量值齐）、3 / 4（类型与布局齐） |
 
@@ -945,11 +949,11 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 | 5 | `ExprKind::Struct.path` | **不解析**（归定型那一趟） | — |
 | 6 | `ExprKind::Method.name`（类型是 `PathIdentSegment`，**不是** `PathId`） | **不解析**（归定型那一趟） | — |
 
-`use` 的 `UsePath` **不在表里**（parser 解析完整条就丢，不进 `ast.paths`）。**段数——先分命名空间，再看上下文限制**：Type 侧只认 1 段（2 段拒——Rx 没有关联类型，`A::B` 在类型位置没有可指的目标）；Value 侧 1 段查值命名空间（**#2 另加**结果必须是 `Const`；**#4 另加**结果必须是 `Fn` / `Builtin`）、2 段头段走 **Type** 命名空间查到那个 struct、再查 `assoc[sid]` 的成员名、≥3 段拒。**值侧的 2 段没有「未命中也放行」这一说**：头段命中 `Box` / `Vec` 构造器就按尾名查**内建表**（`new` / `clone` / `len` / `is_empty` / `push` / `remove`，不在表里就是错），命中具名 struct 就查 `assoc[sid]`，两处都没命中一律 `InvalidPath`。
+`use` 的 `UsePath` **不在表里**（parser 解析完整条就丢，不进 `ast.paths`）。**段数——先分命名空间，再看上下文限制**：Type 侧只认 1 段（2 段拒——Rx 没有关联类型，`A::B` 在类型位置没有可指的目标）；Value 侧 1 段查值命名空间（**#2 另加**结果必须是 `Const`；**#4 另加**结果必须是 `Fn` / `Builtin`）、2 段头段走 **Type** 命名空间查到那个 struct、再查 `assoc[sid]` 的成员名、≥3 段拒。**值侧的 2 段没有「未命中也放行」这一说**：头段命中 `Box` / `Vec` 构造器就按尾名查**内建表**（`new` / `clone` / `len` / `is_empty` / `push` / `remove`，不在表里就是错；两个容器的 `clone` 另要元素 `Clone`，空容器也一样），命中具名 struct 就查 `assoc[sid]`，**未命中且尾名是 `clone` 时再看该 struct 有没有 derive `Clone`**（有 ⇒ 内建 `clone`；固有方法优先，因为它在 `assoc` 里先被查到），其余一律 `InvalidPath`。
 
 **泛型实参只有一条规则：`args` 只许挂在"命名类型的那一段"上。** 类型位置的段（1 段、2 段的 head）合法，按类型位置的规矩来（`Box` / `Vec` **恰好 1 个**类型实参，具名 struct 与内建标量 **0 个**）；值 / 成员位置的段（2 段的 tail、凡在值命名空间命中的段、方法段）**一律拒**——函数、常量、成员都不是类型。判据落在一个自由函数 `has_type_args(seg)` 上、两处共用：它数的是 **`args.types` 空不空，不是 `args` 是否为 `None`**（生命周期实参不进 `types`）。这一条同时管住 #2 / #3 / #4：`f::<i32>()`（值位置）、`v.len::<i32>()`（方法段）、`Config::<i32>::N`（struct 却带了实参）都被它拒掉。
 
-`resolve_value_path` 返回 `Result<ValueSym, SemError>`——**没有「解析成功、但还没定」的中间态**：1 段的 `self` 不在作用域里、`Self` 当值用、`Box` / `Vec` 没有类型实参或尾名不在内建表里、2 段的头不是具名 struct / `assoc` 未命中，**全是硬错**。内建成员（含 derive 生成的 `clone`）一律走内建表、不落 `assoc`。可达性判据因此全在**调用方**：#2（常量初值）要求结果必须是 `Const`；#4（callee）只认 `Fn` / `Builtin`，`Local` / `Const` / 解析不出具名物的一律 `NotCallable`——**函数当值是 UB ⇒ 局部量里永远装不了函数，不用去查它的类型**；`(f)()` 合法，靠 `Paren` 把 `res` 照抄下来。单段命中 `Fn` 就放行，**即使它被当值用**（`let f = helper;`）：规范把「函数当值」定为 UB 且不要诊断，不许因它拒程序。
+`resolve_value_path` 返回 `Result<ValueSym, SemError>`——**没有「解析成功、但还没定」的中间态**：1 段的 `self` 不在作用域里、`Self` 当值用、`Box` / `Vec` 没有类型实参或尾名不在内建表里、2 段的头不是具名 struct / `assoc` 未命中（又不是 derive 出来的 `clone`），**全是硬错**。内建成员（含 derive 生成的 `clone`）一律走内建表、不落 `assoc`。可达性判据因此全在**调用方**：#2（常量初值）要求结果必须是 `Const`；#4（callee）只认 `Fn` / `Builtin`，`Local` / `Const` / 解析不出具名物的一律 `NotCallable`——**函数当值是 UB ⇒ 局部量里永远装不了函数，不用去查它的类型**；`(f)()` 合法，靠 `Paren` 把 `res` 照抄下来。单段命中 `Fn` 就放行，**即使它被当值用**（`let f = helper;`）：规范把「函数当值」定为 UB 且不要诊断，不许因它拒程序。
 
 `Self` 只在 `impl` 块内或 struct 声明内有意义（*Self denotes the struct being declared or the target type of the current inherent implementation*）；三个内建 I/O 按名字直接认。
 
@@ -960,7 +964,7 @@ pub enum IntPred {                    // 10 个：LLVM 整数比较谓词，一�
 | **name** | 名字查不到、用错命名空间（`fn` 与 `const` 撞车，`struct` 与 `fn` 不撞）、重复定义 |
 | **type** | 类型不匹配、隐式转换不成立（引用 coercion 远没有 Rust 多）、`as` 的合法组合之外、数组长度不是 `usize` 常量 |
 | **mutability** | `cat` 不是 `Place(Mutable)` 却要写它（赋值 / `&mut` / `&mut self` 接收者）；`Vec` 下标那一步隐含借用向量，那一刻不是 `Mutable` ⇒ 元素降成 `Shared`、里面存再多 `&mut` 也拿不回可变访问；降成 `Shared` 的元素在转换位点上再被拦一次（可变再借用）（判据与例表见 §2.2.1） |
-| **capability** | derive 的**互相牵连 + 逐字段**检查：`Copy` 必须同时请求 `Clone`、`Eq` 必须同时请求 `PartialEq`、`Box` 字段挡 `Copy`、`&mut` 字段挡 `Clone` |
+| **capability** | 判据只有一条：`TyArena::capable`。**声明侧**：`Copy` 必须同时请求 `Clone`、`Eq` 必须同时请求 `PartialEq`、逐字段能力检查（`Box` 字段挡 `Copy`、`&mut` 字段挡 `Clone`…）；**需求侧**：`==` / `!=` 要 `PartialEq`、`[e; N>1]` 要 `Copy`、`clone()` 要 `Clone`（点号形态表现为"没这个方法"，路径形态报 `CloneRequired`） |
 | **constant** | 常量初始化式类型不符、常量环（直接 / 间接 / 关联三种都要检出）、负号加在无符号常量上 |
 | **layout** | 布局环（`struct A { a: A }`）；**只有 `Box`/`Vec` 能破环**，内联数组不破环 |
 | **receiver** | `self` 出现在方法之外、可变接收者需要可变 place、显式关联调用 `S::m(x)` **不做 autoref**、关联值跨 `impl` 块共享同一命名空间 |

@@ -1,18 +1,14 @@
-#![allow(dead_code, unused_variables, unused_assignments, unreachable_code)] // WIP：写完全部 todo!() 后删掉这一行
-
 pub mod error;
 pub mod tables;
 
 use crate::frontend::Span;
 use crate::frontend::ast::{
-    self, AssignOp, Ast, ConstValueKind, ExprId, ExprKind, ItemId, ItemKind, Lit, PathIdentSegment, StmtId, StmtKind, TypeKind, BinOp
+    self, AssignOp, Ast, ConstValueKind, ExprKind, ItemId, ItemKind, Lit, PathIdentSegment, StmtId, StmtKind, TypeKind, BinOp, Derive
 };
 use crate::frontend::lexer::base_and_digits_at;
-use crate::sema::tables::Category::Value;
-use crate::sema::tables::ExprInfo;
 use error::*;
 use std::cmp::max;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use tables::{Checked, Coercion, PlaceMut, Tables, TyId, Category};
 
@@ -151,29 +147,24 @@ enum Color {
     Black, //finish
 }
 
-#[derive(Copy, Clone, Debug)]
-enum LoopKind {
-    Loop,
-    While,
-}
-
 struct LoopInfo {
-    kind: LoopKind,
     expected: Option<TyId>,
-    break_tys: Vec<TyId>,
+    /// 每个 `break` 的值：`ExprId` 是带值 break 的那个表达式（裸 `break;` 没有），
+    /// 收尾的 LUB 换目标时要按它回填表项
+    break_tys: Vec<(Option<ast::ExprId>, TyId)>,
 }
 
 impl LoopInfo {
-    fn new(kind: LoopKind, expected: Option<TyId>) -> Self {
-        Self { kind, expected, break_tys: Vec::new() }
+    fn new(expected: Option<TyId>) -> Self {
+        Self { expected, break_tys: Vec::new() }
     }
 }
 
 pub struct StructDef {
-    pub name: String,
     pub span: Span,
     pub fields: Vec<(String, TyId)>,
     pub offsets: Vec<u32>,
+    pub derives: HashSet<Derive>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -237,12 +228,12 @@ impl TyArena {
         self.struct_ty[s.0]
     }
 
-    fn new_struct(&mut self, name: String, span: Span) -> (StructId, TyId) {
+    fn new_struct(&mut self, span: Span, derives: HashSet<Derive>) -> (StructId, TyId) {
         let struct_id = self.push_struct(StructDef {
-            name,
             span,
             fields: Vec::new(),
             offsets: Vec::new(),
+            derives,
         });
         let type_id = self.intern(TyKind::Struct(struct_id));
         self.struct_ty.push(type_id);
@@ -252,6 +243,33 @@ impl TyArena {
 
     fn finish_struct(&mut self, s: StructId, fields: Vec<(String, TyId)>) {
         self.structs[s.0].fields = fields;
+    }
+
+    /// 能力表（`builtin-traits.md`）：struct 只看自己声明了什么、不往字段里递归，递归类型因此天然终止
+    fn capable(&self, ty: TyId, d: Derive) -> bool {
+        match self.kinds[ty.0] {
+            TyKind::I32 | TyKind::U32 | TyKind::Isize | TyKind::Usize | TyKind::Bool | TyKind::Unit => true,
+            TyKind::Never => false,
+            TyKind::Ref { mutable: false, inner } => match d {
+                Derive::Copy | Derive::Clone => true,
+                Derive::PartialEq | Derive::Eq => self.capable(inner, d),
+            },
+            TyKind::Ref { mutable: true, inner } => match d {
+                Derive::Copy | Derive::Clone => false,
+                Derive::PartialEq | Derive::Eq => self.capable(inner, d),
+            },
+            TyKind::Boxed(inner) | TyKind::Vec(inner) => match d {
+                Derive::Copy => false,
+                Derive::Clone => self.capable(inner, Derive::Clone),
+                Derive::PartialEq | Derive::Eq => self.capable(inner, d),
+            },
+            TyKind::Array { elem, .. } => match d {
+                Derive::Copy => self.capable(elem, Derive::Copy),
+                Derive::Clone => self.capable(elem, Derive::Clone),
+                Derive::PartialEq | Derive::Eq => self.capable(elem, d),
+            },
+            TyKind::Struct(id) => self.structs[id.0].derives.contains(&d),
+        }
     }
 
     pub fn layout_of(&mut self, ty: TyId) -> Result<Layout, SemError> {
@@ -384,30 +402,35 @@ impl TyArena {
         }
     }
 
-    fn lub(&mut self, tys: &[TyId]) -> Option<TyId> {
-        if tys.len() == 0 { return None; }
-        let mut lub_ty_id = None;
+    fn lub(&mut self, tys: &[TyId]) -> Option<(TyId, Vec<Option<Coercion>>)> {
+        if tys.is_empty() { return None; }
+        let never = self.intern(TyKind::Never);
+        let mut target: Option<TyId> = None;
         for i in 0..tys.len() {
-            let new_ty_id = tys[i];
-            if new_ty_id == self.intern(TyKind::Never) { 
-                continue 
-            } else if lub_ty_id.is_none() {
-                lub_ty_id = Some(new_ty_id);
+            let u = tys[i];
+            if u == never { continue; }
+            let Some(t) = target else {
+                target = Some(u);
                 continue;
-            }
-            if self.coerce(new_ty_id, lub_ty_id.unwrap()).is_none() {
-                for j in 0..i {
-                    if self.coerce(tys[i], new_ty_id).is_none() {
-                        return None;
-                    }
+            };
+            if self.coerce(u, t).is_some() { continue; }
+            for j in 0..i {
+                if self.coerce(tys[j], u).is_none() {
+                    return None; 
                 }
-                lub_ty_id = Some(new_ty_id);
+            }
+            target = Some(u);
+        }
+        let target = target.unwrap_or(never);
+        let mut adjust = vec![None; tys.len()];
+        for i in 0..tys.len() {
+            adjust[i] = match self.coerce(tys[i], target) {
+                Some(Coercion::Identity) => None,
+                Some(c) => Some(c),
+                None => return None,
             }
         }
-        if lub_ty_id.is_none() && tys.len() > 0 {
-            return Some(self.intern(TyKind::Never));
-        }
-        lub_ty_id
+        Some((target, adjust))
     }
 }
 
@@ -501,14 +524,31 @@ impl<'a> Sema<'a> {
     fn declare_items(&mut self) -> Result<(), SemError> {
         for item_id in self.ast.root.iter() {
             let item = &self.ast.items[(*item_id).0];
-            match item.kind {
+            match &item.kind {
                 ItemKind::Struct {
-                    derives: _,
+                    derives,
                     name,
                     fields: _,
                 } => {
                     let struct_name = self.text(name.span);
-                    let (_, type_id) = self.tys.new_struct(struct_name.to_string(), item.span);
+                    let mut set = HashSet::new();
+                    for &d in derives {
+                        if !set.insert(d) {
+                            return Err(SemError {
+                                kind: SemErrorKind::DuplicateDerive,
+                                span: item.span,
+                            });
+                        }
+                    }
+                    if (set.contains(&Derive::Eq) && !set.contains(&Derive::PartialEq))
+                        || (set.contains(&Derive::Copy) && !set.contains(&Derive::Clone))
+                    {
+                        return Err(SemError {
+                            kind: SemErrorKind::DeriveRequiresOther,
+                            span: item.span,
+                        });
+                    }
+                    let (_, type_id) = self.tys.new_struct(item.span, set);
                     self.declare_type(struct_name, TypeSym::Ty(type_id), item.span)?;
                     self.struct_items.push(*item_id);
                 }
@@ -609,14 +649,35 @@ impl<'a> Sema<'a> {
         Ok(())
     }
 
+    fn candidate_method(&mut self, cand: TyId, name: &str) -> Option<ValueSym> {
+        let owner = match self.tys.kinds[cand.0] {
+            TyKind::Ref { inner, .. } => inner,
+            _ => cand,
+        };
+        if let TyKind::Struct(struct_id) = self.tys.kinds[owner.0] {
+            if let Some(&ValueSym::Fn(item_id)) = self.assoc.get(&struct_id).and_then(|m| m.get(name))
+            {
+                if self
+                    .fn_sig
+                    .get(&item_id)
+                    .is_some_and(|s| s.recv.is_some_and(|r| r.ty == cand))
+                {
+                    return Some(ValueSym::Fn(item_id));
+                }
+            }
+        }
+        let builtin = self.builtin_method(owner, name)?;
+        builtin
+            .sig(&mut self.tys)
+            .recv
+            .is_some_and(|r| r.ty == cand)
+            .then_some(ValueSym::Builtin(builtin))
+    }
+
     fn finish_structs(&mut self) -> Result<(), SemError> {
         for i in 0..self.struct_items.len() {
             let item = &self.ast.items[self.struct_items[i].0];
-            if let ItemKind::Struct {
-                derives: _,
-                name: _,
-                fields,
-            } = &item.kind
+            if let ItemKind::Struct { fields, .. } = &item.kind
             {
                 let mut struct_fields = Vec::new();
                 self.cur_self = Some(StructId(i));
@@ -629,6 +690,14 @@ impl<'a> Sema<'a> {
                         });
                     }
                     let ty_id = self.resolve_type(field.ty)?;
+                    for derive in &self.tys.structs[i].derives {
+                        if !self.tys.capable(ty_id, *derive) {
+                            return Err(SemError {
+                                kind: SemErrorKind::DeriveNotSatisfied,
+                                span: self.ast.types[field.ty.0].span,
+                            });
+                        }
+                    }
                     struct_fields.push((name.to_string(), ty_id));
                 }
                 self.tys.finish_struct(StructId(i), struct_fields);
@@ -741,6 +810,12 @@ impl<'a> Sema<'a> {
                             };
                             let elem_ty_id = self.resolve_type(*ty)?;
                             let box_ty = self.tys.intern(TyKind::Boxed(elem_ty_id));
+                            if tail_name == "clone" && !self.tys.capable(box_ty, Derive::Clone) {
+                                return Err(SemError {
+                                    kind: SemErrorKind::CloneRequired,
+                                    span: path.span,
+                                });
+                            }
                             return match tail_name {
                                 "new" => Ok(ValueSym::Builtin(Builtin::ContainerNew(box_ty))),
                                 "clone" => Ok(ValueSym::Builtin(Builtin::Clone(box_ty))),
@@ -756,6 +831,12 @@ impl<'a> Sema<'a> {
                             };
                             let elem_ty_id = self.resolve_type(*ty)?;
                             let vec_ty = self.tys.intern(TyKind::Vec(elem_ty_id));
+                            if tail_name == "clone" && !self.tys.capable(vec_ty, Derive::Clone) {
+                                return Err(SemError {
+                                    kind: SemErrorKind::CloneRequired,
+                                    span: path.span,
+                                });
+                            }
                             return match tail_name {
                                 "new" => Ok(ValueSym::Builtin(Builtin::ContainerNew(vec_ty))),
                                 "clone" => Ok(ValueSym::Builtin(Builtin::Clone(vec_ty))),
@@ -782,6 +863,14 @@ impl<'a> Sema<'a> {
                 };
                 match self.assoc.get(&struct_id).and_then(|m| m.get(tail_name)) {
                     Some(sym) => Ok(*sym),
+                    None if tail_name == "clone" => {
+                        let ty = self.tys.struct_ty(struct_id);
+                        if self.tys.capable(ty, Derive::Clone) {
+                            Ok(ValueSym::Builtin(Builtin::Clone(ty)))
+                        } else {
+                            Err(bad)
+                        }
+                    }
                     None => Err(bad),
                 }
             }
@@ -806,7 +895,6 @@ impl<'a> Sema<'a> {
                 };
                 self.tys.intern(kind)
             }
-            // 无后缀字面量只在四个整数类型里取型；别的 expected（`()`、`bool`、引用…）一律兜底 i32
             None => {
                 let int_expected = expected.filter(|e| {
                     matches!(
@@ -942,21 +1030,21 @@ impl<'a> Sema<'a> {
     }
 
     fn builtin_method(&self, base: TyId, name: &str) -> Option<Builtin> {
+        if name == "clone" {
+            return self
+                .tys
+                .capable(base, Derive::Clone)
+                .then_some(Builtin::Clone(base));
+        }
         match self.tys.kinds[base.0] {
-            TyKind::Boxed(_) if name == "clone" => Some(Builtin::Clone(base)),
             TyKind::Vec(_) => match name {
-                "clone" => Some(Builtin::Clone(base)),
                 "len" => Some(Builtin::VecLen(base)),
                 "is_empty" => Some(Builtin::VecIsEmpty(base)),
                 "push" => Some(Builtin::VecPush(base)),
                 "remove" => Some(Builtin::VecRemove(base)),
                 _ => None,
             },
-            TyKind::Array { .. } => match name {
-                "clone" => Some(Builtin::Clone(base)),
-                "len" => Some(Builtin::ArrayLen(base)),
-                _ => None,
-            },
+            TyKind::Array { .. } if name == "len" => Some(Builtin::ArrayLen(base)),
             _ => None,
         }
     }
@@ -1015,21 +1103,20 @@ impl<'a> Sema<'a> {
                 unreachable!("the item should be function");
             };
             (
-                recv.as_ref().map(|r| (r.by_ref, r.mutable)),
+                recv,
                 params.iter().map(|p| (p.ty, p.mutable)).collect::<Vec<_>>(),
                 *ret,
             )
         };
         let recv = match (recv, self.cur_self) {
-            (Some((by_ref, mutable)), Some(struct_id)) => {
+            (Some(recv), Some(struct_id)) => {
                 let base = self.tys.struct_ty[struct_id.0];
-                let ty = if by_ref {
-                    self.tys.intern(TyKind::Ref { mutable, inner: base })
+                let ty = if recv.by_ref {
+                    self.tys.intern(TyKind::Ref { mutable: recv.mutable, inner: base })
                 } else {
                     base
                 };
-                // 只有 `mut self` 能让 `self` 这个绑定重新赋值；`&mut self` 的可变在引用的类型里
-                Some(ParamSig { ty, binding_mut: !by_ref && mutable })
+                Some(ParamSig { ty, binding_mut: !recv.by_ref && recv.mutable })
             }
             _ => None,
         };
@@ -1199,6 +1286,43 @@ impl<'a> Sema<'a> {
         Ok(ty)
     }
 
+    fn adjust_result(
+        &mut self,
+        expr_id: ast::ExprId,
+        ty: TyId,
+        coercion: Coercion,
+    ) -> Result<(), SemError> {
+        self.tables.exprs[expr_id.0].coercion = Some(coercion);
+        self.typed(expr_id, ty)?;
+        Ok(())
+    }
+
+    fn block_tail_expr(&self, block_id: ast::BlockId) -> Option<ast::ExprId> {
+        let last = *self.ast.blocks[block_id.0].stmts.last()?;
+        match self.ast.stmts[last.0].kind {
+            StmtKind::Expr { expr, semi: false } => Some(expr),
+            _ => None,
+        }
+    }
+
+    fn result_expr(&self, expr_id: ast::ExprId) -> Option<ast::ExprId> {
+        match self.ast.exprs[expr_id.0].kind {
+            ExprKind::Block(block_id) => self.block_tail_expr(block_id),
+            _ => Some(expr_id),
+        }
+    }
+
+    fn check_cond(&mut self, cond: ast::ExprId) -> Result<(), SemError> {
+        let ty_id = self.check_expr(cond, None)?;
+        if self.tys.coerce(ty_id, self.tys.interner[&TyKind::Bool]).is_none() { //cond 可以是！
+            return Err(SemError {
+                kind: SemErrorKind::ConditionNotBool,
+                span: self.ast.exprs[cond.0].span,
+            });
+        }
+        Ok(())
+    }
+
     fn check_expr(&mut self, expr_id: ast::ExprId, expected: Option<TyId>) -> Result<TyId, SemError> {
         let own = self.check_expr_inner(expr_id, expected)?;
         let ty_id = match expected {
@@ -1253,20 +1377,28 @@ impl<'a> Sema<'a> {
                     .iter()
                     .map(|expr| self.check_expr(*expr, expected_elem))
                     .collect::<Result<Vec<TyId>, _>>()?;
-                let ty_id = match expected_elem.or_else(|| self.tys.lub(tys.as_slice())) {
-                    Some(elem) => self.tys.intern(TyKind::Array { elem, len: exprs.len() as u32 }),
+                let elem = match expected_elem {
+                    Some(elem) => elem,
                     None => {
-                        return Err(SemError {
-                            kind: SemErrorKind::ArrayTypeNotMatch,
-                            span: expr.span,
-                        });
+                        let Some((elem, adjust)) = self.tys.lub(tys.as_slice()) else {
+                            return Err(SemError {
+                                kind: SemErrorKind::ArrayTypeNotMatch,
+                                span: expr.span,
+                            });
+                        };
+                        for (k, c) in adjust.iter().enumerate() {
+                            if let Some(c) = c {
+                                self.adjust_result(exprs[k], elem, *c)?;
+                            }
+                        }
+                        elem
                     }
                 };
+                let ty_id = self.tys.intern(TyKind::Array { elem, len: exprs.len() as u32 });
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 ty_id
             }
             ExprKind::ArrayRepeat { elem, len } => {
-                // TODO(M3)：`N > 1` 时元素还得是 `Copy`
                 let array_len = self.array_len(*len)?;
                 let expected_elem = match expected.map(|e| self.tys.kinds[e.0]) {
                     Some(TyKind::Array { elem, len: n }) => {
@@ -1281,6 +1413,12 @@ impl<'a> Sema<'a> {
                     _ => None,
                 };
                 let elem_ty_id = self.check_expr(*elem, expected_elem)?;
+                if array_len > 1 && !self.tys.capable(elem_ty_id, Derive::Copy) {
+                    return Err(SemError {
+                        kind: SemErrorKind::CopyRequired,
+                        span: self.ast.exprs[elem.0].span,
+                    });
+                }
                 let ty_id = self.tys.intern(TyKind::Array { elem: elem_ty_id, len: array_len });
                 self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 ty_id
@@ -1313,12 +1451,21 @@ impl<'a> Sema<'a> {
             }
             ExprKind::Assign { op, lhs, rhs } => {
                 let lhs_ty_id = self.check_expr(*lhs, None)?;
-                let Some(Category::Place(PlaceMut::Mutable)) = self.tables.exprs[lhs.0].cat else {
-                    return Err(SemError {
-                        kind: SemErrorKind::NotMutablePlace,
-                        span: expr.span,
-                    })
-                };
+                match self.tables.exprs[lhs.0].cat {
+                    Some(Category::Place(PlaceMut::Mutable)) => {}
+                    Some(Category::Place(_)) => {
+                        return Err(SemError {
+                            kind: SemErrorKind::NotMutablePlace,
+                            span: expr.span,
+                        })
+                    }
+                    _ => {
+                        return Err(SemError {
+                            kind: SemErrorKind::NotAPlace,
+                            span: expr.span,
+                        })
+                    }
+                }
                 let expected = match op {
                     AssignOp::Assign => Some(lhs_ty_id),
                     _ => None,
@@ -1347,6 +1494,7 @@ impl<'a> Sema<'a> {
                     }
                     _ => {}
                 }
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 self.tys.interner[&TyKind::Unit]
             }
             ExprKind::Binary { lhs, rhs, op } => {
@@ -1392,6 +1540,12 @@ impl<'a> Sema<'a> {
                         if lt != rt {
                             return Err(bad_mismatch);
                         }
+                        if !self.tys.capable(lt, Derive::PartialEq) {
+                            return Err(SemError {
+                                kind: SemErrorKind::PartialEqRequired,
+                                span: expr.span,
+                            });
+                        }
                         self.tys.intern(TyKind::Bool)
                     }
                 };
@@ -1425,6 +1579,7 @@ impl<'a> Sema<'a> {
                         span: expr.span,
                     });
                 }
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 self.tys.intern(TyKind::Never)
             }
             ExprKind::Break(break_expr_id) => {
@@ -1438,7 +1593,8 @@ impl<'a> Sema<'a> {
                     Some(break_expr_id) => self.check_expr(*break_expr_id, self.loops.last().unwrap().expected)?,
                     None => self.tys.intern(TyKind::Unit),
                 };
-                self.loops.last_mut().unwrap().break_tys.push(ty_id);
+                self.loops.last_mut().unwrap().break_tys.push((*break_expr_id, ty_id));
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 self.tys.intern(TyKind::Never)
             }
             ExprKind::Return(return_expr_id) => {
@@ -1449,36 +1605,44 @@ impl<'a> Sema<'a> {
                     });
                 }
                 if let Some(return_expr_id) = return_expr_id {
-                    let ty_id = self.check_expr(*return_expr_id, self.cur_ret)?;
+                    self.check_expr(*return_expr_id, self.cur_ret)?;
                 } else if self.cur_ret.unwrap() != self.tys.intern(TyKind::Unit) {
                     return Err(SemError { 
                         kind: SemErrorKind::RetTypeNotMatch, 
                         span: expr.span, 
                     });
                 }
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 self.tys.intern(TyKind::Never)
             }
             ExprKind::Loop(block_id) => {
-                self.loops.push(LoopInfo::new(LoopKind::Loop, expected));
+                self.loops.push(LoopInfo::new(expected));
                 let body_ty = self.check_block(*block_id, Some(self.tys.interner[&TyKind::Unit]))?;
                 if self.tys.coerce(body_ty, self.tys.interner[&TyKind::Unit]).is_none() {
-                    return Err(SemError { 
-                        kind: SemErrorKind::InvalidLoopBody, 
-                        span: expr.span, 
+                    return Err(SemError {
+                        kind: SemErrorKind::InvalidLoopBody,
+                        span: expr.span,
                     });
                 }
                 let ret_tys = self.loops.pop().unwrap();
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 if ret_tys.break_tys.len() > 0 {
                     if expected.is_some() {
                         expected.unwrap()
                     } else {
-                        let Some(lub_ty_id) = self.tys.lub(ret_tys.break_tys.as_slice()) else {
-                            return Err(SemError { 
-                                kind: SemErrorKind::TypeMismatch, 
+                        let tys: Vec<TyId> = ret_tys.break_tys.iter().map(|(_, ty)| *ty).collect();
+                        let Some((ty, adjust)) = self.tys.lub(tys.as_slice()) else {
+                            return Err(SemError {
+                                kind: SemErrorKind::TypeMismatch,
                                 span: expr.span,
                             });
                         };
-                        lub_ty_id
+                        for (k, c) in adjust.iter().enumerate() {
+                            if let (Some(c), Some(break_expr)) = (c, ret_tys.break_tys[k].0) {
+                                self.adjust_result(break_expr, ty, *c)?;
+                            }
+                        }
+                        ty
                     }
                 } else {
                     self.tys.intern(TyKind::Never)
@@ -1487,11 +1651,12 @@ impl<'a> Sema<'a> {
             ExprKind::While { cond, body } => {
                 // 条件里新起的循环才归它管：条件期间把外层循环栈摘掉
                 let outer = std::mem::take(&mut self.loops);
-                self.check_expr(*cond, Some(self.tys.interner[&TyKind::Bool]))?;
+                self.check_cond(*cond)?;
                 self.loops = outer;
-                self.loops.push(LoopInfo::new(LoopKind::While, Some(self.tys.intern(TyKind::Unit))));
+                self.loops.push(LoopInfo::new(Some(self.tys.intern(TyKind::Unit))));
                 self.check_block(*body, Some(self.tys.interner[&TyKind::Unit]))?;
                 self.loops.pop();
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 self.tys.intern(TyKind::Unit)
             }
             ExprKind::Call { callee, args } => {
@@ -1542,15 +1707,7 @@ impl<'a> Sema<'a> {
                         span: expr.span,
                     });
                 }
-                if self.tables.exprs[inner.0].cat == Some(Category::Value) {
-                    self.tables.exprs[expr_id.0].cat = Some(Category::Value);
-                } else {
-                    self.tables.exprs[expr_id.0].cat = if *mutable {
-                        Some(Category::Place(PlaceMut::Mutable))
-                    } else {
-                        Some(Category::Place(PlaceMut::Immutable))
-                    }
-                }
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 self.tys.intern(TyKind::Ref { mutable: *mutable, inner: ty_id })
             }
             ExprKind::Paren(inner) => {
@@ -1560,22 +1717,34 @@ impl<'a> Sema<'a> {
                 ty_id
             }
             ExprKind::If { cond, then_block, else_branch } => {
-                self.check_expr(*cond, Some(self.tys.interner[&TyKind::Bool]))?;
+                self.check_cond(*cond)?;
                 let then_ty = self.check_block(*then_block, expected)?;
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
                 match else_branch {
-                    // 无 `else` 的 `if` 条件假时正常走完 ⇒ 它自己的类型是 `()`，不是分支的类型
                     None => self.tys.intern(TyKind::Unit),
                     Some(else_expr) => {
                         let else_ty = self.check_expr(*else_expr, expected)?;
-                        let never = self.tys.intern(TyKind::Never);
-                        if then_ty == never && else_ty == never {
-                            never
-                        } else {
-                            self.tys.lub(&[then_ty, else_ty]).ok_or(SemError {
+                        let Some((ty, adjust)) = self.tys.lub(&[then_ty, else_ty]) else {
+                            return Err(SemError {
                                 kind: SemErrorKind::TypeMismatch,
                                 span: expr.span,
-                            })?
+                            });
+                        };
+                        for (k, c) in adjust.iter().enumerate() {
+                            let Some(c) = c else { continue };
+                            let result = if k == 0 {
+                                self.block_tail_expr(*then_block)
+                            } else {
+                                self.result_expr(*else_expr)
+                            };
+                            if let Some(result) = result {
+                                self.adjust_result(result, ty, *c)?;
+                                if k == 1 && result.0 != else_expr.0 {
+                                    self.typed(*else_expr, ty)?;
+                                }
+                            }
                         }
+                        ty
                     }
                 }
             }
@@ -1606,12 +1775,15 @@ impl<'a> Sema<'a> {
                         let (_, ty_id) = self.eval_int_literal(*digits, *suffix, expected);
                         ty_id
                     }
-                    Lit::Bool(bool) => {
+                    Lit::Bool(_) => {
                         self.tys.interner[&TyKind::Bool]
                     }
                 }
             }
-            ExprKind::Unit => self.tys.intern(TyKind::Unit),
+            ExprKind::Unit => {
+                self.tables.exprs[expr_id.0].cat = Some(Category::Value);
+                self.tys.intern(TyKind::Unit)
+            }
             ExprKind::Path(path_id) => {
                 let res = self.resolve_value_path(*path_id)?;
                 self.tables.exprs[expr_id.0].res = Some(res);
@@ -1634,7 +1806,7 @@ impl<'a> Sema<'a> {
                     ValueSym::Local(binding_id) => {
                         match binding_id {
                             BindingId::Let(stmt_id) => {
-                                let StmtKind::Let { binding, mutable, ty, init } = self.ast.stmts[stmt_id.0].kind else {
+                                let StmtKind::Let { mutable, .. } = self.ast.stmts[stmt_id.0].kind else {
                                     unreachable!("the item should be let stmt");
                                 };
                                 self.tables.exprs[expr_id.0].cat = if mutable {
@@ -1642,11 +1814,8 @@ impl<'a> Sema<'a> {
                                 } else {
                                     Some(Category::Place(PlaceMut::Immutable))
                                 };
-                                if ty.is_some() {
-                                    self.resolve_type(ty.unwrap())?
-                                } else {
-                                    self.tables.exprs[init.0].ty_id.unwrap()
-                                }
+                                self.tables.let_tys[stmt_id.0]
+                                    .expect("绑定的类型在它那条 `let` 被检查时写下")
                             }
                             BindingId::Param { item_id, index } => {
                                 let param = self.sig_of(ValueSym::Fn(item_id), expr.span)?.params[index];
@@ -1692,48 +1861,48 @@ impl<'a> Sema<'a> {
                     return Err(bad);
                 };
                 let ident_name = self.text(ident.span);
-                // 候选链：沿内置解引用逐个 base 试 `assoc`（struct）与内建表（Box / Vec / 数组）
                 let mut base = recv_ty_id;
                 let mut state = base_place(self.tables.exprs[recv.0].cat);
-                let mut hit = None;
-                loop {
-                    if let TyKind::Struct(struct_id) = self.tys.kinds[base.0] {
-                        if let Some(&ValueSym::Fn(item_id)) =
-                            self.assoc.get(&struct_id).and_then(|m| m.get(ident_name))
-                        {
-                            if self.fn_sig.get(&item_id).is_some_and(|s| s.recv.is_some())
-                            {
-                                hit = Some(ValueSym::Fn(item_id));
-                            }
-                        }
-                    } else if let Some(builtin) = self.builtin_method(base, ident_name) {
-                        hit = Some(ValueSym::Builtin(builtin));
-                    }
-                    if hit.is_some() {
-                        break;
+                let (cand, hit) = loop {
+                    let cands = [
+                        base,
+                        self.tys.intern(TyKind::Ref { mutable: false, inner: base }),
+                        self.tys.intern(TyKind::Ref { mutable: true, inner: base }),
+                    ];
+                    if let Some(found) = cands.iter().find_map(|&cand| {
+                        self.candidate_method(cand, ident_name).map(|sym| (cand, sym))
+                    }) {
+                        break found;
                     }
                     match self.tys.kinds[base.0] {
                         TyKind::Ref { inner, .. } | TyKind::Boxed(inner) => {
                             state = TyArena::step(state, self.tys.kinds[base.0]);
                             base = inner;
                         }
-                        _ => break,
+                        _ => return Err(bad),
                     }
-                }
-                let Some(hit) = hit else {
-                    return Err(bad);
                 };
-                let sig = self.sig_of(hit, expr.span)?;
-                let recv_sig = sig.recv.unwrap();
-                if let TyKind::Ref { mutable: true, inner } = self.tys.kinds[recv_sig.ty.0] {
-                    debug_assert_eq!(inner, base, "候选链停在命中那一层，接收者内层必然是它");
-                    if state != PlaceMut::Mutable {
-                        return Err(SemError {
-                            kind: SemErrorKind::NotMutablePlace,
-                            span: expr.span,
-                        });
+                if let TyKind::Ref { mutable, inner } = self.tys.kinds[cand.0] {
+                    if inner == base { // 这里的ref可能是本来的recv就是ref，这样就不用类型转换了，但也可能是候选链里加入的&T
+                        self.tables.exprs[recv.0].coercion =
+                            Some(if mutable { Coercion::AutoRefMut } else { Coercion::AutoRef });
+                    }
+                    if mutable {
+                        let reachable = if inner == base {
+                            state == PlaceMut::Mutable
+                        } else {
+                            TyArena::step(state, self.tys.kinds[cand.0]) == PlaceMut::Mutable
+                        };
+                        if !reachable {
+                            return Err(SemError {
+                                kind: SemErrorKind::NotMutablePlace,
+                                span: expr.span,
+                            });
+                        }
                     }
                 }
+                self.tables.exprs[expr_id.0].res = Some(hit);
+                let sig = self.sig_of(hit, expr.span)?;
                 if sig.params.len() != args.len() {
                     return Err(SemError {
                         kind: SemErrorKind::ArgCountMismatch,
@@ -1823,15 +1992,15 @@ impl<'a> Sema<'a> {
                     Ok(ty_id)
                 }
             }
-            StmtKind::Let { binding, mutable, ty, init } => {
-                // TODO(M1.2)：结论落 `tables.let_tys`
+            StmtKind::Let { binding, ty, init, .. } => {
                 let expected = match ty {
                     Some(ty_id) => Some(self.resolve_type(ty_id)?),
                     None => None,
                 };
-                self.check_expr(init, expected)?;
+                let ty_id = self.check_expr(init, expected)?;
+                self.tables.let_tys[stmt_id.0] = Some(ty_id);
                 self.insert_local(
-                    self.text(binding.span), 
+                    self.text(binding.span),
                     ValueSym::Local(BindingId::Let(stmt_id))
                 );
                 Ok(self.tys.intern(TyKind::Unit))
@@ -1878,14 +2047,7 @@ impl<'a> Sema<'a> {
     }
 
     fn check_fn(&mut self, item_id: ItemId) -> Result<(), SemError> {
-        if let ItemKind::Fn { 
-            name, 
-            has_generic_params, 
-            recv, 
-            params, 
-            ret, 
-            body 
-        } = &self.ast.items[item_id.0].kind {
+        if let ItemKind::Fn { recv, params, body, .. } = &self.ast.items[item_id.0].kind {
             if self.cur_self.is_none() && recv.is_some() {
                 return Err(SemError { 
                     kind: SemErrorKind::InvalidParam, 
@@ -1922,7 +2084,6 @@ impl<'a> Sema<'a> {
     fn check_crate(&mut self) -> Result<(), SemError> {
         let mut have_main= false;
         for item_id in self.ast.root.iter() {
-            let item = &self.ast.items[item_id.0];
             match &self.ast.items[item_id.0].kind {
                 ItemKind::Fn { name, has_generic_params, recv, params, ret, .. } => {
                     let is_main = self.text(name.span) == "main";
@@ -1953,7 +2114,7 @@ impl<'a> Sema<'a> {
                         _ => unreachable!("it should be struct")
                     };
                     for item_id in items.iter() {
-                        if let ItemKind::Fn { name, ..} = self.ast.items[(*item_id).0].kind {
+                        if let ItemKind::Fn { .. } = self.ast.items[(*item_id).0].kind {
                             self.cur_self = Some(struct_id);
                             self.check_fn(*item_id)?;
                         }
@@ -2005,10 +2166,10 @@ mod tests {
         let mut tys = TyArena::new();
         let int = tys.intern(TyKind::I32);
 
-        let (b_id, b_ty) = tys.new_struct("B".to_string(), span());
+        let (b_id, b_ty) = tys.new_struct(span(), HashSet::new());
         tys.finish_struct(b_id, vec![("x".to_string(), int)]);
 
-        let (a_id, a_ty) = tys.new_struct("A".to_string(), span());
+        let (a_id, a_ty) = tys.new_struct(span(), HashSet::new());
         tys.finish_struct(a_id, vec![("p".to_string(), b_ty), ("q".to_string(), b_ty)]);
 
         let layout = tys.layout_of(a_ty).unwrap();
@@ -2058,14 +2219,209 @@ mod tests {
         assert_eq!(tys.coerce(vec_i32, i32_ty), None); // Vec 没有内置解引用
     }
 
+    /// LUB 三步（`types.md:158`）：step 1 保目标、step 2 换目标并把更早的结果一起调过去、
+    /// step 3 不找第三类型。用例照 `types.md:170` 那张表
+    #[test]
+    fn lub_follows_the_three_steps() {
+        let mut tys = TyArena::new();
+        let int = tys.intern(TyKind::I32);
+        let uint = tys.intern(TyKind::U32);
+        let never = tys.intern(TyKind::Never);
+        let sh_int = tys.intern(TyKind::Ref { mutable: false, inner: int });
+        let mut_int = tys.intern(TyKind::Ref { mutable: true, inner: int });
+
+        // `[&mut 1, &123]` ⇒ `[&i32; 2]`：换目标，第一个元素调成共享
+        assert_eq!(
+            tys.lub(&[mut_int, sh_int]),
+            Some((sh_int, vec![Some(Coercion::MutToShared), None]))
+        );
+        // `[&123, &mut 1]`：目标不动（step 1），但第二个元素仍要调成共享
+        assert_eq!(
+            tys.lub(&[sh_int, mut_int]),
+            Some((sh_int, vec![None, Some(Coercion::MutToShared)]))
+        );
+        // `[&mut 1u32, &123]` ⇒ UB：`123` 没有期望类型，两个引用调不到一起
+        assert_eq!(tys.lub(&[mut_int, uint]), None);
+        // `!` 不当目标，但它自己仍要调到公共类型上（与出口对 `!` 的口径一致）
+        assert_eq!(
+            tys.lub(&[never, sh_int]),
+            Some((sh_int, vec![Some(Coercion::Never), None]))
+        );
+        assert_eq!(tys.lub(&[never, never]), Some((never, vec![None, None])));
+        // 空输入没有公共类型（空数组字面量走这条）
+        assert_eq!(tys.lub(&[]), None);
+    }
+
+    /// 跑完整前端 + 语义：下面几个测试要"源码进、结论表出"
+    fn check_src(src: &[u8]) -> (Ast, Checked) {
+        let ast = crate::frontend::parser::parse_crate(src).expect("前端应当接受");
+        let checked = check(&ast, src).expect("语义应当接受");
+        (ast, checked)
+    }
+
+    /// 根项（`main`）里第 `n` 条 `let` 的初值表达式
+    fn let_init(ast: &Ast, n: usize) -> ast::ExprId {
+        let ItemKind::Fn { body, .. } = ast.items[ast.root[0].0].kind else {
+            panic!("根项不是函数");
+        };
+        let StmtKind::Let { init, .. } = ast.stmts[ast.blocks[body.0].stmts[n].0].kind else {
+            panic!("第 {n} 条语句不是 `let`");
+        };
+        init
+    }
+
+    /// 那个表达式必须是点号调用，返回它的接收者
+    fn method_recv(ast: &Ast, expr: ast::ExprId) -> ast::ExprId {
+        let ExprKind::Method { recv, .. } = ast.exprs[expr.0].kind else {
+            panic!("不是点号调用");
+        };
+        recv
+    }
+
+    /// P1-10 ③：LUB 换目标后，更早那个结果写进表里的类型与转换形态都要改
+    /// （`[&mut a, &b]` ⇒ `[&i32; 2]`，第一个元素记成 `&i32` + `MutToShared`）
+    #[test]
+    fn array_lub_backfills_the_adjusted_element() {
+        let (ast, checked) =
+            check_src(b"fn main() { let mut a = 4; let b = 9; let refs = [&mut a, &b]; }");
+        let init = let_init(&ast, 2);
+        let ExprKind::Array(elems) = &ast.exprs[init.0].kind else {
+            panic!("初值不是数组字面量");
+        };
+        let array_ty = checked.tables.exprs[init.0].ty_id.unwrap();
+        let TyKind::Array { elem, len } = checked.tys.kinds[array_ty.0] else {
+            panic!("初值不是数组类型");
+        };
+        assert_eq!(len, 2);
+        assert!(matches!(
+            checked.tys.kinds[elem.0],
+            TyKind::Ref { mutable: false, .. }
+        ));
+        assert_eq!(checked.tables.exprs[elems[0].0].ty_id, Some(elem));
+        assert_eq!(
+            checked.tables.exprs[elems[0].0].coercion,
+            Some(Coercion::MutToShared)
+        );
+        assert_eq!(checked.tables.exprs[elems[1].0].ty_id, Some(elem));
+        assert_eq!(checked.tables.exprs[elems[1].0].coercion, None);
+    }
+
+    /// 块尾那条表达式
+    fn tail_of(ast: &Ast, block: ast::BlockId) -> ast::ExprId {
+        let last = *ast.blocks[block.0].stmts.last().unwrap();
+        let StmtKind::Expr { expr, .. } = ast.stmts[last.0].kind else {
+            panic!("块尾不是表达式语句");
+        };
+        expr
+    }
+
+    /// `if` 的 LUB 回填：转换记在**产值的那一步**（块的尾表达式）上。
+    /// `else` 分支被解析器包成了块表达式（它自己也是个节点），类型跟着改成转换后的；
+    /// `then` 分支在 AST 里是裸的 `BlockId`，没有节点，只有它的尾表达式。
+    #[test]
+    fn if_lub_backfills_the_value_producing_expr() {
+        let (ast, checked) = check_src(
+            b"fn main() { let mut a = 1; let mut b = 2; let c = true; \
+              let x = if c { &b } else { &mut a }; let y = if c { &mut b } else { &a }; }",
+        );
+        // `x`：目标就是 then 的类型 ⇒ 转换落在 else 那边
+        let ExprKind::If { else_branch: Some(else_expr), .. } = ast.exprs[let_init(&ast, 3).0].kind
+        else {
+            panic!("初值不是带 else 的 if");
+        };
+        let ExprKind::Block(else_block) = ast.exprs[else_expr.0].kind else {
+            panic!("else 分支不是块表达式");
+        };
+        let else_tail = tail_of(&ast, else_block);
+        let sh_i32 = checked.tables.exprs[else_tail.0].ty_id.unwrap();
+        assert!(matches!(checked.tys.kinds[sh_i32.0], TyKind::Ref { mutable: false, .. }));
+        assert_eq!(checked.tables.exprs[else_tail.0].coercion, Some(Coercion::MutToShared));
+        assert_eq!(checked.tables.exprs[else_expr.0].ty_id, Some(sh_i32)); // 包着它的块节点也跟着换型
+
+        // `y`：step 2 把目标换成 else 的类型 ⇒ 转换落在 then 那边（它没有节点，只有尾）
+        let ExprKind::If { then_block, .. } = ast.exprs[let_init(&ast, 4).0].kind else {
+            panic!("初值不是 if");
+        };
+        let then_tail = tail_of(&ast, then_block);
+        assert_eq!(checked.tables.exprs[then_tail.0].ty_id, Some(sh_i32));
+        assert_eq!(checked.tables.exprs[then_tail.0].coercion, Some(Coercion::MutToShared));
+    }
+
+    /// P2-8：点号调用借出去的那一层（autoref）记在接收者身上
+    #[test]
+    fn dot_call_records_the_autoref() {
+        let (ast, checked) = check_src(b"fn main() { let a = 5i32.clone(); }");
+        let recv = method_recv(&ast, let_init(&ast, 0));
+        assert_eq!(checked.tables.exprs[recv.0].coercion, Some(Coercion::AutoRef));
+
+        let (ast, checked) =
+            check_src(b"fn main() { let mut v = Vec::<i32>::new(); let u = v.push(1); }");
+        let recv = method_recv(&ast, let_init(&ast, 1));
+        assert_eq!(
+            checked.tables.exprs[recv.0].coercion,
+            Some(Coercion::AutoRefMut)
+        );
+    }
+
+    /// P2-9：候选位按"声明的接收者类型**恰是**候选"筛。`S` 的 `clone` 收 by-value `self`，
+    /// 而 `r: &S` 走到候选 `&&S`（= 引用自身的 clone）就该停 ⇒ 结果是 `&S`，不是把 `S` 移出来
+    #[test]
+    fn by_value_clone_does_not_match_a_reference_candidate() {
+        // `main` 写在最前：`let_init` 取的是 `root[0]`
+        let (ast, checked) = check_src(
+            b"fn main() { let s = S { v: 1 }; let r = &s; let x = r.clone(); } \
+              struct S { v: i32 } impl S { fn clone(self) -> i32 { 1 } }",
+        );
+        let call = let_init(&ast, 2);
+        let Some(ValueSym::Builtin(Builtin::Clone(owner))) = checked.tables.exprs[call.0].res
+        else {
+            panic!("该拿到引用自身的内建 clone，而不是 `S::clone`");
+        };
+        assert!(matches!(
+            checked.tys.kinds[owner.0],
+            TyKind::Ref { mutable: false, .. }
+        ));
+        assert_eq!(
+            checked.tables.exprs[method_recv(&ast, call).0].coercion,
+            Some(Coercion::AutoRef)
+        );
+    }
+
     #[test]
     fn self_containing_struct_is_a_layout_cycle() {
         let mut tys = TyArena::new();
-        let (bad_id, bad_ty) = tys.new_struct("Bad".to_string(), span());
+        let (bad_id, bad_ty) = tys.new_struct(span(), HashSet::new());
         tys.finish_struct(bad_id, vec![("next".to_string(), bad_ty)]);
 
         let err = tys.layout_of(bad_ty).unwrap_err();
         assert_eq!(err.kind, SemErrorKind::RecursiveLayout);
         assert_eq!(err.span, span());
+    }
+
+    /// 能力表：`Vec` 挡 `Copy`（递归字段同理）、`&mut` 挡 `Clone`、struct 只看自己声明
+    #[test]
+    fn capability_follows_the_table() {
+        let mut tys = TyArena::new();
+        let int = tys.intern(TyKind::I32);
+        let (node_id, node_ty) = tys.new_struct(
+            span(),
+            HashSet::from([Derive::Clone, Derive::PartialEq]),
+        );
+        let vec_node = tys.intern(TyKind::Vec(node_ty));
+        tys.finish_struct(node_id, vec![("children".to_string(), vec_node)]);
+
+        let sh_node = tys.intern(TyKind::Ref { mutable: false, inner: node_ty });
+        let mut_node = tys.intern(TyKind::Ref { mutable: true, inner: node_ty });
+        let box_int = tys.intern(TyKind::Boxed(int));
+
+        assert!(tys.capable(int, Derive::Copy) && tys.capable(int, Derive::Eq));
+        assert!(tys.capable(sh_node, Derive::Copy));
+        assert!(!tys.capable(mut_node, Derive::Copy) && !tys.capable(mut_node, Derive::Clone));
+        assert!(!tys.capable(box_int, Derive::Copy));
+        // 容器与引用都顺内层问：Node 声明了 Clone/PartialEq ⇒ `Vec<Node>` 也是，但 `Vec` 永远不 Copy
+        assert!(tys.capable(vec_node, Derive::Clone) && tys.capable(vec_node, Derive::PartialEq));
+        assert!(!tys.capable(vec_node, Derive::Copy));
+        assert!(tys.capable(sh_node, Derive::PartialEq) && tys.capable(mut_node, Derive::PartialEq));
+        assert!(!tys.capable(node_ty, Derive::Eq) && !tys.capable(node_ty, Derive::Copy));
     }
 }
