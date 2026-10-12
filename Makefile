@@ -6,15 +6,20 @@ PYTHON ?= python3
 VERBOSE ?= false
 # Directory paths below tests, joined with ':'; separate selections with ','.
 FILTER ?=
+# Optional single stage: semantic, ir, codegen, or optimization.
+STAGE ?=
+# 判分机上是 clang-22；本机 brew LLVM 版本号不同，所以本地路径在此覆盖。
+CLANG ?= /opt/homebrew/opt/llvm/bin/clang
 COMPILE_TIMEOUT ?= 30
 RUN_TIMEOUT ?= 10
 
 # Export commands as data, so shell quoting survives Make's recipe expansion.
 export RX_TEST_BUILD = $(BUILD)
 export RX_TEST_SEMANTIC = $(SEMANTIC)
+export RX_TEST_IR = $(IR)
 export RX_TEST_CODEGEN = $(CODEGEN)
 export RX_TEST_RUN = $(RUN)
-export FILTER COMPILE_TIMEOUT RUN_TIMEOUT VERBOSE
+export FILTER STAGE CLANG COMPILE_TIMEOUT RUN_TIMEOUT VERBOSE
 
 .PHONY: test
 test:
@@ -41,9 +46,9 @@ sema-acc:
 
 # IR 闭环：`.ll` → clang → REIMU，用来在没有自写后端时验证中端（命令原文见 docs/spec-mapping.md §5.1）。
 #   make ll-run                                    # 默认跑 tests/custom/hello.ll，喂 hello.in
-#   make ll-run IR=target/ll-run/out.ll INPUT=tests/official/codegen/xxx.in
-LLVM_CLANG ?= /opt/homebrew/opt/llvm/bin/clang
-IR ?= tests/custom/hello.ll
+#   make ll-run LL_IN=target/ll-run/out.ll INPUT=tests/official/codegen/xxx.in
+# ⚠ 变量名不能叫 IR：config.mk 里的 `IR` 是评测接口的命令，`?=` 抢不过它。
+LL_IN ?= tests/custom/hello.ll
 INPUT ?= tests/custom/hello.in
 # 必须绝对路径：`xmake run -P vendor/REIMU` 的工作目录不是仓库根，相对路径打不开。
 LL_OUT ?= $(CURDIR)/target/ll-run
@@ -51,7 +56,7 @@ LL_OUT ?= $(CURDIR)/target/ll-run
 .PHONY: ll-run
 ll-run:
 	@mkdir -p $(LL_OUT)
-	@$(LLVM_CLANG) -S -x ir $(IR) -o $(LL_OUT)/prog.s \
+	@$(CLANG) -S -x ir $(LL_IN) -o $(LL_OUT)/prog.s \
 	    --target=riscv32-unknown-none-elf -march=rv32im -mabi=ilp32 \
 	    -mllvm -riscv-no-aliases
 	@xmake run -P vendor/REIMU reimu --memory=256M --stack=1M \
